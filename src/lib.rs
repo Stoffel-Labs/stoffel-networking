@@ -1,5 +1,5 @@
 pub mod transports;
-mod network_stuff;
+pub mod network_utils;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

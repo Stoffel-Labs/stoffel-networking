@@ -1633,6 +1633,7 @@ name = "stoffelnet"
 version = "0.1.0"
 dependencies = [
  "ark-ff",
+ "async-trait",
  "quinn",
  "rcgen",
  "rustls",

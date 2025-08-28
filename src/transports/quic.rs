@@ -19,11 +19,12 @@
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use crate::network_utils::{ClientId, Message, Network, NetworkError, Node, PartyId};
 use tokio::sync::Mutex;
 use ark_ff::Field;
@@ -495,10 +496,14 @@ pub struct QuicNetworkManager {
     node_id: PartyId,
     /// Network configuration
     network_config: QuicNetworkConfig,
-    /// Active connections to other nodes
-    /// Using Arc<Mutex<>> for interior mutability to allow modifying connections
+    /// Active connections to other server nodes (party connections)
+    /// Using Arc<tokio::sync::Mutex<>> for interior mutability to allow modifying connections
     /// while keeping self immutable in Network trait methods
     connections: Arc<Mutex<HashMap<PartyId, Box<dyn PeerConnection>>>>,
+    /// Active connections to clients (for async sending)
+    client_connections_async: Arc<Mutex<HashMap<ClientId, Box<dyn PeerConnection>>>>,
+    /// Set of connected client IDs (for sync queries)
+    client_ids: Arc<StdMutex<HashSet<ClientId>>>,
 }
 
 impl Default for QuicNetworkManager {
@@ -525,6 +530,8 @@ impl QuicNetworkManager {
             node_id,
             network_config: QuicNetworkConfig::default(),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            client_connections_async: Arc::new(Mutex::new(HashMap::new())),
+            client_ids: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -701,6 +708,12 @@ impl NetworkManager for QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
+            // Send identification handshake as SERVER with our node_id
+            if let Ok((mut send, _recv)) = connection.open_bi().await {
+                let handshake = format!("ROLE:SERVER:{}\n", self.node_id);
+                let _ = send.write_all(handshake.as_bytes()).await;
+            }
+
             // Find the node ID for this address or generate a new one
             let node_id = self.nodes.iter()
                 .find(|node| node.address() == address)
@@ -743,24 +756,66 @@ impl NetworkManager for QuicNetworkManager {
             // Get the remote address of the connection
             let remote_addr = connection.remote_address();
 
-            // Find the node ID for this address or generate a new one
-            let node_id = self.nodes.iter()
-                .find(|node| node.address() == remote_addr)
-                .map(|node| node.id())
-                .unwrap_or_else(|| {
-                    // If we don't have a node for this address, create one
-                    let node = QuicNode::new_with_random_id(remote_addr);
-                    let id = node.id();
-                    self.nodes.push(node);
-                    id
-                });
+            // Try to read a role identification handshake from the first bi-directional stream
+            let mut parsed_role: Option<(String, usize)> = None;
+            if let Ok((mut _send, mut recv)) = connection.accept_bi().await {
+                let mut buf = vec![0u8; 256];
+                if let Ok(Some(n)) = recv.read(&mut buf).await {
+                    let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+                    if let Some(rest) = line.strip_prefix("ROLE:") {
+                        let mut parts = rest.split(':');
+                        if let (Some(role), Some(id_str)) = (parts.next(), parts.next()) {
+                            if let Ok(id) = id_str.trim().parse::<usize>() {
+                                parsed_role = Some((role.to_string(), id));
+                            }
+                        }
+                    }
+                }
+            }
 
-            // Store a clone of the connection in the connections hashmap
-            let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
+            match parsed_role {
+                Some((role, id)) if role.eq_ignore_ascii_case("CLIENT") => {
+                    // Store as client connection
+                    {
+                        let mut cc = self.client_connections_async.lock().await;
+                        cc.insert(id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
+                    }
+                    if let Ok(mut set) = self.client_ids.lock() { set.insert(id); }
 
-            // Return the original connection
-            Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
+                    // Return the original connection
+                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
+                }
+                Some((role, id)) if role.eq_ignore_ascii_case("SERVER") => {
+                    // Ensure the nodes list includes this server party
+                    if !self.nodes.iter().any(|n| n.id() == id) {
+                        self.nodes.push(QuicNode::from_party_id(id, remote_addr));
+                    }
+
+                    // Store connection in server connections map
+                    let mut connections = self.connections.lock().await;
+                    connections.insert(id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
+
+                    // Return the original connection
+                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
+                }
+                _ => {
+                    // Fallback: use address-based mapping as before
+                    let node_id = self.nodes.iter()
+                        .find(|node| node.address() == remote_addr)
+                        .map(|node| node.id())
+                        .unwrap_or_else(|| {
+                            let node = QuicNode::new_with_random_id(remote_addr);
+                            let id = node.id();
+                            self.nodes.push(node);
+                            id
+                        });
+
+                    let mut connections = self.connections.lock().await;
+                    connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
+
+                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
+                }
+            }
         })
     }
 
@@ -814,12 +869,13 @@ impl Network for QuicNetworkManager {
 
 
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
-        let mut total_bytes = 0;
+        // Count self-delivery to support protocols that expect self-broadcast
+        let mut total_bytes = message.len();
 
         // Acquire the lock on the connections hashmap
         let mut connections = self.connections.lock().await;
 
-        // Send the message to all nodes except self
+        // Send the message to all nodes except self (self is counted above)
         for node in &self.nodes {
             if node.id() != self.node_id {
                 // Check if we have a connection to this node
@@ -845,12 +901,7 @@ impl Network for QuicNetworkManager {
             }
         }
 
-        if total_bytes > 0 {
-            Ok(total_bytes)
-        } else {
-            // If we didn't send any messages, return an error
-            Err(NetworkError::SendError)
-        }
+        Ok(total_bytes)
     }
 
     fn parties(&self) -> Vec<&Self::NodeType> {
@@ -874,15 +925,30 @@ impl Network for QuicNetworkManager {
     }
 
     async fn send_to_client(&self, client: ClientId, message: &[u8]) -> Result<usize, NetworkError> {
-        todo!()
+        // Acquire the lock on client connections
+        let mut connections = self.client_connections_async.lock().await;
+        if let Some(conn) = connections.get_mut(&client) {
+            match conn.send(message).await {
+                Ok(_) => Ok(message.len()),
+                Err(_) => Err(NetworkError::SendError),
+            }
+        } else {
+            Err(NetworkError::ClientNotFound(client))
+        }
     }
 
     fn clients(&self) -> Vec<ClientId> {
-        todo!()
+        match self.client_ids.lock() {
+            Ok(guard) => guard.iter().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     fn is_client_connected(&self, client: ClientId) -> bool {
-        todo!()
+        match self.client_ids.lock() {
+            Ok(guard) => guard.contains(&client),
+            Err(_) => false,
+        }
     }
 }
 

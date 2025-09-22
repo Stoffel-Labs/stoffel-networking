@@ -707,6 +707,12 @@ impl NetworkManager for QuicNetworkManager {
                     .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
                 endpoint.set_default_client_config(client_config);
                 self.endpoint = Some(endpoint);
+            } else {
+                // Ensure an existing endpoint (possibly created by listen()) has a default client config
+                let client_config = Self::create_insecure_client_config()?;
+                if let Some(endpoint) = self.endpoint.as_mut() {
+                    endpoint.set_default_client_config(client_config);
+                }
             }
 
             let endpoint = self.endpoint.as_ref().unwrap();
@@ -833,8 +839,12 @@ impl NetworkManager for QuicNetworkManager {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             let server_config = Self::create_self_signed_server_config()?;
-            let endpoint = Endpoint::server(server_config, bind_address)
+            let mut endpoint = Endpoint::server(server_config, bind_address)
                 .map_err(|e| format!("Failed to create server endpoint: {}", e))?;
+
+            // Also configure default client config so this endpoint can initiate outbound connections
+            let client_config = Self::create_insecure_client_config()?;
+            endpoint.set_default_client_config(client_config);
 
             self.endpoint = Some(endpoint);
             Ok(())

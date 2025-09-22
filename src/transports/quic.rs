@@ -20,6 +20,7 @@ use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -117,6 +118,12 @@ pub trait PeerConnection: Send + Sync {
     /// * `Ok(())` - If the connection was closed successfully
     /// * `Err(String)` - If there was an error closing the connection
     fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+impl Debug for dyn PeerConnection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PeerConnection {{ remote_address: {} }}", self.remote_address())
+    }
 }
 
 /// Manages network connections for the VM
@@ -483,6 +490,7 @@ impl Message for QuicMessage {
 /// The implementation uses self-signed certificates for TLS, which is suitable
 /// for development but should be replaced with proper certificate management
 /// in production.
+#[derive(Debug, Clone)]
 pub struct QuicNetworkManager {
     /// The QUIC endpoint for sending and receiving connections
     endpoint: Option<Endpoint>,

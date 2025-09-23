@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use crate::network_utils::{ClientId, Message, Network, NetworkError, Node, PartyId};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use ark_ff::Field;
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -346,6 +346,95 @@ impl PeerConnection for QuicPeerConnection {
             self.connection.close(0u32.into(), b"Connection closed");
             Ok(())
         })
+    }
+}
+
+/// In-memory loopback implementation of PeerConnection for self-delivery
+pub struct LoopbackPeerConnection {
+    remote_addr: SocketAddr,
+    streams: Arc<Mutex<HashMap<u64, (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)>>> ,
+}
+
+impl LoopbackPeerConnection {
+    pub fn new(remote_addr: SocketAddr) -> Self {
+        Self {
+            remote_addr,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn ensure_stream(&self, stream_id: u64) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let mut guard = self.streams.lock().await;
+        if let Some((tx, rx)) = guard.remove(&stream_id) {
+            (tx, rx)
+        } else {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+            (tx, rx)
+        }
+    }
+}
+
+impl PeerConnection for LoopbackPeerConnection {
+    fn send<'a>(
+        &'a mut self,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        self.send_on_stream(0, data)
+    }
+
+    fn receive<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+        self.receive_from_stream(0)
+    }
+
+    fn send_on_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let (tx, rx) = self.ensure_stream(stream_id).await;
+            // put back for reuse
+            {
+                let mut guard = self.streams.lock().await;
+                guard.insert(stream_id, (tx.clone(), rx));
+            }
+            tx.send(data.to_vec())
+                .await
+                .map_err(|e| format!("loopback send failed: {}", e))
+                .map(|_| ())
+        })
+    }
+
+    fn receive_from_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            // ensure stream exists and reinsert for reuse
+            let (tx, mut rx) = self.ensure_stream(stream_id).await;
+            {
+                let mut guard = self.streams.lock().await;
+                guard.insert(stream_id, (tx, rx));
+            }
+            // now take receiver to await on
+            let mut guard = self.streams.lock().await;
+            if let Some((_tx, rx)) = guard.get_mut(&stream_id) {
+                match rx.recv().await {
+                    Some(msg) => Ok(msg),
+                    None => Err("loopback connection closed".into()),
+                }
+            } else {
+                Err("loopback stream missing".into())
+            }
+        })
+    }
+
+    fn remote_address(&self) -> SocketAddr { self.remote_addr }
+
+    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -692,6 +781,14 @@ impl QuicNetworkManager {
 
         Ok(server_config)
     }
+    /// Ensure a loopback connection is present for self-delivery
+    pub async fn ensure_loopback_installed(&self) {
+        let mut conns = self.connections.lock().await;
+        if !conns.contains_key(&self.node_id) {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            conns.insert(self.node_id, Box::new(LoopbackPeerConnection::new(addr)));
+        }
+    }
 }
 
 impl NetworkManager for QuicNetworkManager {
@@ -714,6 +811,9 @@ impl NetworkManager for QuicNetworkManager {
                     endpoint.set_default_client_config(client_config);
                 }
             }
+
+            // Ensure loopback connection exists for self-delivery
+            self.ensure_loopback_installed().await;
 
             let endpoint = self.endpoint.as_ref().unwrap();
             let connection = endpoint
@@ -847,6 +947,9 @@ impl NetworkManager for QuicNetworkManager {
             endpoint.set_default_client_config(client_config);
 
             self.endpoint = Some(endpoint);
+
+            // Ensure loopback connection exists for self-delivery
+            self.ensure_loopback_installed().await;
             Ok(())
         })
     }
@@ -887,34 +990,37 @@ impl Network for QuicNetworkManager {
 
 
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
-        // Count self-delivery to support protocols that expect self-broadcast
-        let mut total_bytes = message.len();
-
         // Acquire the lock on the connections hashmap
         let mut connections = self.connections.lock().await;
+        let mut total_bytes = 0usize;
+        let mut included_self = false;
 
-        // Send the message to all nodes except self (self is counted above)
+        // Send the message to all known nodes (including self if present)
         for node in &self.nodes {
-            if node.id() != self.node_id {
-                // Check if we have a connection to this node
-                if connections.contains_key(&node.id()) {
-                    // Get a mutable reference to the connection
-                    let connection = connections.get_mut(&node.id()).unwrap();
-
-                    // Send the message
-                    match connection.send(message).await {
-                        Ok(_) => {
-                            println!("Successfully broadcasted message to node {}", node.id());
-                            total_bytes += message.len();
-                        },
-                        Err(e) => {
-                            println!("Failed to broadcast message to node {}: {}", node.id(), e);
-                            // Continue with other nodes even if one fails
-                        }
+            if let Some(connection) = connections.get_mut(&node.id()) {
+                match connection.send(message).await {
+                    Ok(_) => {
+                        println!("Successfully broadcasted message to node {}", node.id());
+                        total_bytes += message.len();
+                        if node.id() == self.node_id { included_self = true; }
+                    },
+                    Err(e) => {
+                        println!("Failed to broadcast message to node {}: {}", node.id(), e);
+                        // Continue with other nodes even if one fails
                     }
-                } else {
-                    // Log a warning that we couldn't send the message to this node
-                    println!("Warning: No connection to node {}, skipping broadcast", node.id());
+                }
+            } else {
+                // Log a warning that we couldn't send the message to this node
+                println!("Warning: No connection to node {}, skipping broadcast", node.id());
+            }
+        }
+
+        // Ensure self-delivery via loopback even if self is not listed in nodes
+        if !included_self {
+            if let Some(connection) = connections.get_mut(&self.node_id) {
+                if let Ok(_) = connection.send(message).await {
+                    println!("Successfully broadcasted message to self (loopback)");
+                    total_bytes += message.len();
                 }
             }
         }

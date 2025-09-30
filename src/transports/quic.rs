@@ -16,7 +16,7 @@
 //!
 //! The current implementation uses the Quinn library for QUIC support.
 
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, IdleTimeout};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -31,6 +31,7 @@ use tokio::sync::{Mutex, mpsc};
 use ark_ff::Field;
 use async_trait::async_trait;
 use uuid::Uuid;
+use std::time::Duration;
 
 /// Represents a connection to a peer
 ///
@@ -726,6 +727,9 @@ impl QuicNetworkManager {
         config.transport_config(Arc::new({
             let mut transport = quinn::TransportConfig::default();
             transport.max_concurrent_uni_streams(0u32.into());
+            // Keep the connection alive during idle periods and extend idle timeout
+            transport.keep_alive_interval(Some(Duration::from_secs(5)));
+            transport.max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(300_000))));
             transport
         }));
 
@@ -776,6 +780,9 @@ impl QuicNetworkManager {
         // Configure transport parameters
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(0u32.into());
+        // Keep the connection alive during idle periods and extend idle timeout
+        transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+        transport_config.max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(300_000))));
 
         Ok(server_config)
     }

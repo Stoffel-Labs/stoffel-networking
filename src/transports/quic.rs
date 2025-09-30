@@ -247,34 +247,32 @@ impl QuicPeerConnection {
     /// # Returns
     /// * `Ok((SendStream, RecvStream))` - The send and receive halves of the stream
     /// * `Err(String)` - If the stream could not be created
-    async fn get_or_create_stream(
-        &mut self,
-        stream_id: u64,
-    ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-        let mut streams = self.streams.lock().await;
-        if let Some((send, recv)) = streams.remove(&stream_id) {
-            // Reuse existing stream
-            Ok((send, recv))
-        } else {
-            drop(streams); // Release the lock before async operations
-            if self.is_server {
-                // Server should accept incoming streams
-                let (send, recv) = self
-                    .connection
-                    .accept_bi()
-                    .await
-                    .map_err(|e| format!("Failed to accept bidirectional stream: {}", e))?;
-                Ok((send, recv))
-            } else {
-                // Client should create new streams
-                let (send, recv) = self
-                    .connection
-                    .open_bi()
-                    .await
-                    .map_err(|e| format!("Failed to open bidirectional stream: {}", e))?;
-                Ok((send, recv))
-            }
+    async fn open_stream_for_send(&mut self, stream_id: u64) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        // Reuse cached stream if present
+        if let Some((send, recv)) = self.streams.lock().await.remove(&stream_id) {
+            return Ok((send, recv));
         }
+        // Actively open a stream when sending
+        let (send, recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| format!("Failed to open bidirectional stream: {}", e))?;
+        Ok((send, recv))
+    }
+
+    async fn accept_stream_for_recv(&mut self, stream_id: u64) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        // Reuse cached stream if present
+        if let Some((send, recv)) = self.streams.lock().await.remove(&stream_id) {
+            return Ok((send, recv));
+        }
+        // Passively accept when receiving
+        let (send, recv) = self
+            .connection
+            .accept_bi()
+            .await
+            .map_err(|e| format!("Failed to accept bidirectional stream: {}", e))?;
+        Ok((send, recv))
     }
 }
 
@@ -298,7 +296,7 @@ impl PeerConnection for QuicPeerConnection {
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            let (mut send, recv) = self.get_or_create_stream(stream_id).await?;
+            let (mut send, recv) = self.open_stream_for_send(stream_id).await?;
 
             send.write_all(data)
                 .await
@@ -317,7 +315,7 @@ impl PeerConnection for QuicPeerConnection {
         stream_id: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let (send, mut recv) = self.get_or_create_stream(stream_id).await?;
+            let (send, mut recv) = self.accept_stream_for_recv(stream_id).await?;
 
             // Read a chunk of data (up to 65536 bytes)
             let mut buf = vec![0u8; 65536];

@@ -32,6 +32,7 @@ use ark_ff::Field;
 use async_trait::async_trait;
 use uuid::Uuid;
 use std::time::Duration;
+use crate::transports::net_envelope::NetEnvelope;
 
 /// Represents a connection to a peer
 ///
@@ -827,10 +828,14 @@ impl NetworkManager for QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            // Send identification handshake as SERVER with our node_id
+            // Send identification handshake envelope as SERVER with our node_id
             if let Ok((mut send, _recv)) = connection.open_bi().await {
-                let handshake = format!("ROLE:SERVER:{}\n", self.node_id);
-                let _ = send.write_all(handshake.as_bytes()).await;
+                let envelope = NetEnvelope::Handshake {
+                    role: "SERVER".to_string(),
+                    id: self.node_id,
+                };
+                let bytes = envelope.serialize();
+                let _ = send.write_all(&bytes).await;
             }
 
             // Find the node ID for this address or generate a new one
@@ -878,15 +883,21 @@ impl NetworkManager for QuicNetworkManager {
             // Try to read a role identification handshake from the first bi-directional stream
             let mut parsed_role: Option<(String, usize)> = None;
             if let Ok((mut _send, mut recv)) = connection.accept_bi().await {
-                let mut buf = vec![0u8; 256];
+                // Read a small buffer; if it's a NetEnvelope, great; otherwise fallback. 
+                let mut buf = vec![0u8; 512];
                 if let Ok(Some(n)) = recv.read(&mut buf).await {
-                    let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
-                    if let Some(rest) = line.strip_prefix("ROLE:") {
-                        let mut parts = rest.split(':');
-                        if let (Some(role), Some(id_str)) = (parts.next(), parts.next()) {
-                            if let Ok(id) = id_str.trim().parse::<usize>() {
-                                parsed_role = Some((role.to_string(), id));
-                            }
+                    let bytes = &buf[..n];
+                    match NetEnvelope::try_deserialize(bytes) {
+                        Ok(NetEnvelope::Handshake { role, id }) => {
+                            parsed_role = Some((role, id));
+                        }
+                        Ok(NetEnvelope::HoneyBadger(_)) => {
+                            // Control stream received a payload; treat as legacy/no-handshake.
+                            parsed_role = None;
+                        }
+                        Err(_) => {
+                            // Not an envelope: legacy path.
+                            parsed_role = None;
                         }
                     }
                 }

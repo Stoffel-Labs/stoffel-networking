@@ -34,6 +34,8 @@ use uuid::Uuid;
 use std::time::Duration;
 use crate::transports::net_envelope::NetEnvelope;
 
+// ...rest of the code...
+
 /// Represents a connection to a peer
 ///
 /// This trait defines the interface for communicating with a remote peer.
@@ -795,6 +797,122 @@ impl QuicNetworkManager {
             conns.insert(self.node_id, Box::new(LoopbackPeerConnection::new(addr)));
         }
     }
+
+    /// Establish a connection and send a CLIENT-role handshake with the provided client_id.
+    pub fn connect_as_client<'a>(
+        &'a mut self,
+        address: SocketAddr,
+        client_id: ClientId,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            // Ensure endpoint and client config
+            if self.endpoint.is_none() {
+                let client_config = Self::create_insecure_client_config()?;
+                let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+                    .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
+                endpoint.set_default_client_config(client_config);
+                self.endpoint = Some(endpoint);
+            } else {
+                let client_config = Self::create_insecure_client_config()?;
+                if let Some(endpoint) = self.endpoint.as_mut() {
+                    endpoint.set_default_client_config(client_config);
+                }
+            }
+
+            // Ensure loopback connection exists for self-delivery
+            self.ensure_loopback_installed().await;
+
+            let endpoint = self.endpoint.as_ref().unwrap();
+            let connection = endpoint
+                .connect(address, "localhost")
+                .map_err(|e| format!("Failed to initiate connection: {}", e))?
+                .await
+                .map_err(|e| format!("Failed to establish connection: {}", e))?;
+
+            // Send identification handshake envelope as CLIENT with client_id
+            if let Ok((mut send, _recv)) = connection.open_bi().await {
+                let envelope = NetEnvelope::Handshake {
+                    role: "CLIENT".to_string(),
+                    id: client_id,
+                };
+                let bytes = envelope.serialize();
+                let _ = send.write_all(&bytes).await;
+            }
+
+            // Insert by address-derived node entry if present, else create ephemeral node id
+            let node_id = self.nodes.iter()
+                .find(|node| node.address() == address)
+                .map(|node| node.id())
+                .unwrap_or_else(|| {
+                    let node = QuicNode::new_with_random_id(address);
+                    let id = node.id();
+                    self.nodes.push(node);
+                    id
+                });
+
+            // Store connection under that node_id for server broadcasts and sends
+            let mut connections = self.connections.lock().await;
+            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
+
+            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
+        })
+    }
+
+    /// Establish a connection and send a SERVER-role handshake with our node_id (party_id).
+    pub fn connect_as_server<'a>(
+        &'a mut self,
+        address: SocketAddr,
+        party_id: PartyId,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
+        // Reuse the original connect path but override the handshake role/id to SERVER.
+        Box::pin(async move {
+            // Delegate to the existing connect(), but immediately after connecting we already send SERVER in connect().
+            // To be explicit and resilient to future changes, we mirror the body here with SERVER role using provided party_id.
+            if self.endpoint.is_none() {
+                let client_config = Self::create_insecure_client_config()?;
+                let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+                    .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
+                endpoint.set_default_client_config(client_config);
+                self.endpoint = Some(endpoint);
+            } else {
+                let client_config = Self::create_insecure_client_config()?;
+                if let Some(endpoint) = self.endpoint.as_mut() {
+                    endpoint.set_default_client_config(client_config);
+                }
+            }
+
+            self.ensure_loopback_installed().await;
+            let endpoint = self.endpoint.as_ref().unwrap();
+            let connection = endpoint
+                .connect(address, "localhost")
+                .map_err(|e| format!("Failed to initiate connection: {}", e))?
+                .await
+                .map_err(|e| format!("Failed to establish connection: {}", e))?;
+
+            if let Ok((mut send, _recv)) = connection.open_bi().await {
+                let envelope = NetEnvelope::Handshake {
+                    role: "SERVER".to_string(),
+                    id: party_id,
+                };
+                let bytes = envelope.serialize();
+                let _ = send.write_all(&bytes).await;
+            }
+
+            let node_id = self.nodes.iter()
+                .find(|node| node.address() == address)
+                .map(|node| node.id())
+                .unwrap_or_else(|| {
+                    let node = QuicNode::new_with_random_id(address);
+                    let id = node.id();
+                    self.nodes.push(node);
+                    id
+                });
+
+            let mut connections = self.connections.lock().await;
+            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
+            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
+        })
+    }
 }
 
 impl NetworkManager for QuicNetworkManager {
@@ -828,7 +946,8 @@ impl NetworkManager for QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            // Send identification handshake envelope as SERVER with our node_id
+            // Default handshake remains SERVER with our node_id (legacy behavior).
+            // New call sites should prefer connect_as_client/connect_as_server to be explicit.
             if let Ok((mut send, _recv)) = connection.open_bi().await {
                 let envelope = NetEnvelope::Handshake {
                     role: "SERVER".to_string(),
@@ -883,7 +1002,7 @@ impl NetworkManager for QuicNetworkManager {
             // Try to read a role identification handshake from the first bi-directional stream
             let mut parsed_role: Option<(String, usize)> = None;
             if let Ok((mut _send, mut recv)) = connection.accept_bi().await {
-                // Read a small buffer; if it's a NetEnvelope, great; otherwise fallback. 
+                // Read a small buffer; if it's a NetEnvelope, great; otherwise fallback.
                 let mut buf = vec![0u8; 512];
                 if let Ok(Some(n)) = recv.read(&mut buf).await {
                     let bytes = &buf[..n];

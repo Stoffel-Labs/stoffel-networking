@@ -1128,6 +1128,7 @@ dependencies = [
  "ark-ff",
  "async-trait",
  "bincode",
+ "log",
  "quinn",
  "rcgen",
  "rustls",

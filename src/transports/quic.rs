@@ -1,20 +1,6 @@
 // src/net/p2p.rs
 //! # Peer-to-Peer Networking for StoffelVM
 //!
-//! ## QUIC Stream Model
-//!
-//! This implementation uses persistent bidirectional streams:
-//! - **Long-lived streams**: A single bidirectional stream is opened per connection and reused
-//!   for all messages between that pair of peers.
-//! - **Message framing**: Length-prefixed framing (4-byte big-endian length + payload) allows
-//!   multiple messages to be sent over the same stream with clear boundaries.
-//! - **Connection persistence**: The QUIC connection itself is persistent and reused across
-//!   many message exchanges.
-//! - **Concurrent access**: Send and receive operations are protected by mutexes to allow
-//!   safe concurrent access from multiple tasks.
-//!
-//! For more details, see: https://docs.rs/quinn/latest/quinn/struct.Connection.html
-//!
 //! This module provides the networking capabilities for StoffelVM, enabling
 //! secure communication between distributed parties for multiparty computation.
 //!
@@ -48,6 +34,8 @@ use uuid::Uuid;
 use std::time::Duration;
 use crate::transports::net_envelope::NetEnvelope;
 
+// ...rest of the code...
+
 /// Represents a connection to a peer
 ///
 /// This trait defines the interface for communicating with a remote peer.
@@ -57,10 +45,10 @@ use crate::transports::net_envelope::NetEnvelope;
 /// The interface is transport-agnostic, allowing different implementations
 /// to use different underlying protocols (e.g., QUIC, WebRTC, etc.).
 pub trait PeerConnection: Send + Sync {
-    /// Sends data to the peer on a fresh stream
+    /// Sends data to the peer on the default stream
     ///
-    /// Opens a new bidirectional stream, sends the data, and closes the stream.
-    /// Each call creates a fresh stream - streams are not reused.
+    /// This is a convenience method that sends data on stream ID 0.
+    /// For more control, use `send_on_stream`.
     ///
     /// # Arguments
     /// * `data` - The data to send
@@ -73,16 +61,50 @@ pub trait PeerConnection: Send + Sync {
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-    /// Receives data from the next available incoming stream
+    /// Receives data from the peer on the default stream
     ///
-    /// Accepts the next incoming bidirectional stream and reads data from it.
-    /// This is a blocking operation that waits for an incoming stream.
+    /// This is a convenience method that receives data from stream ID 0.
+    /// For more control, use `receive_from_stream`.
     ///
     /// # Returns
     /// * `Ok(Vec<u8>)` - The received data
     /// * `Err(String)` - If there was an error receiving data
     fn receive<'a>(
         &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+
+    /// Sends data on a specific stream
+    ///
+    /// This method allows sending data on a specific stream ID, enabling
+    /// multiplexed communication with the peer.
+    ///
+    /// # Arguments
+    /// * `stream_id` - The ID of the stream to send on
+    /// * `data` - The data to send
+    ///
+    /// # Returns
+    /// * `Ok(())` - If the data was sent successfully
+    /// * `Err(String)` - If there was an error sending the data
+    fn send_on_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Receives data from a specific stream
+    ///
+    /// This method allows receiving data from a specific stream ID, enabling
+    /// multiplexed communication with the peer.
+    ///
+    /// # Arguments
+    /// * `stream_id` - The ID of the stream to receive from
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - The received data
+    /// * `Err(String)` - If there was an error receiving data
+    fn receive_from_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
 
     /// Returns the address of the remote peer
@@ -184,86 +206,15 @@ pub trait NetworkManager: Send + Sync {
 /// - Reliable, ordered delivery of data
 /// - Stream multiplexing for concurrent operations
 /// - Connection migration for network changes
-///
-/// ## Message Framing Protocol
-///
-/// This implementation uses a simple length-prefixed framing protocol:
-/// 1. Each message is prefixed with a 4-byte big-endian length field
-/// 2. The length field contains the size of the message payload in bytes
-/// 3. The payload immediately follows the length field
-///
-/// Example:
-/// ```text
-/// [0x00, 0x00, 0x00, 0x0A] [... 10 bytes of payload ...]
-/// ```
-///
-/// This allows multiple messages to be sent over the same stream while
-/// maintaining clear message boundaries.
 pub struct QuicPeerConnection {
     /// The underlying QUIC connection
     connection: Connection,
     /// The remote peer's address
     remote_addr: SocketAddr,
-    /// Persistent bidirectional stream for sending messages
-    send_stream: Arc<Mutex<Option<quinn::SendStream>>>,
-    /// Persistent bidirectional stream for receiving messages
-    recv_stream: Arc<Mutex<Option<quinn::RecvStream>>>,
-}
-
-impl QuicPeerConnection {
-    /// Sends a length-prefixed message over the stream
-    ///
-    /// # Arguments
-    /// * `send` - The send stream to write to
-    /// * `data` - The message payload to send
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the message was sent successfully
-    /// * `Err(String)` - If there was an error sending the message
-    async fn send_framed_message(
-        send: &mut quinn::SendStream,
-        data: &[u8],
-    ) -> Result<(), String> {
-        // Write the length prefix (4 bytes, big-endian)
-        let len = data.len() as u32;
-        send.write_all(&len.to_be_bytes())
-            .await
-            .map_err(|e| format!("Failed to write length prefix: {}", e))?;
-        
-        // Write the message payload
-        send.write_all(data)
-            .await
-            .map_err(|e| format!("Failed to write message payload: {}", e))?;
-        
-        Ok(())
-    }
-
-    /// Receives a length-prefixed message from the stream
-    ///
-    /// # Arguments
-    /// * `recv` - The receive stream to read from
-    ///
-    /// # Returns
-    /// * `Ok(Vec<u8>)` - The received message payload
-    /// * `Err(String)` - If there was an error receiving the message
-    async fn recv_framed_message(
-        recv: &mut quinn::RecvStream,
-    ) -> Result<Vec<u8>, String> {
-        // Read the length prefix (4 bytes, big-endian)
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| format!("Failed to read length prefix: {}", e))?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        
-        // Read the message payload
-        let mut msg = vec![0u8; len];
-        recv.read_exact(&mut msg)
-            .await
-            .map_err(|e| format!("Failed to read message payload: {}", e))?;
-        
-        Ok(msg)
-    }
+    /// Map of stream IDs to send/receive stream pairs
+    streams: Arc<Mutex<HashMap<u64, (quinn::SendStream, quinn::RecvStream)>>>,
+    /// Whether this connection is on the server side
+    is_server: bool,
 }
 
 impl QuicPeerConnection {
@@ -271,52 +222,61 @@ impl QuicPeerConnection {
     ///
     /// # Arguments
     /// * `connection` - The underlying QUIC connection
-    pub fn new(connection: Connection) -> Self {
+    /// * `is_server` - Whether this connection is on the server side
+    ///
+    /// The `is_server` parameter determines the behavior when creating new streams:
+    /// - Server connections accept incoming streams
+    /// - Client connections open new streams
+    pub fn new(connection: Connection, is_server: bool) -> Self {
         let remote_addr = connection.remote_address();
         Self {
             connection,
             remote_addr,
-            send_stream: Arc::new(Mutex::new(None)),
-            recv_stream: Arc::new(Mutex::new(None)),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            is_server,
         }
     }
 
-    /// Creates a new QUIC peer connection with an already-opened persistent stream
+    /// Gets or creates a bidirectional stream with the given ID
+    ///
+    /// This method manages the lifecycle of QUIC streams:
+    /// 1. If a stream with the given ID already exists, it is reused
+    /// 2. Otherwise, a new stream is created:
+    ///    - For server connections, by accepting an incoming stream
+    ///    - For client connections, by opening a new stream
     ///
     /// # Arguments
-    /// * `connection` - The underlying QUIC connection
-    /// * `send` - The send half of the bidirectional stream
-    /// * `recv` - The receive half of the bidirectional stream
-    pub fn new_with_stream(
-        connection: Connection,
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
-    ) -> Self {
-        let remote_addr = connection.remote_address();
-        Self {
-            connection,
-            remote_addr,
-            send_stream: Arc::new(Mutex::new(Some(send))),
-            recv_stream: Arc::new(Mutex::new(Some(recv))),
+    /// * `stream_id` - The ID of the stream to get or create
+    ///
+    /// # Returns
+    /// * `Ok((SendStream, RecvStream))` - The send and receive halves of the stream
+    /// * `Err(String)` - If the stream could not be created
+    async fn open_stream_for_send(&mut self, stream_id: u64) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        // Reuse cached stream if present
+        if let Some((send, recv)) = self.streams.lock().await.remove(&stream_id) {
+            return Ok((send, recv));
         }
+        // Actively open a stream when sending
+        let (send, recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| format!("Failed to open bidirectional stream: {}", e))?;
+        Ok((send, recv))
     }
 
-    /// Ensures a persistent stream is initialized
-    ///
-    /// If no stream exists, opens a new bidirectional stream and stores it.
-    /// This method is idempotent - calling it multiple times is safe.
-    async fn ensure_stream_initialized(&self) -> Result<(), String> {
-        let mut send_guard = self.send_stream.lock().await;
-        let mut recv_guard = self.recv_stream.lock().await;
-        
-        if send_guard.is_none() || recv_guard.is_none() {
-            let (send, recv) = self.connection.open_bi().await
-                .map_err(|e| format!("Failed to open persistent stream: {}", e))?;
-            *send_guard = Some(send);
-            *recv_guard = Some(recv);
+    async fn accept_stream_for_recv(&mut self, stream_id: u64) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        // Reuse cached stream if present
+        if let Some((send, recv)) = self.streams.lock().await.remove(&stream_id) {
+            return Ok((send, recv));
         }
-        
-        Ok(())
+        // Passively accept when receiving
+        let (send, recv) = self
+            .connection
+            .accept_bi()
+            .await
+            .map_err(|e| format!("Failed to accept bidirectional stream: {}", e))?;
+        Ok((send, recv))
     }
 }
 
@@ -325,35 +285,56 @@ impl PeerConnection for QuicPeerConnection {
         &'a mut self,
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            // Ensure the persistent stream is initialized
-            self.ensure_stream_initialized().await?;
-            
-            // Get the send stream and send the framed message
-            let mut send_guard = self.send_stream.lock().await;
-            if let Some(send) = send_guard.as_mut() {
-                Self::send_framed_message(send, data).await?;
-            } else {
-                return Err("Send stream not initialized".to_string());
-            }
-            
-            Ok(())
-        })
+        Box::pin(async move { self.send_on_stream(0, data).await })
     }
 
     fn receive<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+        Box::pin(async move { self.receive_from_stream(0).await })
+    }
+
+    fn send_on_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            // Ensure the persistent stream is initialized
-            self.ensure_stream_initialized().await?;
-            
-            // Get the receive stream and receive the framed message
-            let mut recv_guard = self.recv_stream.lock().await;
-            if let Some(recv) = recv_guard.as_mut() {
-                Self::recv_framed_message(recv).await
-            } else {
-                Err("Receive stream not initialized".to_string())
+            let (mut send, recv) = self.open_stream_for_send(stream_id).await?;
+
+            send.write_all(data)
+                .await
+                .map_err(|e| format!("Failed to send data: {}", e))?;
+
+            // Store the stream back for reuse
+            let mut streams = self.streams.lock().await;
+            streams.insert(stream_id, (send, recv));
+
+            Ok(())
+        })
+    }
+
+    fn receive_from_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let (send, mut recv) = self.accept_stream_for_recv(stream_id).await?;
+
+            // Read a chunk of data (up to 65536 bytes)
+            let mut buf = vec![0u8; 65536];
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => {
+                    buf.truncate(n);
+
+                    // Store the stream back for reuse
+                    let mut streams = self.streams.lock().await;
+                    streams.insert(stream_id, (send, recv));
+
+                    Ok(buf)
+                }
+                Ok(None) => Err("Connection closed by peer".to_string()),
+                Err(e) => Err(format!("Failed to receive data: {}", e)),
             }
         })
     }
@@ -373,18 +354,24 @@ impl PeerConnection for QuicPeerConnection {
 /// In-memory loopback implementation of PeerConnection for self-delivery
 pub struct LoopbackPeerConnection {
     remote_addr: SocketAddr,
-    /// Single channel for all messages with proper framing
-    tx: mpsc::Sender<Vec<u8>>,
-    rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    streams: Arc<Mutex<HashMap<u64, (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)>>> ,
 }
 
 impl LoopbackPeerConnection {
     pub fn new(remote_addr: SocketAddr) -> Self {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
         Self {
             remote_addr,
-            tx,
-            rx: Arc::new(Mutex::new(rx)),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn ensure_stream(&self, stream_id: u64) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let mut guard = self.streams.lock().await;
+        if let Some((tx, rx)) = guard.remove(&stream_id) {
+            (tx, rx)
+        } else {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+            (tx, rx)
         }
     }
 }
@@ -394,34 +381,62 @@ impl PeerConnection for LoopbackPeerConnection {
         &'a mut self,
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        self.send_on_stream(0, data)
+    }
+
+    fn receive<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+        self.receive_from_stream(0)
+    }
+
+    fn send_on_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            self.tx.send(data.to_vec())
+            let (tx, rx) = self.ensure_stream(stream_id).await;
+            // put back for reuse
+            {
+                let mut guard = self.streams.lock().await;
+                guard.insert(stream_id, (tx.clone(), rx));
+            }
+            tx.send(data.to_vec())
                 .await
                 .map_err(|e| format!("loopback send failed: {}", e))
                 .map(|_| ())
         })
     }
 
-    fn receive<'a>(
+    fn receive_from_stream<'a>(
         &'a mut self,
+        stream_id: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let mut rx = self.rx.lock().await;
-            match rx.recv().await {
-                Some(msg) => Ok(msg),
-                None => Err("loopback connection closed".into()),
+            // ensure stream exists and reinsert for reuse
+            let (tx, mut rx) = self.ensure_stream(stream_id).await;
+            {
+                let mut guard = self.streams.lock().await;
+                guard.insert(stream_id, (tx, rx));
+            }
+            // now take receiver to await on
+            let mut guard = self.streams.lock().await;
+            if let Some((_tx, rx)) = guard.get_mut(&stream_id) {
+                match rx.recv().await {
+                    Some(msg) => Ok(msg),
+                    None => Err("loopback connection closed".into()),
+                }
+            } else {
+                Err("loopback stream missing".into())
             }
         })
     }
 
-    fn remote_address(&self) -> SocketAddr { 
-        self.remote_addr 
-    }
+    fn remote_address(&self) -> SocketAddr { self.remote_addr }
 
     fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move { 
-            Ok(())
-        })
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -814,44 +829,32 @@ impl QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            // Open a persistent bidirectional stream for this connection
-            let (mut send, recv) = connection.open_bi().await
-                .map_err(|e| format!("Failed to open persistent stream: {}", e))?;
-
             // Send identification handshake envelope as CLIENT with client_id
-            let envelope = NetEnvelope::Handshake {
-                role: "CLIENT".to_string(),
-                id: client_id,
-            };
-            let bytes = envelope.serialize();
-            
-            // Use framed message for handshake
-            let len = bytes.len() as u32;
-            send.write_all(&len.to_be_bytes()).await
-                .map_err(|e| format!("Failed to send handshake length: {}", e))?;
-            send.write_all(&bytes).await
-                .map_err(|e| format!("Failed to send handshake: {}", e))?;
+            if let Ok((mut send, _recv)) = connection.open_bi().await {
+                let envelope = NetEnvelope::Handshake {
+                    role: "CLIENT".to_string(),
+                    id: client_id,
+                };
+                let bytes = envelope.serialize();
+                let _ = send.write_all(&bytes).await;
+            }
 
-            // Find the node ID for this address or generate a new one
-            let existing_node = self.nodes.iter()
+            // Insert by address-derived node entry if present, else create ephemeral node id
+            let node_id = self.nodes.iter()
                 .find(|node| node.address() == address)
-                .map(|node| node.id());
-            
-            let node_id = if let Some(id) = existing_node {
-                id
-            } else {
-                // If we don't have a node for this address, create one
-                let node = QuicNode::new_with_random_id(address);
-                let id = node.id();
-                self.nodes.push(node);
-                id
-            };
+                .map(|node| node.id())
+                .unwrap_or_else(|| {
+                    let node = QuicNode::new_with_random_id(address);
+                    let id = node.id();
+                    self.nodes.push(node);
+                    id
+                });
 
             // Store connection under that node_id for server broadcasts and sends
             let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone())));
+            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
 
-            Ok(Box::new(QuicPeerConnection::new_with_stream(connection, send, recv)) as Box<dyn PeerConnection>)
+            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
         })
     }
 
@@ -886,23 +889,14 @@ impl QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            // Open a persistent bidirectional stream for this connection
-            let (mut send, recv) = connection.open_bi().await
-                .map_err(|e| format!("Failed to open persistent stream: {}", e))?;
-
-            // Send identification handshake envelope as SERVER with party_id
-            let envelope = NetEnvelope::Handshake {
-                role: "SERVER".to_string(),
-                id: party_id,
-            };
-            let bytes = envelope.serialize();
-            
-            // Use framed message for handshake
-            let len = bytes.len() as u32;
-            send.write_all(&len.to_be_bytes()).await
-                .map_err(|e| format!("Failed to send handshake length: {}", e))?;
-            send.write_all(&bytes).await
-                .map_err(|e| format!("Failed to send handshake: {}", e))?;
+            if let Ok((mut send, _recv)) = connection.open_bi().await {
+                let envelope = NetEnvelope::Handshake {
+                    role: "SERVER".to_string(),
+                    id: party_id,
+                };
+                let bytes = envelope.serialize();
+                let _ = send.write_all(&bytes).await;
+            }
 
             let node_id = self.nodes.iter()
                 .find(|node| node.address() == address)
@@ -915,9 +909,8 @@ impl QuicNetworkManager {
                 });
 
             let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone())));
-            
-            Ok(Box::new(QuicPeerConnection::new_with_stream(connection, send, recv)) as Box<dyn PeerConnection>)
+            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
+            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
         })
     }
 }
@@ -953,45 +946,35 @@ impl NetworkManager for QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            // Open a persistent bidirectional stream for this connection
-            let (mut send, recv) = connection.open_bi().await
-                .map_err(|e| format!("Failed to open persistent stream: {}", e))?;
-
             // Default handshake remains SERVER with our node_id (legacy behavior).
             // New call sites should prefer connect_as_client/connect_as_server to be explicit.
-            let envelope = NetEnvelope::Handshake {
-                role: "SERVER".to_string(),
-                id: self.node_id,
-            };
-            let bytes = envelope.serialize();
-            
-            // Use framed message for handshake
-            let len = bytes.len() as u32;
-            send.write_all(&len.to_be_bytes()).await
-                .map_err(|e| format!("Failed to send handshake length: {}", e))?;
-            send.write_all(&bytes).await
-                .map_err(|e| format!("Failed to send handshake: {}", e))?;
+            if let Ok((mut send, _recv)) = connection.open_bi().await {
+                let envelope = NetEnvelope::Handshake {
+                    role: "SERVER".to_string(),
+                    id: self.node_id,
+                };
+                let bytes = envelope.serialize();
+                let _ = send.write_all(&bytes).await;
+            }
 
             // Find the node ID for this address or generate a new one
-            let existing_node = self.nodes.iter()
+            let node_id = self.nodes.iter()
                 .find(|node| node.address() == address)
-                .map(|node| node.id());
-            
-            let node_id = if let Some(id) = existing_node {
-                id
-            } else {
-                // If we don't have a node for this address, create one
-                let node = QuicNode::new_with_random_id(address);
-                self.nodes.push(node);
-                self.nodes.last().unwrap().id()
-            };
+                .map(|node| node.id())
+                .unwrap_or_else(|| {
+                    // If we don't have a node for this address, create one
+                    let node = QuicNode::new_with_random_id(address);
+                    let id = node.id();
+                    self.nodes.push(node);
+                    id
+                });
 
             // Store a clone of the connection in the connections hashmap
             let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone())));
+            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
 
             // Return the original connection
-            Ok(Box::new(QuicPeerConnection::new_with_stream(connection, send, recv)) as Box<dyn PeerConnection>)
+            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
         })
     }
 
@@ -1016,18 +999,14 @@ impl NetworkManager for QuicNetworkManager {
             // Get the remote address of the connection
             let remote_addr = connection.remote_address();
 
-            // Accept the persistent bidirectional stream and read handshake
+            // Try to read a role identification handshake from the first bi-directional stream
             let mut parsed_role: Option<(String, usize)> = None;
-            let (send, mut recv) = connection.accept_bi().await
-                .map_err(|e| format!("Failed to accept persistent stream: {}", e))?;
-            
-            // Read the framed handshake message
-            let mut len_buf = [0u8; 4];
-            if let Ok(_) = recv.read_exact(&mut len_buf).await {
-                let len = u32::from_be_bytes(len_buf) as usize;
-                let mut buf = vec![0u8; len];
-                if let Ok(_) = recv.read_exact(&mut buf).await {
-                    match NetEnvelope::try_deserialize(&buf) {
+            if let Ok((mut _send, mut recv)) = connection.accept_bi().await {
+                // Read a small buffer; if it's a NetEnvelope, great; otherwise fallback.
+                let mut buf = vec![0u8; 512];
+                if let Ok(Some(n)) = recv.read(&mut buf).await {
+                    let bytes = &buf[..n];
+                    match NetEnvelope::try_deserialize(bytes) {
                         Ok(NetEnvelope::Handshake { role, id }) => {
                             parsed_role = Some((role, id));
                         }
@@ -1048,12 +1027,12 @@ impl NetworkManager for QuicNetworkManager {
                     // Store as client connection
                     {
                         let mut cc = self.client_connections_async.lock().await;
-                        cc.insert(id, Box::new(QuicPeerConnection::new(connection.clone())));
+                        cc.insert(id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
                     }
                     if let Ok(mut set) = self.client_ids.lock() { set.insert(id); }
 
                     // Return the original connection
-                    Ok(Box::new(QuicPeerConnection::new_with_stream(connection, send, recv)) as Box<dyn PeerConnection>)
+                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
                 }
                 Some((role, id)) if role.eq_ignore_ascii_case("SERVER") => {
                     // Ensure the nodes list includes this server party
@@ -1063,30 +1042,27 @@ impl NetworkManager for QuicNetworkManager {
 
                     // Store connection in server connections map
                     let mut connections = self.connections.lock().await;
-                    connections.insert(id, Box::new(QuicPeerConnection::new(connection.clone())));
+                    connections.insert(id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
 
                     // Return the original connection
-                    Ok(Box::new(QuicPeerConnection::new_with_stream(connection, send, recv)) as Box<dyn PeerConnection>)
+                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
                 }
                 _ => {
                     // Fallback: use address-based mapping as before
-                    let existing_node = self.nodes.iter()
+                    let node_id = self.nodes.iter()
                         .find(|node| node.address() == remote_addr)
-                        .map(|node| node.id());
-                    
-                    let node_id = if let Some(id) = existing_node {
-                        id
-                    } else {
-                        let node = QuicNode::new_with_random_id(remote_addr);
-                        let id = node.id();
-                        self.nodes.push(node);
-                        id
-                    };
+                        .map(|node| node.id())
+                        .unwrap_or_else(|| {
+                            let node = QuicNode::new_with_random_id(remote_addr);
+                            let id = node.id();
+                            self.nodes.push(node);
+                            id
+                        });
 
                     let mut connections = self.connections.lock().await;
-                    connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone())));
+                    connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
 
-                    Ok(Box::new(QuicPeerConnection::new_with_stream(connection, send, recv)) as Box<dyn PeerConnection>)
+                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
                 }
             }
         })

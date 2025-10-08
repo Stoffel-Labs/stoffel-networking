@@ -732,7 +732,7 @@ impl QuicNetworkManager {
             transport.max_concurrent_uni_streams(0u32.into());
             // Keep the connection alive during idle periods and extend idle timeout
             transport.keep_alive_interval(Some(Duration::from_secs(5)));
-            transport.max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(5000))));
+            transport.max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(30000))));
             transport
         }));
 

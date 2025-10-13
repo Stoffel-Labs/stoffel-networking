@@ -3,16 +3,8 @@
 //!
 //! ## QUIC Stream Model
 //!
-//! This implementation uses persistent bidirectional streams:
-//! - **One persistent stream per connection**: A single bidirectional stream is established
-//!   when the connection is created and reused for all messages.
-//! - **Message framing**: Length-prefixed framing (4-byte big-endian length + payload) allows
-//!   multiple messages to be sent over the same stream with clear boundaries.
-//! - **Connection persistence**: The QUIC connection is persistent and reused across
-//!   many message exchanges.
-//! - **Thread-safe concurrent access**: Send and receive operations are protected by mutexes
-//!   to allow safe concurrent access from multiple tasks.
-//! - **Arc-based connections**: Connections use Arc for sharing between send/receive tasks
+//! This implementation uses persistent bidirectional streams with improved
+//! connection state management and graceful handling of stream/connection closures.
 
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, IdleTimeout};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -33,27 +25,55 @@ use std::time::Duration;
 use crate::transports::net_envelope::NetEnvelope;
 
 // ============================================================================
+// CONNECTION STATE
+// ============================================================================
+
+/// Represents the current state of a connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Connection is active and healthy
+    Connected,
+    /// Connection is gracefully closing
+    Closing,
+    /// Connection has been closed
+    Closed,
+    /// Connection failed/disconnected unexpectedly
+    Disconnected,
+}
+
+// ============================================================================
 // CUSTOM ERROR TYPE
 // ============================================================================
 
 /// Error type for connection operations
 #[derive(Debug, Clone)]
 pub enum ConnectionError {
+    /// Stream closed gracefully by peer
     StreamClosed,
+    /// Connection lost unexpectedly
+    ConnectionLost(String),
+    /// Send operation failed
     SendFailed(String),
+    /// Receive operation failed
     ReceiveFailed(String),
+    /// Message framing error
     FramingError(String),
+    /// Connection initialization failed
     InitializationFailed(String),
+    /// Connection is in invalid state for operation
+    InvalidState(ConnectionState),
 }
 
 impl std::fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::StreamClosed => write!(f, "Stream closed by peer"),
+            Self::StreamClosed => write!(f, "Stream closed gracefully by peer"),
+            Self::ConnectionLost(msg) => write!(f, "Connection lost: {}", msg),
             Self::SendFailed(msg) => write!(f, "Send failed: {}", msg),
             Self::ReceiveFailed(msg) => write!(f, "Receive failed: {}", msg),
             Self::FramingError(msg) => write!(f, "Framing error: {}", msg),
             Self::InitializationFailed(msg) => write!(f, "Initialization failed: {}", msg),
+            Self::InvalidState(state) => write!(f, "Invalid connection state: {:?}", state),
         }
     }
 }
@@ -90,8 +110,14 @@ pub trait PeerConnection: Send + Sync {
     /// Returns the address of the remote peer
     fn remote_address(&self) -> SocketAddr;
 
-    /// Closes the connection
+    /// Closes the connection gracefully
     fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Returns the current connection state
+    fn state<'a>(&'a self) -> Pin<Box<dyn Future<Output = ConnectionState> + Send + 'a>>;
+
+    /// Checks if the connection is still alive
+    fn is_connected<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 }
 
 impl Debug for dyn PeerConnection {
@@ -127,7 +153,7 @@ pub trait NetworkManager: Send + Sync {
 /// Maximum message size: 100MB
 const MAX_MESSAGE_SIZE: usize = 100_000_000;
 
-/// Sends a length-prefixed message
+/// Sends a length-prefixed message with connection state checking
 async fn send_framed_message(
     send: &mut quinn::SendStream,
     data: &[u8],
@@ -142,17 +168,30 @@ async fn send_framed_message(
     let len = data.len() as u32;
     send.write_all(&len.to_be_bytes())
         .await
-        .map_err(|e| ConnectionError::SendFailed(format!("Failed to write length: {}", e)))?;
+        .map_err(|e| {
+            // Check if this is a connection error
+            if e.to_string().contains("closed") || e.to_string().contains("reset") {
+                ConnectionError::ConnectionLost(format!("Connection lost while writing length: {}", e))
+            } else {
+                ConnectionError::SendFailed(format!("Failed to write length: {}", e))
+            }
+        })?;
 
     // Write message payload
     send.write_all(data)
         .await
-        .map_err(|e| ConnectionError::SendFailed(format!("Failed to write payload: {}", e)))?;
+        .map_err(|e| {
+            if e.to_string().contains("closed") || e.to_string().contains("reset") {
+                ConnectionError::ConnectionLost(format!("Connection lost while writing payload: {}", e))
+            } else {
+                ConnectionError::SendFailed(format!("Failed to write payload: {}", e))
+            }
+        })?;
 
     Ok(())
 }
 
-/// Receives a length-prefixed message
+/// Receives a length-prefixed message with better EOF handling
 async fn recv_framed_message(
     recv: &mut quinn::RecvStream,
 ) -> Result<Vec<u8>, ConnectionError> {
@@ -162,8 +201,15 @@ async fn recv_framed_message(
         .await
         .map_err(|e| match e {
             quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
-            quinn::ReadExactError::ReadError(re) =>
-                ConnectionError::ReceiveFailed(format!("Failed to read length: {}", re)),
+            quinn::ReadExactError::ReadError(re) => {
+                // Check if this is a connection lost scenario
+                let err_str = re.to_string();
+                if err_str.contains("closed") || err_str.contains("reset") || err_str.contains("connection lost") {
+                    ConnectionError::ConnectionLost(format!("Connection lost while reading length: {}", re))
+                } else {
+                    ConnectionError::ReceiveFailed(format!("Failed to read length: {}", re))
+                }
+            }
         })?;
 
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -181,8 +227,14 @@ async fn recv_framed_message(
         .await
         .map_err(|e| match e {
             quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
-            quinn::ReadExactError::ReadError(re) =>
-                ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re)),
+            quinn::ReadExactError::ReadError(re) => {
+                let err_str = re.to_string();
+                if err_str.contains("closed") || err_str.contains("reset") || err_str.contains("connection lost") {
+                    ConnectionError::ConnectionLost(format!("Connection lost while reading payload: {}", re))
+                } else {
+                    ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re))
+                }
+            }
         })?;
 
     Ok(msg)
@@ -199,6 +251,8 @@ pub struct QuicPeerConnection {
     send_stream: Arc<Mutex<quinn::SendStream>>,
     /// Persistent receive stream - uses interior mutability for sharing
     recv_stream: Arc<Mutex<quinn::RecvStream>>,
+    /// Connection state
+    state: Arc<Mutex<ConnectionState>>,
 }
 
 impl QuicPeerConnection {
@@ -214,6 +268,7 @@ impl QuicPeerConnection {
             remote_addr,
             send_stream: Arc::new(Mutex::new(send)),
             recv_stream: Arc::new(Mutex::new(recv)),
+            state: Arc::new(Mutex::new(ConnectionState::Connected)),
         }
     }
 
@@ -232,7 +287,23 @@ impl QuicPeerConnection {
             remote_addr,
             send_stream: Arc::new(Mutex::new(send)),
             recv_stream: Arc::new(Mutex::new(recv)),
+            state: Arc::new(Mutex::new(ConnectionState::Connected)),
         })
+    }
+
+    /// Updates connection state
+    async fn update_state(&self, new_state: ConnectionState) {
+        let mut state = self.state.lock().await;
+        *state = new_state;
+    }
+
+    /// Checks the underlying QUIC connection health
+    async fn check_connection_health(&self) -> bool {
+        // Check if the connection is closed
+        if let Some(err) = self.connection.close_reason() {
+            return false;
+        }
+        true
     }
 }
 
@@ -242,10 +313,33 @@ impl PeerConnection for QuicPeerConnection {
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            // Check state before sending
+            {
+                let state = self.state.lock().await;
+                match *state {
+                    ConnectionState::Closed | ConnectionState::Disconnected => {
+                        return Err(format!("Cannot send: connection is {:?}", *state));
+                    }
+                    ConnectionState::Closing => {
+                        return Err("Cannot send: connection is closing".to_string());
+                    }
+                    _ => {}
+                }
+            }
+
             let mut send_guard = self.send_stream.lock().await;
-            send_framed_message(&mut *send_guard, data)
-                .await
-                .map_err(|e| e.to_string())
+            match send_framed_message(&mut *send_guard, data).await {
+                Ok(()) => Ok(()),
+                Err(ConnectionError::ConnectionLost(msg)) => {
+                    self.update_state(ConnectionState::Disconnected).await;
+                    Err(format!("Connection lost: {}", msg))
+                }
+                Err(ConnectionError::StreamClosed) => {
+                    self.update_state(ConnectionState::Closed).await;
+                    Err("Stream closed by peer".to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            }
         })
     }
 
@@ -253,10 +347,30 @@ impl PeerConnection for QuicPeerConnection {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
         Box::pin(async move {
+            // Check state before receiving
+            {
+                let state = self.state.lock().await;
+                match *state {
+                    ConnectionState::Closed | ConnectionState::Disconnected => {
+                        return Err(format!("Cannot receive: connection is {:?}", *state));
+                    }
+                    _ => {}
+                }
+            }
+
             let mut recv_guard = self.recv_stream.lock().await;
-            recv_framed_message(&mut *recv_guard)
-                .await
-                .map_err(|e| e.to_string())
+            match recv_framed_message(&mut *recv_guard).await {
+                Ok(data) => Ok(data),
+                Err(ConnectionError::ConnectionLost(msg)) => {
+                    self.update_state(ConnectionState::Disconnected).await;
+                    Err(format!("Connection lost: {}", msg))
+                }
+                Err(ConnectionError::StreamClosed) => {
+                    self.update_state(ConnectionState::Closed).await;
+                    Err("Stream closed by peer".to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            }
         })
     }
 
@@ -266,8 +380,27 @@ impl PeerConnection for QuicPeerConnection {
 
     fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            self.connection.close(0u32.into(), b"Connection closed");
+            self.update_state(ConnectionState::Closing).await;
+            self.connection.close(0u32.into(), b"Connection closed gracefully");
+            self.update_state(ConnectionState::Closed).await;
             Ok(())
+        })
+    }
+
+    fn state<'a>(&'a self) -> Pin<Box<dyn Future<Output = ConnectionState> + Send + 'a>> {
+        Box::pin(async move {
+            let state = self.state.lock().await;
+            *state
+        })
+    }
+
+    fn is_connected<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let state = self.state.lock().await;
+            match *state {
+                ConnectionState::Connected => self.check_connection_health().await,
+                _ => false,
+            }
         })
     }
 }
@@ -280,6 +413,7 @@ pub struct LoopbackPeerConnection {
     remote_addr: SocketAddr,
     tx: mpsc::Sender<Vec<u8>>,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    state: Arc<Mutex<ConnectionState>>,
 }
 
 impl LoopbackPeerConnection {
@@ -289,6 +423,7 @@ impl LoopbackPeerConnection {
             remote_addr,
             tx,
             rx: Arc::new(Mutex::new(rx)),
+            state: Arc::new(Mutex::new(ConnectionState::Connected)),
         }
     }
 
@@ -318,6 +453,12 @@ impl LoopbackPeerConnection {
 
         Ok(framed[4..].to_vec())
     }
+
+    /// Updates connection state
+    async fn update_state(&self, new_state: ConnectionState) {
+        let mut state = self.state.lock().await;
+        *state = new_state;
+    }
 }
 
 impl PeerConnection for LoopbackPeerConnection {
@@ -326,11 +467,29 @@ impl PeerConnection for LoopbackPeerConnection {
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            // Check state
+            {
+                let state = self.state.lock().await;
+                if *state != ConnectionState::Connected {
+                    return Err(format!("Cannot send: loopback connection is {:?}", *state));
+                }
+            }
+
             let framed = Self::frame_message(data);
             self.tx
                 .send(framed)
                 .await
-                .map_err(|e| format!("Loopback send failed: {}", e))
+                .map_err(|e| {
+                    // Channel closed - update state
+                    tokio::spawn({
+                        let state = self.state.clone();
+                        async move {
+                            let mut s = state.lock().await;
+                            *s = ConnectionState::Closed;
+                        }
+                    });
+                    format!("Loopback send failed: {}", e)
+                })
         })
     }
 
@@ -338,10 +497,23 @@ impl PeerConnection for LoopbackPeerConnection {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
         Box::pin(async move {
+            // Check state
+            {
+                let state = self.state.lock().await;
+                if *state == ConnectionState::Closed || *state == ConnectionState::Disconnected {
+                    return Err(format!("Cannot receive: loopback connection is {:?}", *state));
+                }
+            }
+
             let mut rx = self.rx.lock().await;
             match rx.recv().await {
-                Some(framed) => Self::unframe_message(framed).map_err(|e| e.to_string()),
-                None => Err("Loopback connection closed".to_string()),
+                Some(framed) => {
+                    Self::unframe_message(framed).map_err(|e| e.to_string())
+                }
+                None => {
+                    self.update_state(ConnectionState::Closed).await;
+                    Err("Loopback connection closed".to_string())
+                }
             }
         })
     }
@@ -351,7 +523,26 @@ impl PeerConnection for LoopbackPeerConnection {
     }
 
     fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            self.update_state(ConnectionState::Closing).await;
+            // For loopback, we just update state - channel will close when dropped
+            self.update_state(ConnectionState::Closed).await;
+            Ok(())
+        })
+    }
+
+    fn state<'a>(&'a self) -> Pin<Box<dyn Future<Output = ConnectionState> + Send + 'a>> {
+        Box::pin(async move {
+            let state = self.state.lock().await;
+            *state
+        })
+    }
+
+    fn is_connected<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let state = self.state.lock().await;
+            *state == ConnectionState::Connected
+        })
     }
 }
 
@@ -489,7 +680,6 @@ pub struct QuicNetworkManager {
     nodes: Vec<QuicNode>,
     node_id: PartyId,
     network_config: QuicNetworkConfig,
-    /// CHANGED: Now uses Arc for sharing connections between tasks
     connections: Arc<Mutex<HashMap<PartyId, Arc<dyn PeerConnection>>>>,
     client_connections: Arc<Mutex<HashMap<ClientId, Arc<dyn PeerConnection>>>>,
     client_ids: Arc<StdMutex<HashSet<ClientId>>>,
@@ -557,6 +747,32 @@ impl QuicNetworkManager {
     pub async fn get_all_connections(&self) -> Vec<(PartyId, Arc<dyn PeerConnection>)> {
         let conns = self.connections.lock().await;
         conns.iter().map(|(id, conn)| (*id, Arc::clone(conn))).collect()
+    }
+
+    /// Removes dead connections from the connection map
+    pub async fn cleanup_dead_connections(&self) {
+        let mut conns = self.connections.lock().await;
+        let mut to_remove = Vec::new();
+
+        for (party_id, conn) in conns.iter() {
+            if !conn.is_connected().await {
+                to_remove.push(*party_id);
+            }
+        }
+
+        for party_id in to_remove {
+            conns.remove(&party_id);
+        }
+    }
+
+    /// Checks connection health for a specific party
+    pub async fn is_party_connected(&self, party_id: PartyId) -> bool {
+        let conns = self.connections.lock().await;
+        if let Some(conn) = conns.get(&party_id) {
+            conn.is_connected().await
+        } else {
+            false
+        }
     }
 
     /// Creates insecure client config (for development only)
@@ -840,6 +1056,14 @@ impl Network for QuicNetworkManager {
         let connections = self.connections.lock().await;
 
         if let Some(connection) = connections.get(&recipient) {
+            // Check if connection is still alive
+            if !connection.is_connected().await {
+                println!("Connection to recipient {} is dead, removing from map", recipient);
+                drop(connections);
+                self.cleanup_dead_connections().await;
+                return Err(NetworkError::PartyNotFound(recipient));
+            }
+
             match connection.send(message).await {
                 Ok(_) => {
                     println!("Successfully sent message to recipient {}", recipient);
@@ -847,6 +1071,9 @@ impl Network for QuicNetworkManager {
                 }
                 Err(e) => {
                     println!("Failed to send message to recipient {}: {}", recipient, e);
+                    // Connection might be dead, mark for cleanup
+                    drop(connections);
+                    self.cleanup_dead_connections().await;
                     Err(NetworkError::SendError)
                 }
             }
@@ -862,6 +1089,12 @@ impl Network for QuicNetworkManager {
 
         for node in &self.nodes {
             if let Some(connection) = connections.get(&node.id()) {
+                // Check connection health before sending
+                if !connection.is_connected().await {
+                    println!("Skipping broadcast to node {}: connection is dead", node.id());
+                    continue;
+                }
+
                 match connection.send(message).await {
                     Ok(_) => {
                         println!("Successfully broadcasted message to node {}", node.id());
@@ -882,12 +1115,16 @@ impl Network for QuicNetworkManager {
         // Ensure self-delivery via loopback
         if !included_self {
             if let Some(connection) = connections.get(&self.node_id) {
-                if connection.send(message).await.is_ok() {
+                if connection.is_connected().await && connection.send(message).await.is_ok() {
                     println!("Successfully broadcasted message to self (loopback)");
                     total_bytes += message.len();
                 }
             }
         }
+
+        // Cleanup dead connections after broadcast
+        drop(connections);
+        self.cleanup_dead_connections().await;
 
         Ok(total_bytes)
     }
@@ -915,6 +1152,13 @@ impl Network for QuicNetworkManager {
     async fn send_to_client(&self, client: ClientId, message: &[u8]) -> Result<usize, NetworkError> {
         let connections = self.client_connections.lock().await;
         if let Some(conn) = connections.get(&client) {
+            // Check connection health
+            if !conn.is_connected().await {
+                println!("Connection to client {} is dead", client);
+                drop(connections);
+                return Err(NetworkError::ClientNotFound(client));
+            }
+
             match conn.send(message).await {
                 Ok(_) => Ok(message.len()),
                 Err(_) => Err(NetworkError::SendError),

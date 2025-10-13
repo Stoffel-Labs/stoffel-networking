@@ -1,20 +1,18 @@
 // src/net/p2p.rs
-//! # Peer-to-Peer Networking for StoffelVM
+//! # Peer-to-Peer Networking for StoffelVM (Actor Model Compatible)
 //!
-//! This module provides the networking capabilities for StoffelVM, enabling
-//! secure communication between distributed parties for multiparty computation.
+//! ## QUIC Stream Model
 //!
-//! The networking layer is built on the QUIC protocol, which offers:
-//! - Encrypted connections using TLS 1.3
-//! - Low latency with 0-RTT connection establishment
-//! - Stream multiplexing for concurrent data transfers
-//! - Connection migration for network changes
-//!
-//! The module defines two primary abstractions:
-//! - `PeerConnection`: Represents a connection to a single peer
-//! - `NetworkManager`: Manages multiple peer connections
-//!
-//! The current implementation uses the Quinn library for QUIC support.
+//! This implementation uses persistent bidirectional streams:
+//! - **One persistent stream per connection**: A single bidirectional stream is established
+//!   when the connection is created and reused for all messages.
+//! - **Message framing**: Length-prefixed framing (4-byte big-endian length + payload) allows
+//!   multiple messages to be sent over the same stream with clear boundaries.
+//! - **Connection persistence**: The QUIC connection is persistent and reused across
+//!   many message exchanges.
+//! - **Thread-safe concurrent access**: Send and receive operations are protected by mutexes
+//!   to allow safe concurrent access from multiple tasks.
+//! - **Arc-based connections**: Connections use Arc for sharing between send/receive tasks
 
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, IdleTimeout};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -34,94 +32,66 @@ use uuid::Uuid;
 use std::time::Duration;
 use crate::transports::net_envelope::NetEnvelope;
 
-// ...rest of the code...
+// ============================================================================
+// CUSTOM ERROR TYPE
+// ============================================================================
+
+/// Error type for connection operations
+#[derive(Debug, Clone)]
+pub enum ConnectionError {
+    StreamClosed,
+    SendFailed(String),
+    ReceiveFailed(String),
+    FramingError(String),
+    InitializationFailed(String),
+}
+
+impl std::fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StreamClosed => write!(f, "Stream closed by peer"),
+            Self::SendFailed(msg) => write!(f, "Send failed: {}", msg),
+            Self::ReceiveFailed(msg) => write!(f, "Receive failed: {}", msg),
+            Self::FramingError(msg) => write!(f, "Framing error: {}", msg),
+            Self::InitializationFailed(msg) => write!(f, "Initialization failed: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionError {}
+
+// For backward compatibility with String errors
+impl From<ConnectionError> for String {
+    fn from(err: ConnectionError) -> String {
+        err.to_string()
+    }
+}
+
+// ============================================================================
+// PEER CONNECTION TRAIT
+// ============================================================================
 
 /// Represents a connection to a peer
 ///
-/// This trait defines the interface for communicating with a remote peer.
-/// It provides methods for sending and receiving data, managing streams,
-/// and controlling the connection lifecycle.
-///
-/// The interface is transport-agnostic, allowing different implementations
-/// to use different underlying protocols (e.g., QUIC, WebRTC, etc.).
+/// IMPORTANT: Uses interior mutability (Arc<Mutex<...>>) internally,
+/// so it can be safely shared via Arc between multiple tasks.
 pub trait PeerConnection: Send + Sync {
-    /// Sends data to the peer on the default stream
-    ///
-    /// This is a convenience method that sends data on stream ID 0.
-    /// For more control, use `send_on_stream`.
-    ///
-    /// # Arguments
-    /// * `data` - The data to send
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the data was sent successfully
-    /// * `Err(String)` - If there was an error sending the data
+    /// Sends data to the peer
     fn send<'a>(
-        &'a mut self,
+        &'a self,
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-    /// Receives data from the peer on the default stream
-    ///
-    /// This is a convenience method that receives data from stream ID 0.
-    /// For more control, use `receive_from_stream`.
-    ///
-    /// # Returns
-    /// * `Ok(Vec<u8>)` - The received data
-    /// * `Err(String)` - If there was an error receiving data
+    /// Receives data from the peer
     fn receive<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
-
-    /// Sends data on a specific stream
-    ///
-    /// This method allows sending data on a specific stream ID, enabling
-    /// multiplexed communication with the peer.
-    ///
-    /// # Arguments
-    /// * `stream_id` - The ID of the stream to send on
-    /// * `data` - The data to send
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the data was sent successfully
-    /// * `Err(String)` - If there was an error sending the data
-    fn send_on_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-
-    /// Receives data from a specific stream
-    ///
-    /// This method allows receiving data from a specific stream ID, enabling
-    /// multiplexed communication with the peer.
-    ///
-    /// # Arguments
-    /// * `stream_id` - The ID of the stream to receive from
-    ///
-    /// # Returns
-    /// * `Ok(Vec<u8>)` - The received data
-    /// * `Err(String)` - If there was an error receiving data
-    fn receive_from_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
+        &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
 
     /// Returns the address of the remote peer
-    ///
-    /// This method provides the network address of the connected peer,
-    /// which can be useful for logging, debugging, or identity verification.
     fn remote_address(&self) -> SocketAddr;
 
     /// Closes the connection
-    ///
-    /// This method gracefully terminates the connection with the peer.
-    /// After calling this method, no more data can be sent or received.
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the connection was closed successfully
-    /// * `Err(String)` - If there was an error closing the connection
-    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 impl Debug for dyn PeerConnection {
@@ -130,211 +100,248 @@ impl Debug for dyn PeerConnection {
     }
 }
 
-/// Manages network connections for the VM
-///
-/// This trait defines the interface for managing network connections in the VM.
-/// It provides methods for establishing connections to peers, accepting incoming
-/// connections, and listening for connection requests.
-///
-/// The NetworkManager is responsible for:
-/// - Creating and configuring network endpoints
-/// - Establishing outgoing connections
-/// - Accepting incoming connections
-/// - Managing connection lifecycle
-///
-/// Like the PeerConnection trait, this interface is transport-agnostic,
-/// allowing different implementations to use different underlying protocols.
+// ============================================================================
+// NETWORK MANAGER TRAIT
+// ============================================================================
+
 pub trait NetworkManager: Send + Sync {
-    /// Establishes a connection to a new peer
-    ///
-    /// This method initiates an outgoing connection to a peer at the specified address.
-    /// It handles the connection establishment process, including any necessary
-    /// handshaking, encryption setup, and protocol negotiation.
-    ///
-    /// # Arguments
-    /// * `address` - The network address of the peer to connect to
-    ///
-    /// # Returns
-    /// * `Ok(Box<dyn PeerConnection>)` - A connection to the peer
-    /// * `Err(String)` - If the connection could not be established
     fn connect<'a>(
         &'a mut self,
         address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>>;
 
-    /// Accepts an incoming connection
-    ///
-    /// This method accepts a pending incoming connection from a peer.
-    /// It should be called after `listen()` has been called to set up
-    /// the listening endpoint.
-    ///
-    /// This method will block until a connection is available or an error occurs.
-    ///
-    /// # Returns
-    /// * `Ok(Box<dyn PeerConnection>)` - A connection to the peer
-    /// * `Err(String)` - If no connection could be accepted
     fn accept<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>>;
 
-    /// Listens for incoming connections
-    ///
-    /// This method sets up a network endpoint to listen for incoming connections
-    /// at the specified address. After calling this method, `accept()` can be
-    /// called to accept incoming connections.
-    ///
-    /// # Arguments
-    /// * `bind_address` - The local address to bind to for listening
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the listening endpoint was set up successfully
-    /// * `Err(String)` - If the listening endpoint could not be set up
     fn listen<'a>(
         &'a mut self,
         bind_address: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
-/// QUIC-based implementation of PeerConnection
-///
-/// This struct implements the PeerConnection trait using the QUIC protocol
-/// via the Quinn library. It manages a QUIC connection to a remote peer and
-/// provides methods for sending and receiving data over that connection.
-///
-/// QUIC provides several benefits for secure multiparty computation:
-/// - Built-in encryption and authentication
-/// - Reliable, ordered delivery of data
-/// - Stream multiplexing for concurrent operations
-/// - Connection migration for network changes
+// ============================================================================
+// MESSAGE FRAMING HELPERS
+// ============================================================================
+
+/// Maximum message size: 100MB
+const MAX_MESSAGE_SIZE: usize = 100_000_000;
+
+/// Sends a length-prefixed message
+async fn send_framed_message(
+    send: &mut quinn::SendStream,
+    data: &[u8],
+) -> Result<(), ConnectionError> {
+    if data.len() > MAX_MESSAGE_SIZE {
+        return Err(ConnectionError::FramingError(
+            format!("Message size {} exceeds maximum {}", data.len(), MAX_MESSAGE_SIZE)
+        ));
+    }
+
+    // Write 4-byte length prefix (big-endian)
+    let len = data.len() as u32;
+    send.write_all(&len.to_be_bytes())
+        .await
+        .map_err(|e| ConnectionError::SendFailed(format!("Failed to write length: {}", e)))?;
+
+    // Write message payload
+    send.write_all(data)
+        .await
+        .map_err(|e| ConnectionError::SendFailed(format!("Failed to write payload: {}", e)))?;
+
+    Ok(())
+}
+
+/// Receives a length-prefixed message
+async fn recv_framed_message(
+    recv: &mut quinn::RecvStream,
+) -> Result<Vec<u8>, ConnectionError> {
+    // Read 4-byte length prefix
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| match e {
+            quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
+            quinn::ReadExactError::ReadError(re) =>
+                ConnectionError::ReceiveFailed(format!("Failed to read length: {}", re)),
+        })?;
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    // Validate message size
+    if len > MAX_MESSAGE_SIZE {
+        return Err(ConnectionError::FramingError(
+            format!("Message size {} exceeds maximum {}", len, MAX_MESSAGE_SIZE)
+        ));
+    }
+
+    // Read message payload
+    let mut msg = vec![0u8; len];
+    recv.read_exact(&mut msg)
+        .await
+        .map_err(|e| match e {
+            quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
+            quinn::ReadExactError::ReadError(re) =>
+                ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re)),
+        })?;
+
+    Ok(msg)
+}
+
+// ============================================================================
+// QUIC PEER CONNECTION
+// ============================================================================
+
 pub struct QuicPeerConnection {
-    /// The underlying QUIC connection
     connection: Connection,
-    /// The remote peer's address
     remote_addr: SocketAddr,
-    /// Map of stream IDs to send/receive stream pairs
-    streams: Arc<Mutex<HashMap<u64, (quinn::SendStream, quinn::RecvStream)>>>,
-    /// Whether this connection is on the server side
-    is_server: bool,
+    /// Persistent send stream - uses interior mutability for sharing
+    send_stream: Arc<Mutex<quinn::SendStream>>,
+    /// Persistent receive stream - uses interior mutability for sharing
+    recv_stream: Arc<Mutex<quinn::RecvStream>>,
 }
 
 impl QuicPeerConnection {
-    /// Creates a new QUIC peer connection
-    ///
-    /// # Arguments
-    /// * `connection` - The underlying QUIC connection
-    /// * `is_server` - Whether this connection is on the server side
-    ///
-    /// The `is_server` parameter determines the behavior when creating new streams:
-    /// - Server connections accept incoming streams
-    /// - Client connections open new streams
-    pub fn new(connection: Connection, is_server: bool) -> Self {
+    /// Creates a new connection with an already-opened bidirectional stream
+    pub fn new(
+        connection: Connection,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+    ) -> Self {
         let remote_addr = connection.remote_address();
         Self {
             connection,
             remote_addr,
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            is_server,
+            send_stream: Arc::new(Mutex::new(send)),
+            recv_stream: Arc::new(Mutex::new(recv)),
         }
     }
 
-    /// Gets or creates a bidirectional stream with the given ID
-    ///
-    /// This method manages the lifecycle of QUIC streams:
-    /// 1. If a stream with the given ID already exists, it is reused
-    /// 2. Otherwise, a new stream is created:
-    ///    - For server connections, by accepting an incoming stream
-    ///    - For client connections, by opening a new stream
-    ///
-    /// # Arguments
-    /// * `stream_id` - The ID of the stream to get or create
-    ///
-    /// # Returns
-    /// * `Ok((SendStream, RecvStream))` - The send and receive halves of the stream
-    /// * `Err(String)` - If the stream could not be created
-    async fn open_stream_for_send(&mut self, stream_id: u64) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-        // Reuse cached stream if present
-        if let Some((send, recv)) = self.streams.lock().await.remove(&stream_id) {
-            return Ok((send, recv));
-        }
-        // Actively open a stream when sending
-        let (send, recv) = self
-            .connection
+    /// Creates a new connection and immediately opens a bidirectional stream
+    pub async fn new_with_connection(connection: Connection) -> Result<Self, ConnectionError> {
+        let remote_addr = connection.remote_address();
+        let (send, recv) = connection
             .open_bi()
             .await
-            .map_err(|e| format!("Failed to open bidirectional stream: {}", e))?;
-        Ok((send, recv))
-    }
+            .map_err(|e| ConnectionError::InitializationFailed(
+                format!("Failed to open stream: {}", e)
+            ))?;
 
-    async fn accept_stream_for_recv(&mut self, stream_id: u64) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-        // Reuse cached stream if present
-        if let Some((send, recv)) = self.streams.lock().await.remove(&stream_id) {
-            return Ok((send, recv));
-        }
-        // Passively accept when receiving
-        let (send, recv) = self
-            .connection
-            .accept_bi()
-            .await
-            .map_err(|e| format!("Failed to accept bidirectional stream: {}", e))?;
-        Ok((send, recv))
+        Ok(Self {
+            connection,
+            remote_addr,
+            send_stream: Arc::new(Mutex::new(send)),
+            recv_stream: Arc::new(Mutex::new(recv)),
+        })
     }
 }
 
 impl PeerConnection for QuicPeerConnection {
     fn send<'a>(
-        &'a mut self,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move { self.send_on_stream(0, data).await })
-    }
-
-    fn receive<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
-        Box::pin(async move { self.receive_from_stream(0).await })
-    }
-
-    fn send_on_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
+        &'a self,
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            let (mut send, recv) = self.open_stream_for_send(stream_id).await?;
-
-            send.write_all(data)
+            let mut send_guard = self.send_stream.lock().await;
+            send_framed_message(&mut *send_guard, data)
                 .await
-                .map_err(|e| format!("Failed to send data: {}", e))?;
-
-            // Store the stream back for reuse
-            let mut streams = self.streams.lock().await;
-            streams.insert(stream_id, (send, recv));
-
-            Ok(())
+                .map_err(|e| e.to_string())
         })
     }
 
-    fn receive_from_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
+    fn receive<'a>(
+        &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let (send, mut recv) = self.accept_stream_for_recv(stream_id).await?;
+            let mut recv_guard = self.recv_stream.lock().await;
+            recv_framed_message(&mut *recv_guard)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
 
-            // Read a chunk of data (up to 65536 bytes)
-            let mut buf = vec![0u8; 65536];
-            match recv.read(&mut buf).await {
-                Ok(Some(n)) => {
-                    buf.truncate(n);
+    fn remote_address(&self) -> SocketAddr {
+        self.remote_addr
+    }
 
-                    // Store the stream back for reuse
-                    let mut streams = self.streams.lock().await;
-                    streams.insert(stream_id, (send, recv));
+    fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.connection.close(0u32.into(), b"Connection closed");
+            Ok(())
+        })
+    }
+}
 
-                    Ok(buf)
-                }
-                Ok(None) => Err("Connection closed by peer".to_string()),
-                Err(e) => Err(format!("Failed to receive data: {}", e)),
+// ============================================================================
+// LOOPBACK PEER CONNECTION (for self-delivery)
+// ============================================================================
+
+pub struct LoopbackPeerConnection {
+    remote_addr: SocketAddr,
+    tx: mpsc::Sender<Vec<u8>>,
+    rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+}
+
+impl LoopbackPeerConnection {
+    pub fn new(remote_addr: SocketAddr) -> Self {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+        Self {
+            remote_addr,
+            tx,
+            rx: Arc::new(Mutex::new(rx)),
+        }
+    }
+
+    /// Helper to create a framed message (for consistency with QUIC)
+    fn frame_message(data: &[u8]) -> Vec<u8> {
+        let len = data.len() as u32;
+        let mut framed = Vec::with_capacity(4 + data.len());
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(data);
+        framed
+    }
+
+    /// Helper to unframe a message (for consistency with QUIC)
+    fn unframe_message(framed: Vec<u8>) -> Result<Vec<u8>, ConnectionError> {
+        if framed.len() < 4 {
+            return Err(ConnectionError::FramingError("Message too short".to_string()));
+        }
+
+        let len_bytes: [u8; 4] = framed[0..4].try_into().unwrap();
+        let len = u32::from_be_bytes(len_bytes) as usize;
+
+        if framed.len() != 4 + len {
+            return Err(ConnectionError::FramingError(
+                format!("Length mismatch: expected {}, got {}", len, framed.len() - 4)
+            ));
+        }
+
+        Ok(framed[4..].to_vec())
+    }
+}
+
+impl PeerConnection for LoopbackPeerConnection {
+    fn send<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let framed = Self::frame_message(data);
+            self.tx
+                .send(framed)
+                .await
+                .map_err(|e| format!("Loopback send failed: {}", e))
+        })
+    }
+
+    fn receive<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut rx = self.rx.lock().await;
+            match rx.recv().await {
+                Some(framed) => Self::unframe_message(framed).map_err(|e| e.to_string()),
+                None => Err("Loopback connection closed".to_string()),
             }
         })
     }
@@ -343,120 +350,53 @@ impl PeerConnection for QuicPeerConnection {
         self.remote_addr
     }
 
-    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            self.connection.close(0u32.into(), b"Connection closed");
-            Ok(())
-        })
-    }
-}
-
-/// In-memory loopback implementation of PeerConnection for self-delivery
-pub struct LoopbackPeerConnection {
-    remote_addr: SocketAddr,
-    streams: Arc<Mutex<HashMap<u64, (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)>>> ,
-}
-
-impl LoopbackPeerConnection {
-    pub fn new(remote_addr: SocketAddr) -> Self {
-        Self {
-            remote_addr,
-            streams: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    async fn ensure_stream(&self, stream_id: u64) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
-        let mut guard = self.streams.lock().await;
-        if let Some((tx, rx)) = guard.remove(&stream_id) {
-            (tx, rx)
-        } else {
-            let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
-            (tx, rx)
-        }
-    }
-}
-
-impl PeerConnection for LoopbackPeerConnection {
-    fn send<'a>(
-        &'a mut self,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        self.send_on_stream(0, data)
-    }
-
-    fn receive<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
-        self.receive_from_stream(0)
-    }
-
-    fn send_on_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            let (tx, rx) = self.ensure_stream(stream_id).await;
-            // put back for reuse
-            {
-                let mut guard = self.streams.lock().await;
-                guard.insert(stream_id, (tx.clone(), rx));
-            }
-            tx.send(data.to_vec())
-                .await
-                .map_err(|e| format!("loopback send failed: {}", e))
-                .map(|_| ())
-        })
-    }
-
-    fn receive_from_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
-        Box::pin(async move {
-            // ensure stream exists and reinsert for reuse
-            let (tx, mut rx) = self.ensure_stream(stream_id).await;
-            {
-                let mut guard = self.streams.lock().await;
-                guard.insert(stream_id, (tx, rx));
-            }
-            // now take receiver to await on
-            let mut guard = self.streams.lock().await;
-            if let Some((_tx, rx)) = guard.get_mut(&stream_id) {
-                match rx.recv().await {
-                    Some(msg) => Ok(msg),
-                    None => Err("loopback connection closed".into()),
-                }
-            } else {
-                Err("loopback stream missing".into())
-            }
-        })
-    }
-
-    fn remote_address(&self) -> SocketAddr { self.remote_addr }
-
-    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move { Ok(()) })
     }
 }
 
-/// A node in the QUIC network
-///
-/// This struct represents a participant in the secure multiparty computation
-/// network. It implements the Node trait from stoffelmpc-network.
+// ============================================================================
+// HANDSHAKE HELPERS
+// ============================================================================
+
+/// Sends a handshake envelope over a stream
+async fn send_handshake(
+    send: &mut quinn::SendStream,
+    role: &str,
+    id: usize,
+) -> Result<(), ConnectionError> {
+    let envelope = NetEnvelope::Handshake {
+        role: role.to_string(),
+        id,
+    };
+    let bytes = envelope.serialize();
+    send_framed_message(send, &bytes).await
+}
+
+/// Receives a handshake envelope from a stream
+async fn recv_handshake(
+    recv: &mut quinn::RecvStream,
+) -> Result<Option<(String, usize)>, ConnectionError> {
+    let bytes = recv_framed_message(recv).await?;
+
+    match NetEnvelope::try_deserialize(&bytes) {
+        Ok(NetEnvelope::Handshake { role, id }) => Ok(Some((role, id))),
+        Ok(NetEnvelope::HoneyBadger(_)) => Ok(None), // Legacy, no handshake
+        Err(_) => Ok(None), // Not an envelope, legacy path
+    }
+}
+
+// ============================================================================
+// QUIC NODE
+// ============================================================================
+
 #[derive(Debug, Clone)]
 pub struct QuicNode {
-    /// The UUID of this node
     uuid: Uuid,
-    /// The network address of this node
     address: SocketAddr,
 }
 
 impl QuicNode {
-    /// Creates a new node with a random UUID
-    ///
-    /// # Arguments
-    /// * `address` - The network address of the node
     pub fn new_with_random_id(address: SocketAddr) -> Self {
         Self {
             uuid: Uuid::new_v4(),
@@ -464,32 +404,19 @@ impl QuicNode {
         }
     }
 
-    /// Creates a new node with a specific UUID
-    ///
-    /// # Arguments
-    /// * `uuid` - The UUID of the node
-    /// * `address` - The network address of the node
     pub fn new(uuid: Uuid, address: SocketAddr) -> Self {
         Self { uuid, address }
     }
 
-    /// Creates a new node with a specific ID
-    ///
-    /// # Arguments
-    /// * `id` - The ID of the node (will be converted to UUID)
-    /// * `address` - The network address of the node
     pub fn from_party_id(id: PartyId, address: SocketAddr) -> Self {
-        // Convert PartyId to u128 and then to UUID
         let uuid = Uuid::from_u128(id as u128);
         Self { uuid, address }
     }
 
-    /// Returns the network address of this node
     pub fn address(&self) -> SocketAddr {
         self.address
     }
 
-    /// Returns the UUID of this node
     pub fn uuid(&self) -> Uuid {
         self.uuid
     }
@@ -497,65 +424,46 @@ impl QuicNode {
 
 impl Node for QuicNode {
     fn id(&self) -> PartyId {
-        // Convert UUID to u128 and then to PartyId
-        // This might lose precision if PartyId is smaller than u128
         self.uuid.as_u128() as PartyId
     }
 
     fn scalar_id<F: Field>(&self) -> F {
-        // Convert UUID to u128 for use with Field
         F::from(self.uuid.as_u128())
     }
 }
 
-/// Configuration for the QUIC network
-///
-/// This struct contains configuration parameters for the QUIC network,
-/// such as timeout values, retry settings, and other network-specific options.
+// ============================================================================
+// NETWORK CONFIG AND MESSAGE
+// ============================================================================
+
 #[derive(Debug, Clone)]
 pub struct QuicNetworkConfig {
-    /// Timeout for network operations in milliseconds
     pub timeout_ms: u64,
-    /// Maximum number of retry attempts for network operations
     pub max_retries: u32,
-    /// Whether to use secure connections (TLS)
     pub use_tls: bool,
 }
 
 impl Default for QuicNetworkConfig {
     fn default() -> Self {
         Self {
-            timeout_ms: 30000, // 30 seconds
+            timeout_ms: 30000,
             max_retries: 3,
             use_tls: true,
         }
     }
 }
 
-/// A message type for QUIC-based communication
-///
-/// This struct implements the Message trait from stoffelmpc-network,
-/// providing a standard way to serialize and deserialize messages
-/// for secure multiparty computation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicMessage {
-    /// The ID of the sender of this message
     sender_id: PartyId,
-    /// The actual message content
     content: Vec<u8>,
 }
 
 impl QuicMessage {
-    /// Creates a new message
-    ///
-    /// # Arguments
-    /// * `sender_id` - The ID of the sender
-    /// * `content` - The content of the message
     pub fn new(sender_id: PartyId, content: Vec<u8>) -> Self {
         Self { sender_id, content }
     }
 
-    /// Returns the content of the message
     pub fn content(&self) -> &[u8] {
         &self.content
     }
@@ -571,37 +479,19 @@ impl Message for QuicMessage {
     }
 }
 
-/// QUIC-based implementation of NetworkManager
-///
-/// This struct implements the NetworkManager trait using the QUIC protocol
-/// via the Quinn library. It manages QUIC endpoints for both client and server
-/// roles, and provides methods for establishing connections and accepting
-/// incoming connections.
-///
-/// The implementation uses self-signed certificates for TLS, which is suitable
-/// for development but should be replaced with proper certificate management
-/// in production.
-#[derive(Debug, Clone)]
+// ============================================================================
+// QUIC NETWORK MANAGER (Actor-Compatible)
+// ============================================================================
+
+#[derive(Clone)]
 pub struct QuicNetworkManager {
-    /// The QUIC endpoint for sending and receiving connections
     endpoint: Option<Endpoint>,
-    /// Configuration for the server role
-    server_config: Option<ServerConfig>,
-    /// Configuration for the client role
-    client_config: Option<ClientConfig>,
-    /// The nodes in the network
     nodes: Vec<QuicNode>,
-    /// The ID of this node in the network
     node_id: PartyId,
-    /// Network configuration
     network_config: QuicNetworkConfig,
-    /// Active connections to other server nodes (party connections)
-    /// Using Arc<tokio::sync::Mutex<>> for interior mutability to allow modifying connections
-    /// while keeping self immutable in Network trait methods
-    connections: Arc<Mutex<HashMap<PartyId, Box<dyn PeerConnection>>>>,
-    /// Active connections to clients (for async sending)
-    client_connections_async: Arc<Mutex<HashMap<ClientId, Box<dyn PeerConnection>>>>,
-    /// Set of connected client IDs (for sync queries)
+    /// CHANGED: Now uses Arc for sharing connections between tasks
+    connections: Arc<Mutex<HashMap<PartyId, Arc<dyn PeerConnection>>>>,
+    client_connections: Arc<Mutex<HashMap<ClientId, Arc<dyn PeerConnection>>>>,
     client_ids: Arc<StdMutex<HashSet<ClientId>>>,
 }
 
@@ -612,306 +502,224 @@ impl Default for QuicNetworkManager {
 }
 
 impl QuicNetworkManager {
-    /// Creates a new QUIC network manager
-    ///
-    /// This initializes a network manager with no active endpoints or configurations.
-    /// Before using the manager, you must call either `connect()` or `listen()`
-    /// to set up the appropriate endpoint.
     pub fn new() -> Self {
-        // Generate a random UUID for this node
         let node_id = Uuid::new_v4().as_u128() as PartyId;
-
         Self {
             endpoint: None,
-            server_config: None,
-            client_config: None,
             nodes: Vec::new(),
             node_id,
             network_config: QuicNetworkConfig::default(),
             connections: Arc::new(Mutex::new(HashMap::new())),
-            client_connections_async: Arc::new(Mutex::new(HashMap::new())),
+            client_connections: Arc::new(Mutex::new(HashMap::new())),
             client_ids: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
-    /// Creates a new QUIC network manager with the specified node ID
-    ///
-    /// # Arguments
-    /// * `node_id` - The ID of this node in the network
     pub fn with_node_id(node_id: PartyId) -> Self {
         let mut manager = Self::new();
         manager.node_id = node_id;
         manager
     }
 
-    /// Creates a new QUIC network manager with a random UUID-based node ID
-    pub fn with_random_id() -> Self {
-        Self::new() // new() already generates a random UUID-based ID
-    }
-
-    /// Creates a new QUIC network manager with the specified configuration
-    ///
-    /// # Arguments
-    /// * `config` - The network configuration
     pub fn with_config(config: QuicNetworkConfig) -> Self {
         let mut manager = Self::new();
         manager.network_config = config;
         manager
     }
 
-    /// Adds a node to the network
-    ///
-    /// # Arguments
-    /// * `node` - The node to add
     pub fn add_node(&mut self, node: QuicNode) {
         self.nodes.push(node);
     }
 
-    /// Adds a node with a random UUID to the network
-    ///
-    /// # Arguments
-    /// * `address` - The network address of the node
-    pub fn add_node_with_random_id(&mut self, address: SocketAddr) {
-        let node = QuicNode::new_with_random_id(address);
-        self.nodes.push(node);
-    }
-
-    /// Adds a node with a specific UUID to the network
-    ///
-    /// # Arguments
-    /// * `uuid` - The UUID of the node
-    /// * `address` - The network address of the node
-    pub fn add_node_with_uuid(&mut self, uuid: Uuid, address: SocketAddr) {
-        let node = QuicNode::new(uuid, address);
-        self.nodes.push(node);
-    }
-
-    /// Adds a node with a specific party ID to the network
-    ///
-    /// # Arguments
-    /// * `id` - The ID of the node
-    /// * `address` - The network address of the node
     pub fn add_node_with_party_id(&mut self, id: PartyId, address: SocketAddr) {
-        let node = QuicNode::from_party_id(id, address);
-        self.nodes.push(node);
+        self.nodes.push(QuicNode::from_party_id(id, address));
     }
 
-    /// Creates an insecure client configuration for QUIC
-    ///
-    /// This method creates a client configuration that:
-    /// 1. Skips server certificate verification (insecure, but useful for development)
-    /// 2. Sets up ALPN protocols for protocol negotiation
-    /// 3. Configures transport parameters
-    ///
-    /// # Warning
-    /// This configuration is insecure and should only be used for development.
-    /// In production, proper certificate verification should be implemented.
-    ///
-    /// # Returns
-    /// * `Ok(ClientConfig)` - The client configuration
-    /// * `Err(String)` - If the configuration could not be created
+    /// Ensures loopback connection exists for self-delivery
+    pub async fn ensure_loopback_installed(&self) {
+        let mut conns = self.connections.lock().await;
+        if !conns.contains_key(&self.node_id) {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            conns.insert(
+                self.node_id,
+                Arc::new(LoopbackPeerConnection::new(addr)) as Arc<dyn PeerConnection>
+            );
+        }
+    }
+
+    /// Gets a connection by party ID (for actor model usage)
+    pub async fn get_connection(&self, party_id: PartyId) -> Option<Arc<dyn PeerConnection>> {
+        let conns = self.connections.lock().await;
+        conns.get(&party_id).cloned()
+    }
+
+    /// Gets all party connections (for actor model usage)
+    pub async fn get_all_connections(&self) -> Vec<(PartyId, Arc<dyn PeerConnection>)> {
+        let conns = self.connections.lock().await;
+        conns.iter().map(|(id, conn)| (*id, Arc::clone(conn))).collect()
+    }
+
+    /// Creates insecure client config (for development only)
     fn create_insecure_client_config() -> Result<ClientConfig, String> {
-        // Create a client crypto configuration that skips certificate verification
         let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
             .with_no_client_auth();
 
-        // Set ALPN protocol to match the server
         crypto.alpn_protocols = vec![b"quic-example".to_vec()];
 
-        // Create a QUIC client configuration with the crypto configuration
         let mut config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|e| format!("Failed to create QUIC client config: {}", e))?,
         ));
 
-        // Set transport config
         config.transport_config(Arc::new({
             let mut transport = quinn::TransportConfig::default();
             transport.max_concurrent_uni_streams(0u32.into());
-            // Keep the connection alive during idle periods and extend idle timeout
             transport.keep_alive_interval(Some(Duration::from_secs(5)));
-            transport.max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(5000))));
+            transport.max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(300_000))));
             transport
         }));
 
         Ok(config)
     }
 
-    /// Creates a self-signed server configuration for QUIC
-    ///
-    /// This method creates a server configuration that:
-    /// 1. Generates a self-signed certificate for TLS
-    /// 2. Sets up ALPN protocols for protocol negotiation
-    /// 3. Configures transport parameters
-    ///
-    /// # Warning
-    /// This configuration uses a self-signed certificate, which is suitable for
-    /// development but not for production. In production, proper certificates
-    /// should be used.
-    ///
-    /// # Returns
-    /// * `Ok(ServerConfig)` - The server configuration
-    /// * `Err(String)` - If the configuration could not be created
+    /// Creates self-signed server config (for development only)
     fn create_self_signed_server_config() -> Result<ServerConfig, String> {
-        // Generate self-signed certificate
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
             .map_err(|e| format!("Failed to generate certificate: {}", e))?;
 
-        // Convert the certificate and key to DER format
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
         let key_der = PrivateKeyDer::Pkcs8(
             PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
         );
 
-        // Create a server crypto configuration with the certificate
         let mut server_crypto = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| format!("Failed to create server crypto config: {}", e))?;
 
-        // Set ALPN protocol
         server_crypto.alpn_protocols = vec![b"quic-example".to_vec()];
 
-        // Create a QUIC server configuration with the crypto configuration
         let mut server_config = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
                 .map_err(|e| format!("Failed to create QUIC server config: {}", e))?,
         ));
 
-        // Configure transport parameters
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(0u32.into());
-        // Keep the connection alive during idle periods and extend idle timeout
         transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
         transport_config.max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(300_000))));
 
         Ok(server_config)
     }
-    /// Ensure a loopback connection is present for self-delivery
-    pub async fn ensure_loopback_installed(&self) {
-        let mut conns = self.connections.lock().await;
-        if !conns.contains_key(&self.node_id) {
-            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            conns.insert(self.node_id, Box::new(LoopbackPeerConnection::new(addr)));
+
+    /// Ensures endpoint is initialized with client config
+    async fn ensure_client_endpoint(&mut self) -> Result<(), String> {
+        if self.endpoint.is_none() {
+            let client_config = Self::create_insecure_client_config()?;
+            let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+                .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
+            endpoint.set_default_client_config(client_config);
+            self.endpoint = Some(endpoint);
         }
+        Ok(())
     }
 
-    /// Establish a connection and send a CLIENT-role handshake with the provided client_id.
-    pub fn connect_as_client<'a>(
-        &'a mut self,
+    /// Connects and sends a CLIENT handshake
+    /// Returns Arc<dyn PeerConnection> for actor model compatibility
+    pub async fn connect_as_client(
+        &mut self,
         address: SocketAddr,
         client_id: ClientId,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
-        Box::pin(async move {
-            // Ensure endpoint and client config
-            if self.endpoint.is_none() {
-                let client_config = Self::create_insecure_client_config()?;
-                let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-                    .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
-                endpoint.set_default_client_config(client_config);
-                self.endpoint = Some(endpoint);
-            } else {
-                let client_config = Self::create_insecure_client_config()?;
-                if let Some(endpoint) = self.endpoint.as_mut() {
-                    endpoint.set_default_client_config(client_config);
-                }
-            }
+    ) -> Result<Arc<dyn PeerConnection>, String> {
+        self.ensure_client_endpoint().await?;
+        self.ensure_loopback_installed().await;
 
-            // Ensure loopback connection exists for self-delivery
-            self.ensure_loopback_installed().await;
+        let endpoint = self.endpoint.as_ref().unwrap();
+        let connection = endpoint
+            .connect(address, "localhost")
+            .map_err(|e| format!("Failed to initiate connection: {}", e))?
+            .await
+            .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            let endpoint = self.endpoint.as_ref().unwrap();
-            let connection = endpoint
-                .connect(address, "localhost")
-                .map_err(|e| format!("Failed to initiate connection: {}", e))?
-                .await
-                .map_err(|e| format!("Failed to establish connection: {}", e))?;
+        // Open persistent stream and send handshake
+        let (mut send, recv) = connection.open_bi().await
+            .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-            // Send identification handshake envelope as CLIENT with client_id
-            if let Ok((mut send, _recv)) = connection.open_bi().await {
-                let envelope = NetEnvelope::Handshake {
-                    role: "CLIENT".to_string(),
-                    id: client_id,
-                };
-                let bytes = envelope.serialize();
-                let _ = send.write_all(&bytes).await;
-            }
+        send_handshake(&mut send, "CLIENT", client_id).await
+            .map_err(|e| format!("Failed to send handshake: {}", e))?;
 
-            // Insert by address-derived node entry if present, else create ephemeral node id
-            let node_id = self.nodes.iter()
-                .find(|node| node.address() == address)
-                .map(|node| node.id())
-                .unwrap_or_else(|| {
-                    let node = QuicNode::new_with_random_id(address);
-                    let id = node.id();
-                    self.nodes.push(node);
-                    id
-                });
+        // Create Arc-wrapped connection
+        let conn = Arc::new(QuicPeerConnection::new(
+            connection.clone(),
+            send,
+            recv,
+        )) as Arc<dyn PeerConnection>;
 
-            // Store connection under that node_id for server broadcasts and sends
-            let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
+        // Find or create node and store connection
+        let node_id = self.nodes.iter()
+            .find(|n| n.address() == address)
+            .map(|n| n.id())
+            .unwrap_or_else(|| {
+                let node = QuicNode::new_with_random_id(address);
+                let id = node.id();
+                self.nodes.push(node);
+                id
+            });
 
-            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
-        })
+        let mut connections = self.connections.lock().await;
+        connections.insert(node_id, Arc::clone(&conn));
+
+        Ok(conn)
     }
 
-    /// Establish a connection and send a SERVER-role handshake with our node_id (party_id).
-    pub fn connect_as_server<'a>(
-        &'a mut self,
+    /// Connects and sends a SERVER handshake
+    /// Returns Arc<dyn PeerConnection> for actor model compatibility
+    pub async fn connect_as_server(
+        &mut self,
         address: SocketAddr,
         party_id: PartyId,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
-        // Reuse the original connect path but override the handshake role/id to SERVER.
-        Box::pin(async move {
-            // Delegate to the existing connect(), but immediately after connecting we already send SERVER in connect().
-            // To be explicit and resilient to future changes, we mirror the body here with SERVER role using provided party_id.
-            if self.endpoint.is_none() {
-                let client_config = Self::create_insecure_client_config()?;
-                let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-                    .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
-                endpoint.set_default_client_config(client_config);
-                self.endpoint = Some(endpoint);
-            } else {
-                let client_config = Self::create_insecure_client_config()?;
-                if let Some(endpoint) = self.endpoint.as_mut() {
-                    endpoint.set_default_client_config(client_config);
-                }
-            }
+    ) -> Result<Arc<dyn PeerConnection>, String> {
+        self.ensure_client_endpoint().await?;
+        self.ensure_loopback_installed().await;
 
-            self.ensure_loopback_installed().await;
-            let endpoint = self.endpoint.as_ref().unwrap();
-            let connection = endpoint
-                .connect(address, "localhost")
-                .map_err(|e| format!("Failed to initiate connection: {}", e))?
-                .await
-                .map_err(|e| format!("Failed to establish connection: {}", e))?;
+        let endpoint = self.endpoint.as_ref().unwrap();
+        let connection = endpoint
+            .connect(address, "localhost")
+            .map_err(|e| format!("Failed to initiate connection: {}", e))?
+            .await
+            .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            if let Ok((mut send, _recv)) = connection.open_bi().await {
-                let envelope = NetEnvelope::Handshake {
-                    role: "SERVER".to_string(),
-                    id: party_id,
-                };
-                let bytes = envelope.serialize();
-                let _ = send.write_all(&bytes).await;
-            }
+        // Open persistent stream and send handshake
+        let (mut send, recv) = connection.open_bi().await
+            .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-            let node_id = self.nodes.iter()
-                .find(|node| node.address() == address)
-                .map(|node| node.id())
-                .unwrap_or_else(|| {
-                    let node = QuicNode::new_with_random_id(address);
-                    let id = node.id();
-                    self.nodes.push(node);
-                    id
-                });
+        send_handshake(&mut send, "SERVER", party_id).await
+            .map_err(|e| format!("Failed to send handshake: {}", e))?;
 
-            let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
-            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
-        })
+        // Create Arc-wrapped connection
+        let conn = Arc::new(QuicPeerConnection::new(
+            connection.clone(),
+            send,
+            recv,
+        )) as Arc<dyn PeerConnection>;
+
+        // Find or create node and store connection
+        let node_id = self.nodes.iter()
+            .find(|n| n.address() == address)
+            .map(|n| n.id())
+            .unwrap_or_else(|| {
+                let node = QuicNode::new_with_random_id(address);
+                let id = node.id();
+                self.nodes.push(node);
+                id
+            });
+
+        let mut connections = self.connections.lock().await;
+        connections.insert(node_id, Arc::clone(&conn));
+
+        Ok(conn)
     }
 }
 
@@ -919,139 +727,71 @@ impl NetworkManager for QuicNetworkManager {
     fn connect<'a>(
         &'a mut self,
         address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
         Box::pin(async move {
-            if self.endpoint.is_none() {
-                // Create client endpoint
-                let client_config = Self::create_insecure_client_config()?;
-                let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-                    .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
-                endpoint.set_default_client_config(client_config);
-                self.endpoint = Some(endpoint);
-            } else {
-                // Ensure an existing endpoint (possibly created by listen()) has a default client config
-                let client_config = Self::create_insecure_client_config()?;
-                if let Some(endpoint) = self.endpoint.as_mut() {
-                    endpoint.set_default_client_config(client_config);
-                }
-            }
-
-            // Ensure loopback connection exists for self-delivery
-            self.ensure_loopback_installed().await;
-
-            let endpoint = self.endpoint.as_ref().unwrap();
-            let connection = endpoint
-                .connect(address, "localhost")
-                .map_err(|e| format!("Failed to initiate connection: {}", e))?
-                .await
-                .map_err(|e| format!("Failed to establish connection: {}", e))?;
-
-            // Default handshake remains SERVER with our node_id (legacy behavior).
-            // New call sites should prefer connect_as_client/connect_as_server to be explicit.
-            if let Ok((mut send, _recv)) = connection.open_bi().await {
-                let envelope = NetEnvelope::Handshake {
-                    role: "SERVER".to_string(),
-                    id: self.node_id,
-                };
-                let bytes = envelope.serialize();
-                let _ = send.write_all(&bytes).await;
-            }
-
-            // Find the node ID for this address or generate a new one
-            let node_id = self.nodes.iter()
-                .find(|node| node.address() == address)
-                .map(|node| node.id())
-                .unwrap_or_else(|| {
-                    // If we don't have a node for this address, create one
-                    let node = QuicNode::new_with_random_id(address);
-                    let id = node.id();
-                    self.nodes.push(node);
-                    id
-                });
-
-            // Store a clone of the connection in the connections hashmap
-            let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
-
-            // Return the original connection
-            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
+            self.connect_as_server(address, self.node_id).await
         })
     }
 
     fn accept<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let endpoint = self
-                .endpoint
-                .as_ref()
+            let endpoint = self.endpoint.as_ref()
                 .ok_or_else(|| "Endpoint not initialized. Call listen() first.".to_string())?;
 
-            let incoming = endpoint
-                .accept()
-                .await
+            let incoming = endpoint.accept().await
                 .ok_or_else(|| "No incoming connections".to_string())?;
 
-            let connection = incoming
-                .await
+            let connection = incoming.await
                 .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
-            // Get the remote address of the connection
             let remote_addr = connection.remote_address();
 
-            // Try to read a role identification handshake from the first bi-directional stream
-            let mut parsed_role: Option<(String, usize)> = None;
-            if let Ok((mut _send, mut recv)) = connection.accept_bi().await {
-                // Read a small buffer; if it's a NetEnvelope, great; otherwise fallback.
-                let mut buf = vec![0u8; 512];
-                if let Ok(Some(n)) = recv.read(&mut buf).await {
-                    let bytes = &buf[..n];
-                    match NetEnvelope::try_deserialize(bytes) {
-                        Ok(NetEnvelope::Handshake { role, id }) => {
-                            parsed_role = Some((role, id));
-                        }
-                        Ok(NetEnvelope::HoneyBadger(_)) => {
-                            // Control stream received a payload; treat as legacy/no-handshake.
-                            parsed_role = None;
-                        }
-                        Err(_) => {
-                            // Not an envelope: legacy path.
-                            parsed_role = None;
-                        }
-                    }
-                }
-            }
+            // Accept persistent stream and read handshake
+            let (send, mut recv) = connection.accept_bi().await
+                .map_err(|e| format!("Failed to accept stream: {}", e))?;
+
+            let parsed_role = recv_handshake(&mut recv).await
+                .map_err(|e| format!("Failed to read handshake: {}", e))?;
+
+            // Create Arc-wrapped connection
+            let conn = Arc::new(QuicPeerConnection::new(
+                connection.clone(),
+                send,
+                recv,
+            )) as Arc<dyn PeerConnection>;
 
             match parsed_role {
                 Some((role, id)) if role.eq_ignore_ascii_case("CLIENT") => {
                     // Store as client connection
                     {
-                        let mut cc = self.client_connections_async.lock().await;
-                        cc.insert(id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
+                        let mut cc = self.client_connections.lock().await;
+                        cc.insert(id, Arc::clone(&conn));
                     }
-                    if let Ok(mut set) = self.client_ids.lock() { set.insert(id); }
+                    if let Ok(mut set) = self.client_ids.lock() {
+                        set.insert(id);
+                    }
 
-                    // Return the original connection
-                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
+                    Ok(conn)
                 }
                 Some((role, id)) if role.eq_ignore_ascii_case("SERVER") => {
-                    // Ensure the nodes list includes this server party
+                    // Ensure node exists
                     if !self.nodes.iter().any(|n| n.id() == id) {
                         self.nodes.push(QuicNode::from_party_id(id, remote_addr));
                     }
 
-                    // Store connection in server connections map
+                    // Store connection
                     let mut connections = self.connections.lock().await;
-                    connections.insert(id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
+                    connections.insert(id, Arc::clone(&conn));
 
-                    // Return the original connection
-                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
+                    Ok(conn)
                 }
                 _ => {
-                    // Fallback: use address-based mapping as before
+                    // Fallback: address-based mapping
                     let node_id = self.nodes.iter()
-                        .find(|node| node.address() == remote_addr)
-                        .map(|node| node.id())
+                        .find(|n| n.address() == remote_addr)
+                        .map(|n| n.id())
                         .unwrap_or_else(|| {
                             let node = QuicNode::new_with_random_id(remote_addr);
                             let id = node.id();
@@ -1060,9 +800,9 @@ impl NetworkManager for QuicNetworkManager {
                         });
 
                     let mut connections = self.connections.lock().await;
-                    connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
+                    connections.insert(node_id, Arc::clone(&conn));
 
-                    Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
+                    Ok(conn)
                 }
             }
         })
@@ -1077,83 +817,72 @@ impl NetworkManager for QuicNetworkManager {
             let mut endpoint = Endpoint::server(server_config, bind_address)
                 .map_err(|e| format!("Failed to create server endpoint: {}", e))?;
 
-            // Also configure default client config so this endpoint can initiate outbound connections
             let client_config = Self::create_insecure_client_config()?;
             endpoint.set_default_client_config(client_config);
 
             self.endpoint = Some(endpoint);
-
-            // Ensure loopback connection exists for self-delivery
             self.ensure_loopback_installed().await;
             Ok(())
         })
     }
 }
 
-/// Implementation of the Network trait for QuicNetworkManager
-///
-/// This implementation uses the QUIC protocol for communication between nodes.
+// ============================================================================
+// NETWORK TRAIT IMPLEMENTATION
+// ============================================================================
+
 #[async_trait]
 impl Network for QuicNetworkManager {
     type NodeType = QuicNode;
     type NetworkConfig = QuicNetworkConfig;
 
     async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
-        // Acquire the lock on the connections hashmap
-        let mut connections = self.connections.lock().await;
+        let connections = self.connections.lock().await;
 
-        // Check if the connection exists
-        if !connections.contains_key(&recipient) {
-            return Err(NetworkError::PartyNotFound(recipient));
-        }
-
-        // Get a mutable reference to the connection
-        let connection = connections.get_mut(&recipient).unwrap();
-
-        // Send the message
-        match connection.send(message).await {
-            Ok(_) => {
-                println!("Successfully sent message to recipient {}", recipient);
-                Ok(message.len())
-            },
-            Err(e) => {
-                println!("Failed to send message to recipient {}: {}", recipient, e);
-                Err(NetworkError::SendError)
+        if let Some(connection) = connections.get(&recipient) {
+            match connection.send(message).await {
+                Ok(_) => {
+                    println!("Successfully sent message to recipient {}", recipient);
+                    Ok(message.len())
+                }
+                Err(e) => {
+                    println!("Failed to send message to recipient {}: {}", recipient, e);
+                    Err(NetworkError::SendError)
+                }
             }
+        } else {
+            Err(NetworkError::PartyNotFound(recipient))
         }
     }
 
-
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
-        // Acquire the lock on the connections hashmap
-        let mut connections = self.connections.lock().await;
+        let connections = self.connections.lock().await;
         let mut total_bytes = 0usize;
         let mut included_self = false;
 
-        // Send the message to all known nodes (including self if present)
         for node in &self.nodes {
-            if let Some(connection) = connections.get_mut(&node.id()) {
+            if let Some(connection) = connections.get(&node.id()) {
                 match connection.send(message).await {
                     Ok(_) => {
                         println!("Successfully broadcasted message to node {}", node.id());
                         total_bytes += message.len();
-                        if node.id() == self.node_id { included_self = true; }
-                    },
+                        if node.id() == self.node_id {
+                            included_self = true;
+                        }
+                    }
                     Err(e) => {
                         println!("Failed to broadcast message to node {}: {}", node.id(), e);
-                        // Continue with other nodes even if one fails
                     }
                 }
             } else {
-                // Log a warning that we couldn't send the message to this node
                 println!("Warning: No connection to node {}, skipping broadcast", node.id());
             }
         }
 
-        // Ensure self-delivery via loopback even if self is not listed in nodes
+        // Ensure self-delivery via loopback
         if !included_self {
-            if let Some(connection) = connections.get_mut(&self.node_id) {
-                if let Ok(_) = connection.send(message).await {
+            if let Some(connection) = connections.get(&self.node_id) {
+                if connection.send(message).await.is_ok() {
                     println!("Successfully broadcasted message to self (loopback)");
                     total_bytes += message.len();
                 }
@@ -1184,9 +913,8 @@ impl Network for QuicNetworkManager {
     }
 
     async fn send_to_client(&self, client: ClientId, message: &[u8]) -> Result<usize, NetworkError> {
-        // Acquire the lock on client connections
-        let mut connections = self.client_connections_async.lock().await;
-        if let Some(conn) = connections.get_mut(&client) {
+        let connections = self.client_connections.lock().await;
+        if let Some(conn) = connections.get(&client) {
             match conn.send(message).await {
                 Ok(_) => Ok(message.len()),
                 Err(_) => Err(NetworkError::SendError),
@@ -1211,26 +939,14 @@ impl Network for QuicNetworkManager {
     }
 }
 
-/// Certificate verifier that accepts any server certificate
-///
-/// This is a dummy implementation of the ServerCertVerifier trait that
-/// accepts any server certificate without verification. It is used for
-/// development and testing purposes only.
-///
-/// # Security Warning
-///
-/// This implementation is **extremely insecure** and vulnerable to
-/// man-in-the-middle attacks. It should never be used in production.
-/// In a production environment, proper certificate verification should
-/// be implemented, typically using a trusted certificate authority.
+// ============================================================================
+// CERTIFICATE VERIFIER (Development Only)
+// ============================================================================
+
 #[derive(Debug)]
 struct SkipServerVerification;
 
 impl SkipServerVerification {
-    /// Creates a new SkipServerVerification instance
-    ///
-    /// This is a simple constructor that returns a new instance of
-    /// the SkipServerVerification struct.
     fn new() -> Self {
         Self
     }

@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 use std::time::Duration;
 use crate::transports::net_envelope::NetEnvelope;
+use tracing::{debug, error, info, trace, warn};
 
 // ============================================================================
 // CONNECTION STATE
@@ -1058,7 +1059,7 @@ impl Network for QuicNetworkManager {
         if let Some(connection) = connections.get(&recipient) {
             // Check if connection is still alive
             if !connection.is_connected().await {
-                println!("Connection to recipient {} is dead, removing from map", recipient);
+                debug!("Connection to recipient {} is dead, removing from map", recipient);
                 drop(connections);
                 self.cleanup_dead_connections().await;
                 return Err(NetworkError::PartyNotFound(recipient));
@@ -1066,11 +1067,11 @@ impl Network for QuicNetworkManager {
 
             match connection.send(message).await {
                 Ok(_) => {
-                    println!("Successfully sent message to recipient {}", recipient);
+                    debug!("Successfully sent message to recipient {}", recipient);
                     Ok(message.len())
                 }
                 Err(e) => {
-                    println!("Failed to send message to recipient {}: {}", recipient, e);
+                    debug!("Failed to send message to recipient {}: {}", recipient, e);
                     // Connection might be dead, mark for cleanup
                     drop(connections);
                     self.cleanup_dead_connections().await;
@@ -1091,24 +1092,24 @@ impl Network for QuicNetworkManager {
             if let Some(connection) = connections.get(&node.id()) {
                 // Check connection health before sending
                 if !connection.is_connected().await {
-                    println!("Skipping broadcast to node {}: connection is dead", node.id());
+                    debug!("Skipping broadcast to node {}: connection is dead", node.id());
                     continue;
                 }
 
                 match connection.send(message).await {
                     Ok(_) => {
-                        println!("Successfully broadcasted message to node {}", node.id());
+                        debug!("Successfully broadcasted message to node {}", node.id());
                         total_bytes += message.len();
                         if node.id() == self.node_id {
                             included_self = true;
                         }
                     }
                     Err(e) => {
-                        println!("Failed to broadcast message to node {}: {}", node.id(), e);
+                        debug!("Failed to broadcast message to node {}: {}", node.id(), e);
                     }
                 }
             } else {
-                println!("Warning: No connection to node {}, skipping broadcast", node.id());
+                debug!("Warning: No connection to node {}, skipping broadcast", node.id());
             }
         }
 
@@ -1116,7 +1117,7 @@ impl Network for QuicNetworkManager {
         if !included_self {
             if let Some(connection) = connections.get(&self.node_id) {
                 if connection.is_connected().await && connection.send(message).await.is_ok() {
-                    println!("Successfully broadcasted message to self (loopback)");
+                    debug!("Successfully broadcasted message to self (loopback)");
                     total_bytes += message.len();
                 }
             }
@@ -1154,7 +1155,7 @@ impl Network for QuicNetworkManager {
         if let Some(conn) = connections.get(&client) {
             // Check connection health
             if !conn.is_connected().await {
-                println!("Connection to client {} is dead", client);
+                debug!("Connection to client {} is dead", client);
                 drop(connections);
                 return Err(NetworkError::ClientNotFound(client));
             }

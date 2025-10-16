@@ -1,4 +1,3 @@
-// src/net/p2p.rs
 //! # Peer-to-Peer Networking for StoffelVM (Actor Model Compatible)
 //!
 //! ## QUIC Stream Model
@@ -15,7 +14,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
+use dashmap::{DashMap, DashSet};
 use crate::network_utils::{ClientId, Message, Network, NetworkError, Node, PartyId};
 use tokio::sync::{Mutex, mpsc};
 use ark_ff::Field;
@@ -681,9 +680,12 @@ pub struct QuicNetworkManager {
     nodes: Vec<QuicNode>,
     node_id: PartyId,
     network_config: QuicNetworkConfig,
-    connections: Arc<Mutex<HashMap<PartyId, Arc<dyn PeerConnection>>>>,
-    client_connections: Arc<Mutex<HashMap<ClientId, Arc<dyn PeerConnection>>>>,
-    client_ids: Arc<StdMutex<HashSet<ClientId>>>,
+    /// Replaced Mutex<HashMap> with DashMap for better concurrent access
+    connections: Arc<DashMap<PartyId, Arc<dyn PeerConnection>>>,
+    /// Replaced Mutex<HashMap> with DashMap for client connections
+    client_connections: Arc<DashMap<ClientId, Arc<dyn PeerConnection>>>,
+    /// Replaced Mutex<HashSet> with DashSet for client IDs
+    client_ids: Arc<DashSet<ClientId>>,
 }
 
 impl Default for QuicNetworkManager {
@@ -700,9 +702,9 @@ impl QuicNetworkManager {
             nodes: Vec::new(),
             node_id,
             network_config: QuicNetworkConfig::default(),
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            client_connections: Arc::new(Mutex::new(HashMap::new())),
-            client_ids: Arc::new(StdMutex::new(HashSet::new())),
+            connections: Arc::new(DashMap::new()),
+            client_connections: Arc::new(DashMap::new()),
+            client_ids: Arc::new(DashSet::new()),
         }
     }
 
@@ -728,10 +730,9 @@ impl QuicNetworkManager {
 
     /// Ensures loopback connection exists for self-delivery
     pub async fn ensure_loopback_installed(&self) {
-        let mut conns = self.connections.lock().await;
-        if !conns.contains_key(&self.node_id) {
+        if !self.connections.contains_key(&self.node_id) {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            conns.insert(
+            self.connections.insert(
                 self.node_id,
                 Arc::new(LoopbackPeerConnection::new(addr)) as Arc<dyn PeerConnection>
             );
@@ -740,37 +741,38 @@ impl QuicNetworkManager {
 
     /// Gets a connection by party ID (for actor model usage)
     pub async fn get_connection(&self, party_id: PartyId) -> Option<Arc<dyn PeerConnection>> {
-        let conns = self.connections.lock().await;
-        conns.get(&party_id).cloned()
+        self.connections.get(&party_id).map(|entry| Arc::clone(entry.value()))
     }
 
     /// Gets all party connections (for actor model usage)
     pub async fn get_all_connections(&self) -> Vec<(PartyId, Arc<dyn PeerConnection>)> {
-        let conns = self.connections.lock().await;
-        conns.iter().map(|(id, conn)| (*id, Arc::clone(conn))).collect()
+        self.connections
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect()
     }
 
     /// Removes dead connections from the connection map
     pub async fn cleanup_dead_connections(&self) {
-        let mut conns = self.connections.lock().await;
         let mut to_remove = Vec::new();
 
-        for (party_id, conn) in conns.iter() {
+        for entry in self.connections.iter() {
+            let party_id = *entry.key();
+            let conn = entry.value();
             if !conn.is_connected().await {
-                to_remove.push(*party_id);
+                to_remove.push(party_id);
             }
         }
 
         for party_id in to_remove {
-            conns.remove(&party_id);
+            self.connections.remove(&party_id);
         }
     }
 
     /// Checks connection health for a specific party
     pub async fn is_party_connected(&self, party_id: PartyId) -> bool {
-        let conns = self.connections.lock().await;
-        if let Some(conn) = conns.get(&party_id) {
-            conn.is_connected().await
+        if let Some(conn_ref) = self.connections.get(&party_id) {
+            conn_ref.value().is_connected().await
         } else {
             false
         }
@@ -885,8 +887,7 @@ impl QuicNetworkManager {
                 id
             });
 
-        let mut connections = self.connections.lock().await;
-        connections.insert(node_id, Arc::clone(&conn));
+        self.connections.insert(node_id, Arc::clone(&conn));
 
         Ok(conn)
     }
@@ -933,8 +934,7 @@ impl QuicNetworkManager {
                 id
             });
 
-        let mut connections = self.connections.lock().await;
-        connections.insert(node_id, Arc::clone(&conn));
+        self.connections.insert(node_id, Arc::clone(&conn));
 
         Ok(conn)
     }
@@ -982,13 +982,8 @@ impl NetworkManager for QuicNetworkManager {
             match parsed_role {
                 Some((role, id)) if role.eq_ignore_ascii_case("CLIENT") => {
                     // Store as client connection
-                    {
-                        let mut cc = self.client_connections.lock().await;
-                        cc.insert(id, Arc::clone(&conn));
-                    }
-                    if let Ok(mut set) = self.client_ids.lock() {
-                        set.insert(id);
-                    }
+                    self.client_connections.insert(id, Arc::clone(&conn));
+                    self.client_ids.insert(id);
 
                     Ok(conn)
                 }
@@ -999,8 +994,7 @@ impl NetworkManager for QuicNetworkManager {
                     }
 
                     // Store connection
-                    let mut connections = self.connections.lock().await;
-                    connections.insert(id, Arc::clone(&conn));
+                    self.connections.insert(id, Arc::clone(&conn));
 
                     Ok(conn)
                 }
@@ -1016,8 +1010,7 @@ impl NetworkManager for QuicNetworkManager {
                             id
                         });
 
-                    let mut connections = self.connections.lock().await;
-                    connections.insert(node_id, Arc::clone(&conn));
+                    self.connections.insert(node_id, Arc::clone(&conn));
 
                     Ok(conn)
                 }
@@ -1054,13 +1047,13 @@ impl Network for QuicNetworkManager {
     type NetworkConfig = QuicNetworkConfig;
 
     async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
-        let connections = self.connections.lock().await;
+        if let Some(connection_ref) = self.connections.get(&recipient) {
+            let connection = connection_ref.value();
 
-        if let Some(connection) = connections.get(&recipient) {
             // Check if connection is still alive
             if !connection.is_connected().await {
                 debug!("Connection to recipient {} is dead, removing from map", recipient);
-                drop(connections);
+                drop(connection_ref);
                 self.cleanup_dead_connections().await;
                 return Err(NetworkError::PartyNotFound(recipient));
             }
@@ -1073,7 +1066,7 @@ impl Network for QuicNetworkManager {
                 Err(e) => {
                     debug!("Failed to send message to recipient {}: {}", recipient, e);
                     // Connection might be dead, mark for cleanup
-                    drop(connections);
+                    drop(connection_ref);
                     self.cleanup_dead_connections().await;
                     Err(NetworkError::SendError)
                 }
@@ -1084,12 +1077,13 @@ impl Network for QuicNetworkManager {
     }
 
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
-        let connections = self.connections.lock().await;
         let mut total_bytes = 0usize;
         let mut included_self = false;
 
         for node in &self.nodes {
-            if let Some(connection) = connections.get(&node.id()) {
+            if let Some(connection_ref) = self.connections.get(&node.id()) {
+                let connection = connection_ref.value();
+
                 // Check connection health before sending
                 if !connection.is_connected().await {
                     debug!("Skipping broadcast to node {}: connection is dead", node.id());
@@ -1115,7 +1109,8 @@ impl Network for QuicNetworkManager {
 
         // Ensure self-delivery via loopback
         if !included_self {
-            if let Some(connection) = connections.get(&self.node_id) {
+            if let Some(connection_ref) = self.connections.get(&self.node_id) {
+                let connection = connection_ref.value();
                 if connection.is_connected().await && connection.send(message).await.is_ok() {
                     debug!("Successfully broadcasted message to self (loopback)");
                     total_bytes += message.len();
@@ -1124,7 +1119,6 @@ impl Network for QuicNetworkManager {
         }
 
         // Cleanup dead connections after broadcast
-        drop(connections);
         self.cleanup_dead_connections().await;
 
         Ok(total_bytes)
@@ -1151,16 +1145,16 @@ impl Network for QuicNetworkManager {
     }
 
     async fn send_to_client(&self, client: ClientId, message: &[u8]) -> Result<usize, NetworkError> {
-        let connections = self.client_connections.lock().await;
-        if let Some(conn) = connections.get(&client) {
+        if let Some(conn_ref) = self.client_connections.get(&client) {
+            let connection = conn_ref.value();
+
             // Check connection health
-            if !conn.is_connected().await {
+            if !connection.is_connected().await {
                 debug!("Connection to client {} is dead", client);
-                drop(connections);
                 return Err(NetworkError::ClientNotFound(client));
             }
 
-            match conn.send(message).await {
+            match connection.send(message).await {
                 Ok(_) => Ok(message.len()),
                 Err(_) => Err(NetworkError::SendError),
             }
@@ -1170,17 +1164,11 @@ impl Network for QuicNetworkManager {
     }
 
     fn clients(&self) -> Vec<ClientId> {
-        match self.client_ids.lock() {
-            Ok(guard) => guard.iter().cloned().collect(),
-            Err(_) => Vec::new(),
-        }
+        self.client_ids.iter().map(|entry| *entry.key()).collect()
     }
 
     fn is_client_connected(&self, client: ClientId) -> bool {
-        match self.client_ids.lock() {
-            Ok(guard) => guard.contains(&client),
-            Err(_) => false,
-        }
+        self.client_ids.contains(&client)
     }
 }
 

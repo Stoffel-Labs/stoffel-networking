@@ -847,6 +847,8 @@ impl QuicNetworkManager {
 
     /// Connects and sends a CLIENT handshake
     /// Returns Arc<dyn PeerConnection> for actor model compatibility
+    /// Connects and sends a CLIENT handshake
+    /// Returns Arc<dyn PeerConnection> for actor model compatibility
     pub async fn connect_as_client(
         &mut self,
         address: SocketAddr,
@@ -863,11 +865,15 @@ impl QuicNetworkManager {
             .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
         // Open persistent stream and send handshake
-        let (mut send, recv) = connection.open_bi().await
+        let (mut send, mut recv) = connection.open_bi().await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
         send_handshake(&mut send, "CLIENT", client_id).await
             .map_err(|e| format!("Failed to send handshake: {}", e))?;
+
+        // Receive server's handshake response to get its PartyId
+        let server_handshake = recv_handshake(&mut recv).await
+            .map_err(|e| format!("Failed to receive server handshake: {}", e))?;
 
         // Create Arc-wrapped connection
         let conn = Arc::new(QuicPeerConnection::new(
@@ -876,20 +882,48 @@ impl QuicNetworkManager {
             recv,
         )) as Arc<dyn PeerConnection>;
 
-        // Find or create node and store connection
-        let node_id = self.nodes.iter()
+        // Determine the correct party_id to use
+        let party_id = if let Some((role, id)) = server_handshake {
+            if role.eq_ignore_ascii_case("SERVER") {
+                // Server told us its PartyId - use it!
+                info!("Client {} connected to server with PartyId {}", client_id, id);
+
+                // Ensure node exists with this party_id
+                if !self.nodes.iter().any(|n| n.id() == id) {
+                    self.nodes.push(QuicNode::from_party_id(id, address));
+                }
+
+                id
+            } else {
+                // Unexpected role, fallback to address-based lookup
+                warn!("Unexpected handshake role from server: {}", role);
+                self.fallback_node_lookup(address)
+            }
+        } else {
+            // No handshake received, fallback to address-based lookup
+            warn!("No handshake received from server at {}", address);
+            self.fallback_node_lookup(address)
+        };
+
+        // Store connection with the correct party_id
+        self.connections.insert(party_id, Arc::clone(&conn));
+        info!("Client {} stored connection to server PartyId {} at {}", client_id, party_id, address);
+
+        Ok(conn)
+    }
+
+    /// Fallback method to find or create a node ID when handshake fails
+    fn fallback_node_lookup(&mut self, address: SocketAddr) -> PartyId {
+        self.nodes.iter()
             .find(|n| n.address() == address)
             .map(|n| n.id())
             .unwrap_or_else(|| {
+                warn!("Creating random node ID for address {} - this may cause connection issues", address);
                 let node = QuicNode::new_with_random_id(address);
                 let id = node.id();
                 self.nodes.push(node);
                 id
-            });
-
-        self.connections.insert(node_id, Arc::clone(&conn));
-
-        Ok(conn)
+            })
     }
 
     /// Connects and sends a SERVER handshake
@@ -966,21 +1000,25 @@ impl NetworkManager for QuicNetworkManager {
             let remote_addr = connection.remote_address();
 
             // Accept persistent stream and read handshake
-            let (send, mut recv) = connection.accept_bi().await
+            let (mut send, mut recv) = connection.accept_bi().await
                 .map_err(|e| format!("Failed to accept stream: {}", e))?;
 
             let parsed_role = recv_handshake(&mut recv).await
                 .map_err(|e| format!("Failed to read handshake: {}", e))?;
 
-            // Create Arc-wrapped connection
-            let conn = Arc::new(QuicPeerConnection::new(
-                connection.clone(),
-                send,
-                recv,
-            )) as Arc<dyn PeerConnection>;
-
             match parsed_role {
                 Some((role, id)) if role.eq_ignore_ascii_case("CLIENT") => {
+                    // Send our party_id back to the client so it knows who we are
+                    send_handshake(&mut send, "SERVER", self.node_id).await
+                        .map_err(|e| format!("Failed to send handshake response: {}", e))?;
+
+                    // Create Arc-wrapped connection AFTER sending handshake
+                    let conn = Arc::new(QuicPeerConnection::new(
+                        connection.clone(),
+                        send,
+                        recv,
+                    )) as Arc<dyn PeerConnection>;
+
                     // Store as client connection
                     self.client_connections.insert(id, Arc::clone(&conn));
                     self.client_ids.insert(id);
@@ -988,6 +1026,17 @@ impl NetworkManager for QuicNetworkManager {
                     Ok(conn)
                 }
                 Some((role, id)) if role.eq_ignore_ascii_case("SERVER") => {
+                    // Server-to-server connection: send handshake response
+                    send_handshake(&mut send, "SERVER", self.node_id).await
+                        .map_err(|e| format!("Failed to send handshake response: {}", e))?;
+
+                    // Create Arc-wrapped connection
+                    let conn = Arc::new(QuicPeerConnection::new(
+                        connection.clone(),
+                        send,
+                        recv,
+                    )) as Arc<dyn PeerConnection>;
+
                     // Ensure node exists
                     if !self.nodes.iter().any(|n| n.id() == id) {
                         self.nodes.push(QuicNode::from_party_id(id, remote_addr));
@@ -1000,6 +1049,13 @@ impl NetworkManager for QuicNetworkManager {
                 }
                 _ => {
                     // Fallback: address-based mapping
+                    // Create Arc-wrapped connection
+                    let conn = Arc::new(QuicPeerConnection::new(
+                        connection.clone(),
+                        send,
+                        recv,
+                    )) as Arc<dyn PeerConnection>;
+
                     let node_id = self.nodes.iter()
                         .find(|n| n.address() == remote_addr)
                         .map(|n| n.id())

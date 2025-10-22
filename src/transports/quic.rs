@@ -889,9 +889,10 @@ impl QuicNetworkManager {
                 info!("Client {} connected to server with PartyId {}", client_id, id);
 
                 // Ensure node exists with this party_id
-                if !self.nodes.iter().any(|n| n.id() == id) {
-                    self.nodes.push(QuicNode::from_party_id(id, address));
-                }
+                // if !self.nodes.iter().any(|n| n.id() == id) {
+                let node = QuicNode::from_party_id(id, address);
+                self.nodes.push(node);
+                // }
 
                 id
             } else {

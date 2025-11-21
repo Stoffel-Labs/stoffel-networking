@@ -23,6 +23,13 @@ pub enum NetworkError {
 pub type PartyId = usize;
 pub type ClientId = usize;
 
+/// Describes how the remote endpoint identifies itself during the handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientType {
+    Server,
+    Client,
+}
+
 /// Time that the network needs to wait until the operation returns a timeout.
 pub type Timeout = usize;
 

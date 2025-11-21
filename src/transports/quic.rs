@@ -8,21 +8,20 @@
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, IdleTimeout};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use dashmap::{DashMap, DashSet};
-use crate::network_utils::{ClientId, Message, Network, NetworkError, Node, PartyId};
+use crate::network_utils::{ClientId, ClientType, Message, Network, NetworkError, Node, PartyId};
 use tokio::sync::{Mutex, mpsc};
 use ark_ff::Field;
 use async_trait::async_trait;
 use uuid::Uuid;
 use std::time::Duration;
 use crate::transports::net_envelope::NetEnvelope;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // CONNECTION STATE
@@ -118,6 +117,9 @@ pub trait PeerConnection: Send + Sync {
 
     /// Checks if the connection is still alive
     fn is_connected<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+    /// Returns how the remote peer identified itself in the handshake
+    fn get_connection_role(&self) -> ClientType;
 }
 
 impl Debug for dyn PeerConnection {
@@ -244,6 +246,7 @@ async fn recv_framed_message(
 // QUIC PEER CONNECTION
 // ============================================================================
 
+#[derive(Clone)]
 pub struct QuicPeerConnection {
     connection: Connection,
     remote_addr: SocketAddr,
@@ -253,6 +256,7 @@ pub struct QuicPeerConnection {
     recv_stream: Arc<Mutex<quinn::RecvStream>>,
     /// Connection state
     state: Arc<Mutex<ConnectionState>>,
+    connection_role: ClientType,
 }
 
 impl QuicPeerConnection {
@@ -261,6 +265,7 @@ impl QuicPeerConnection {
         connection: Connection,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
+        connection_role: ClientType,
     ) -> Self {
         let remote_addr = connection.remote_address();
         Self {
@@ -269,11 +274,15 @@ impl QuicPeerConnection {
             send_stream: Arc::new(Mutex::new(send)),
             recv_stream: Arc::new(Mutex::new(recv)),
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
+            connection_role,
         }
     }
 
     /// Creates a new connection and immediately opens a bidirectional stream
-    pub async fn new_with_connection(connection: Connection) -> Result<Self, ConnectionError> {
+    pub async fn new_with_connection(
+        connection: Connection,
+        connection_role: ClientType,
+    ) -> Result<Self, ConnectionError> {
         let remote_addr = connection.remote_address();
         let (send, recv) = connection
             .open_bi()
@@ -288,6 +297,7 @@ impl QuicPeerConnection {
             send_stream: Arc::new(Mutex::new(send)),
             recv_stream: Arc::new(Mutex::new(recv)),
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
+            connection_role,
         })
     }
 
@@ -300,7 +310,7 @@ impl QuicPeerConnection {
     /// Checks the underlying QUIC connection health
     async fn check_connection_health(&self) -> bool {
         // Check if the connection is closed
-        if let Some(err) = self.connection.close_reason() {
+        if let Some(_err) = self.connection.close_reason() {
             return false;
         }
         true
@@ -403,6 +413,10 @@ impl PeerConnection for QuicPeerConnection {
             }
         })
     }
+
+    fn get_connection_role(&self) -> ClientType {
+        self.connection_role
+    }
 }
 
 // ============================================================================
@@ -414,6 +428,7 @@ pub struct LoopbackPeerConnection {
     tx: mpsc::Sender<Vec<u8>>,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     state: Arc<Mutex<ConnectionState>>,
+    connection_role: ClientType,
 }
 
 impl LoopbackPeerConnection {
@@ -424,6 +439,7 @@ impl LoopbackPeerConnection {
             tx,
             rx: Arc::new(Mutex::new(rx)),
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
+            connection_role: ClientType::Server,
         }
     }
 
@@ -544,6 +560,10 @@ impl PeerConnection for LoopbackPeerConnection {
             *state == ConnectionState::Connected
         })
     }
+
+    fn get_connection_role(&self) -> ClientType {
+        self.connection_role
+    }
 }
 
 // ============================================================================
@@ -574,6 +594,14 @@ async fn recv_handshake(
         Ok(NetEnvelope::Handshake { role, id }) => Ok(Some((role, id))),
         Ok(NetEnvelope::HoneyBadger(_)) => Ok(None), // Legacy, no handshake
         Err(_) => Ok(None), // Not an envelope, legacy path
+    }
+}
+
+fn client_type_from_role(role: &str) -> ClientType {
+    if role.eq_ignore_ascii_case("CLIENT") {
+        ClientType::Client
+    } else {
+        ClientType::Server
     }
 }
 
@@ -875,15 +903,10 @@ impl QuicNetworkManager {
         let server_handshake = recv_handshake(&mut recv).await
             .map_err(|e| format!("Failed to receive server handshake: {}", e))?;
 
-        // Create Arc-wrapped connection
-        let conn = Arc::new(QuicPeerConnection::new(
-            connection.clone(),
-            send,
-            recv,
-        )) as Arc<dyn PeerConnection>;
-
+        let mut connection_role = ClientType::Server;
         // Determine the correct party_id to use
         let party_id = if let Some((role, id)) = server_handshake {
+            connection_role = client_type_from_role(&role);
             if role.eq_ignore_ascii_case("SERVER") {
                 // Server told us its PartyId - use it!
                 info!("Client {} connected to server with PartyId {}", client_id, id);
@@ -905,6 +928,14 @@ impl QuicNetworkManager {
             warn!("No handshake received from server at {}", address);
             self.fallback_node_lookup(address)
         };
+
+        // Create Arc-wrapped connection
+        let conn = Arc::new(QuicPeerConnection::new(
+            connection.clone(),
+            send,
+            recv,
+            connection_role,
+        )) as Arc<dyn PeerConnection>;
 
         // Store connection with the correct party_id
         self.connections.insert(party_id, Arc::clone(&conn));
@@ -945,29 +976,40 @@ impl QuicNetworkManager {
             .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
         // Open persistent stream and send handshake
-        let (mut send, recv) = connection.open_bi().await
+        let (mut send, mut recv) = connection.open_bi().await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
         send_handshake(&mut send, "SERVER", party_id).await
             .map_err(|e| format!("Failed to send handshake: {}", e))?;
+
+        let server_handshake = recv_handshake(&mut recv).await
+            .map_err(|e| format!("Failed to receive server handshake response: {}", e))?;
+
+        let mut connection_role = ClientType::Server;
+        // Find or create node and store connection
+        let node_id = if let Some((role, id)) = server_handshake {
+            connection_role = client_type_from_role(&role);
+            if role.eq_ignore_ascii_case("SERVER") {
+                if !self.nodes.iter().any(|n| n.id() == id) {
+                    self.nodes.push(QuicNode::from_party_id(id, address));
+                }
+                id
+            } else {
+                warn!("Unexpected handshake role '{}' from server at {}", role, address);
+                self.fallback_node_lookup(address)
+            }
+        } else {
+            warn!("No handshake received from server at {}", address);
+            self.fallback_node_lookup(address)
+        };
 
         // Create Arc-wrapped connection
         let conn = Arc::new(QuicPeerConnection::new(
             connection.clone(),
             send,
             recv,
+            connection_role,
         )) as Arc<dyn PeerConnection>;
-
-        // Find or create node and store connection
-        let node_id = self.nodes.iter()
-            .find(|n| n.address() == address)
-            .map(|n| n.id())
-            .unwrap_or_else(|| {
-                let node = QuicNode::new_with_random_id(address);
-                let id = node.id();
-                self.nodes.push(node);
-                id
-            });
 
         self.connections.insert(node_id, Arc::clone(&conn));
 
@@ -1018,6 +1060,7 @@ impl NetworkManager for QuicNetworkManager {
                         connection.clone(),
                         send,
                         recv,
+                        ClientType::Client,
                     )) as Arc<dyn PeerConnection>;
 
                     // Store as client connection
@@ -1036,6 +1079,7 @@ impl NetworkManager for QuicNetworkManager {
                         connection.clone(),
                         send,
                         recv,
+                        ClientType::Server,
                     )) as Arc<dyn PeerConnection>;
 
                     // Ensure node exists
@@ -1055,6 +1099,7 @@ impl NetworkManager for QuicNetworkManager {
                         connection.clone(),
                         send,
                         recv,
+                        ClientType::Server,
                     )) as Arc<dyn PeerConnection>;
 
                     let node_id = self.nodes.iter()

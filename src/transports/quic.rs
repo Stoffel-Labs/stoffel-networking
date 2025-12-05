@@ -592,7 +592,7 @@ async fn recv_handshake(
 
     match NetEnvelope::try_deserialize(&bytes) {
         Ok(NetEnvelope::Handshake { role, id }) => Ok(Some((role, id))),
-        Ok(NetEnvelope::HoneyBadger(_)) => Ok(None), // Legacy, no handshake
+        Ok(_) => Ok(None), // Not a handshake envelope
         Err(_) => Ok(None), // Not an envelope, legacy path
     }
 }
@@ -660,6 +660,18 @@ pub struct QuicNetworkConfig {
     pub timeout_ms: u64,
     pub max_retries: u32,
     pub use_tls: bool,
+
+    // NAT Traversal Configuration
+    /// Enable NAT traversal features
+    pub enable_nat_traversal: bool,
+    /// STUN servers for reflexive address discovery
+    pub stun_servers: Vec<SocketAddr>,
+    /// Enable hole punching for peer-to-peer connections
+    pub enable_hole_punching: bool,
+    /// Timeout for hole punching attempts (milliseconds)
+    pub hole_punch_timeout_ms: u64,
+    /// ICE agent configuration
+    pub ice_config: crate::transports::ice_agent::IceAgentConfig,
 }
 
 impl Default for QuicNetworkConfig {
@@ -668,7 +680,37 @@ impl Default for QuicNetworkConfig {
             timeout_ms: 30000,
             max_retries: 3,
             use_tls: true,
+            enable_nat_traversal: false,
+            stun_servers: vec![
+                "stun.l.google.com:19302".parse().unwrap(),
+                "stun1.l.google.com:19302".parse().unwrap(),
+            ],
+            enable_hole_punching: true,
+            hole_punch_timeout_ms: 10000,
+            ice_config: crate::transports::ice_agent::IceAgentConfig::default(),
         }
+    }
+}
+
+impl QuicNetworkConfig {
+    /// Creates a config with NAT traversal enabled
+    pub fn with_nat_traversal() -> Self {
+        Self {
+            enable_nat_traversal: true,
+            ..Default::default()
+        }
+    }
+
+    /// Sets custom STUN servers
+    pub fn stun_servers(mut self, servers: Vec<SocketAddr>) -> Self {
+        self.stun_servers = servers;
+        self
+    }
+
+    /// Enables or disables NAT traversal
+    pub fn nat_traversal(mut self, enabled: bool) -> Self {
+        self.enable_nat_traversal = enabled;
+        self
     }
 }
 
@@ -714,6 +756,14 @@ pub struct QuicNetworkManager {
     client_connections: Arc<DashMap<ClientId, Arc<dyn PeerConnection>>>,
     /// Replaced Mutex<HashSet> with DashSet for client IDs
     client_ids: Arc<DashSet<ClientId>>,
+
+    // NAT Traversal State
+    /// STUN client for reflexive address discovery
+    stun_client: Option<Arc<crate::transports::stun::StunClient>>,
+    /// Cached local ICE candidates
+    local_candidates: Arc<Mutex<Option<crate::transports::ice::LocalCandidates>>>,
+    /// Active ICE agents for pending P2P negotiations
+    pending_ice_agents: Arc<DashMap<PartyId, Arc<Mutex<crate::transports::ice_agent::IceAgent>>>>,
 }
 
 impl Default for QuicNetworkManager {
@@ -733,6 +783,9 @@ impl QuicNetworkManager {
             connections: Arc::new(DashMap::new()),
             client_connections: Arc::new(DashMap::new()),
             client_ids: Arc::new(DashSet::new()),
+            stun_client: None,
+            local_candidates: Arc::new(Mutex::new(None)),
+            pending_ice_agents: Arc::new(DashMap::new()),
         }
     }
 
@@ -743,9 +796,34 @@ impl QuicNetworkManager {
     }
 
     pub fn with_config(config: QuicNetworkConfig) -> Self {
-        let mut manager = Self::new();
-        manager.network_config = config;
-        manager
+        let stun_client = if config.enable_nat_traversal {
+            let stun_servers = config
+                .stun_servers
+                .iter()
+                .map(|addr| crate::transports::stun::StunServerConfig::new(*addr))
+                .collect();
+            Some(Arc::new(crate::transports::stun::StunClient::new(stun_servers)))
+        } else {
+            None
+        };
+
+        Self {
+            endpoint: None,
+            nodes: Vec::new(),
+            node_id: Uuid::new_v4().as_u128() as PartyId,
+            network_config: config,
+            connections: Arc::new(DashMap::new()),
+            client_connections: Arc::new(DashMap::new()),
+            client_ids: Arc::new(DashSet::new()),
+            stun_client,
+            local_candidates: Arc::new(Mutex::new(None)),
+            pending_ice_agents: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Creates a manager with NAT traversal enabled
+    pub fn with_nat_traversal() -> Self {
+        Self::with_config(QuicNetworkConfig::with_nat_traversal())
     }
 
     pub fn add_node(&mut self, node: QuicNode) {
@@ -1014,6 +1092,485 @@ impl QuicNetworkManager {
         self.connections.insert(node_id, Arc::clone(&conn));
 
         Ok(conn)
+    }
+
+    // =========================================================================
+    // NAT TRAVERSAL METHODS
+    // =========================================================================
+
+    /// Returns whether NAT traversal is enabled
+    pub fn is_nat_traversal_enabled(&self) -> bool {
+        self.network_config.enable_nat_traversal
+    }
+
+    /// Returns the local party ID
+    pub fn party_id(&self) -> PartyId {
+        self.node_id
+    }
+
+    /// Gathers ICE candidates for NAT traversal
+    ///
+    /// Discovers local host addresses and queries STUN servers for
+    /// server reflexive (external) addresses.
+    pub async fn gather_ice_candidates(
+        &self,
+    ) -> Result<crate::transports::ice::LocalCandidates, String> {
+        use crate::transports::ice::LocalCandidates;
+
+        if !self.network_config.enable_nat_traversal {
+            return Err("NAT traversal not enabled".to_string());
+        }
+
+        // Check cache first
+        {
+            let cached = self.local_candidates.lock().await;
+            if let Some(ref candidates) = *cached {
+                return Ok(candidates.clone());
+            }
+        }
+
+        let mut candidates = LocalCandidates::new();
+
+        // Get local address from endpoint
+        let local_addr = if let Some(endpoint) = &self.endpoint {
+            endpoint
+                .local_addr()
+                .map_err(|e| format!("Failed to get local address: {}", e))?
+        } else {
+            // Create a temporary socket to determine local address
+            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| format!("Failed to bind socket: {}", e))?;
+            socket
+                .local_addr()
+                .map_err(|e| format!("Failed to get local address: {}", e))?
+        };
+
+        // Add host candidate
+        candidates.add_host(local_addr);
+        debug!("Added host candidate: {}", local_addr);
+
+        // Gather server reflexive candidates via STUN
+        if let Some(ref stun_client) = self.stun_client {
+            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| format!("Failed to bind STUN socket: {}", e))?;
+
+            let results = stun_client.discover_all(&socket).await;
+
+            for result in results {
+                if result.reflexive_address != local_addr {
+                    candidates.add_server_reflexive(
+                        result.reflexive_address,
+                        local_addr,
+                        result.server_address,
+                    );
+                    debug!(
+                        "Added server reflexive candidate: {} (from {})",
+                        result.reflexive_address, result.server_address
+                    );
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Err("No candidates gathered".to_string());
+        }
+
+        info!("Gathered {} ICE candidates", candidates.len());
+
+        // Cache the candidates
+        {
+            let mut cached = self.local_candidates.lock().await;
+            *cached = Some(candidates.clone());
+        }
+
+        Ok(candidates)
+    }
+
+    /// Creates an ICE candidates message for sending to a peer
+    pub async fn create_ice_candidates_message(
+        &self,
+    ) -> Result<NetEnvelope, String> {
+        let candidates = self.gather_ice_candidates().await?;
+
+        Ok(NetEnvelope::IceCandidates {
+            ufrag: candidates.ufrag.clone(),
+            pwd: candidates.pwd.clone(),
+            candidates: candidates.candidates.clone(),
+        })
+    }
+
+    /// Initiates a peer-to-peer connection with NAT traversal
+    ///
+    /// This method:
+    /// 1. Gathers local ICE candidates
+    /// 2. Sends candidates to the peer via the signaling connection
+    /// 3. Receives remote candidates
+    /// 4. Runs ICE connectivity checks
+    /// 5. Returns the established connection
+    pub async fn connect_p2p(
+        &mut self,
+        target_party_id: PartyId,
+        signaling_connection: Arc<dyn PeerConnection>,
+    ) -> Result<Arc<dyn PeerConnection>, String> {
+        use crate::transports::ice_agent::IceAgent;
+
+        if !self.network_config.enable_nat_traversal {
+            return Err("NAT traversal not enabled".to_string());
+        }
+
+        info!(
+            "Starting P2P connection to party {} via NAT traversal",
+            target_party_id
+        );
+
+        // 1. Gather local candidates
+        let local_candidates = self.gather_ice_candidates().await?;
+
+        // 2. Send our candidates to the peer
+        let candidates_msg = NetEnvelope::IceCandidates {
+            ufrag: local_candidates.ufrag.clone(),
+            pwd: local_candidates.pwd.clone(),
+            candidates: local_candidates.candidates.clone(),
+        };
+
+        signaling_connection
+            .send(&candidates_msg.serialize())
+            .await
+            .map_err(|e| format!("Failed to send ICE candidates: {}", e))?;
+
+        debug!("Sent {} ICE candidates to peer", local_candidates.len());
+
+        // 3. Wait for remote candidates
+        let remote_data = signaling_connection
+            .receive()
+            .await
+            .map_err(|e| format!("Failed to receive remote candidates: {}", e))?;
+
+        let remote_envelope = NetEnvelope::try_deserialize(&remote_data)
+            .map_err(|e| format!("Failed to deserialize remote candidates: {}", e))?;
+
+        let (remote_ufrag, remote_pwd, remote_candidates) = match remote_envelope {
+            NetEnvelope::IceCandidates {
+                ufrag,
+                pwd,
+                candidates,
+            } => (ufrag, pwd, candidates),
+            _ => {
+                return Err("Expected IceCandidates message".to_string());
+            }
+        };
+
+        debug!(
+            "Received {} remote ICE candidates",
+            remote_candidates.len()
+        );
+
+        // 4. Create and configure ICE agent
+        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id);
+
+        // Gather candidates using our local address
+        let local_addr = local_candidates
+            .best_candidate()
+            .map(|c| c.address)
+            .ok_or("No local candidates")?;
+
+        ice_agent
+            .gather_candidates(local_addr)
+            .await
+            .map_err(|e| format!("ICE gathering failed: {}", e))?;
+
+        // Set remote candidates
+        ice_agent
+            .set_remote_candidates(target_party_id, remote_ufrag, remote_pwd, remote_candidates)
+            .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
+
+        // Store agent for potential later use
+        self.pending_ice_agents.insert(
+            target_party_id,
+            Arc::new(Mutex::new(ice_agent)),
+        );
+
+        // 5. Ensure endpoint exists
+        self.ensure_client_endpoint().await?;
+        let endpoint = self.endpoint.as_ref().unwrap();
+
+        // 6. Get the agent back and run connectivity checks
+        let agent_arc = self
+            .pending_ice_agents
+            .get(&target_party_id)
+            .map(|e| Arc::clone(e.value()))
+            .ok_or("ICE agent not found")?;
+
+        let nominated_pair = {
+            let mut agent = agent_arc.lock().await;
+            agent
+                .run_connectivity_checks(endpoint)
+                .await
+                .map_err(|e| format!("ICE connectivity checks failed: {}", e))?
+        };
+
+        info!(
+            "ICE completed: {} -> {} (RTT: {:?}ms)",
+            nominated_pair.local.address,
+            nominated_pair.remote.address,
+            nominated_pair.rtt_ms
+        );
+
+        // 7. Establish QUIC connection on the successful pair
+        let connection = endpoint
+            .connect(nominated_pair.remote.address, "localhost")
+            .map_err(|e| format!("Failed to initiate connection: {}", e))?
+            .await
+            .map_err(|e| format!("Failed to establish connection: {}", e))?;
+
+        // Open stream and perform handshake
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| format!("Failed to open stream: {}", e))?;
+
+        send_handshake(&mut send, "SERVER", self.node_id)
+            .await
+            .map_err(|e| format!("Failed to send handshake: {}", e))?;
+
+        let handshake = recv_handshake(&mut recv)
+            .await
+            .map_err(|e| format!("Failed to receive handshake: {}", e))?;
+
+        let connection_role = if let Some((role, _)) = handshake {
+            client_type_from_role(&role)
+        } else {
+            ClientType::Server
+        };
+
+        let conn = Arc::new(QuicPeerConnection::new(
+            connection,
+            send,
+            recv,
+            connection_role,
+        )) as Arc<dyn PeerConnection>;
+
+        // Store connection
+        self.connections.insert(target_party_id, Arc::clone(&conn));
+
+        // Cleanup ICE agent
+        self.pending_ice_agents.remove(&target_party_id);
+
+        Ok(conn)
+    }
+
+    /// Handles an incoming P2P connection request with NAT traversal
+    ///
+    /// Called when we receive ICE candidates from a peer wanting to connect.
+    pub async fn handle_p2p_request(
+        &mut self,
+        from_party_id: PartyId,
+        remote_ufrag: String,
+        remote_pwd: String,
+        remote_candidates: Vec<crate::transports::ice::IceCandidate>,
+        signaling_connection: Arc<dyn PeerConnection>,
+    ) -> Result<Arc<dyn PeerConnection>, String> {
+        use crate::transports::ice_agent::IceAgent;
+
+        if !self.network_config.enable_nat_traversal {
+            return Err("NAT traversal not enabled".to_string());
+        }
+
+        info!(
+            "Handling P2P request from party {} with {} candidates",
+            from_party_id,
+            remote_candidates.len()
+        );
+
+        // 1. Gather our candidates
+        let local_candidates = self.gather_ice_candidates().await?;
+
+        // 2. Send our candidates back
+        let candidates_msg = NetEnvelope::IceCandidates {
+            ufrag: local_candidates.ufrag.clone(),
+            pwd: local_candidates.pwd.clone(),
+            candidates: local_candidates.candidates.clone(),
+        };
+
+        signaling_connection
+            .send(&candidates_msg.serialize())
+            .await
+            .map_err(|e| format!("Failed to send ICE candidates: {}", e))?;
+
+        // 3. Create ICE agent
+        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id);
+
+        let local_addr = local_candidates
+            .best_candidate()
+            .map(|c| c.address)
+            .ok_or("No local candidates")?;
+
+        ice_agent
+            .gather_candidates(local_addr)
+            .await
+            .map_err(|e| format!("ICE gathering failed: {}", e))?;
+
+        ice_agent
+            .set_remote_candidates(from_party_id, remote_ufrag, remote_pwd, remote_candidates)
+            .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
+
+        // 4. Run connectivity checks
+        self.ensure_client_endpoint().await?;
+        let endpoint = self.endpoint.as_ref().unwrap();
+
+        let nominated_pair = ice_agent
+            .run_connectivity_checks(endpoint)
+            .await
+            .map_err(|e| format!("ICE connectivity checks failed: {}", e))?;
+
+        info!(
+            "ICE completed (responder): {} -> {}",
+            nominated_pair.local.address, nominated_pair.remote.address
+        );
+
+        // 5. The controlling agent will establish the final connection
+        // We wait to accept it
+        let incoming = endpoint
+            .accept()
+            .await
+            .ok_or("No incoming connection")?;
+
+        let connection = incoming
+            .await
+            .map_err(|e| format!("Failed to accept connection: {}", e))?;
+
+        let (mut send, mut recv) = connection
+            .accept_bi()
+            .await
+            .map_err(|e| format!("Failed to accept stream: {}", e))?;
+
+        // Read and respond to handshake
+        let _handshake = recv_handshake(&mut recv)
+            .await
+            .map_err(|e| format!("Failed to read handshake: {}", e))?;
+
+        send_handshake(&mut send, "SERVER", self.node_id)
+            .await
+            .map_err(|e| format!("Failed to send handshake: {}", e))?;
+
+        let conn = Arc::new(QuicPeerConnection::new(
+            connection,
+            send,
+            recv,
+            ClientType::Server,
+        )) as Arc<dyn PeerConnection>;
+
+        self.connections.insert(from_party_id, Arc::clone(&conn));
+
+        Ok(conn)
+    }
+
+    /// Connects with automatic fallback strategies
+    ///
+    /// Tries connection methods in order:
+    /// 1. Direct connection (if address provided)
+    /// 2. NAT traversal with hole punching
+    /// 3. Relay (future - returns error for now)
+    pub async fn connect_with_fallback(
+        &mut self,
+        target_party_id: PartyId,
+        direct_address: Option<SocketAddr>,
+        signaling_connection: Option<Arc<dyn PeerConnection>>,
+    ) -> Result<Arc<dyn PeerConnection>, String> {
+        // Strategy 1: Direct connection
+        if let Some(addr) = direct_address {
+            debug!("Attempting direct connection to {}", addr);
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                self.connect_as_server(addr, self.node_id),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(conn)) => {
+                    info!("Direct connection succeeded to {}", addr);
+                    return Ok(conn);
+                }
+                Ok(Err(e)) => {
+                    debug!("Direct connection failed: {}", e);
+                }
+                Err(_) => {
+                    debug!("Direct connection timed out");
+                }
+            }
+        }
+
+        // Strategy 2: NAT traversal
+        if self.network_config.enable_nat_traversal {
+            if let Some(signaling) = signaling_connection {
+                debug!("Attempting NAT traversal to party {}", target_party_id);
+
+                match self.connect_p2p(target_party_id, signaling).await {
+                    Ok(conn) => {
+                        info!("NAT traversal succeeded to party {}", target_party_id);
+                        return Ok(conn);
+                    }
+                    Err(e) => {
+                        warn!("NAT traversal failed: {}", e);
+                    }
+                }
+            } else {
+                debug!("No signaling connection available for NAT traversal");
+            }
+        }
+
+        // Strategy 3: Relay (future implementation)
+        // For now, return an error indicating relay is not available
+
+        Err(format!(
+            "All connection strategies failed for party {}",
+            target_party_id
+        ))
+    }
+
+    /// Processes an incoming signaling message for NAT traversal
+    ///
+    /// Returns an optional response message to send back.
+    pub async fn process_signaling_message(
+        &mut self,
+        from_party_id: PartyId,
+        envelope: NetEnvelope,
+        signaling_connection: Arc<dyn PeerConnection>,
+    ) -> Result<Option<Arc<dyn PeerConnection>>, String> {
+        match envelope {
+            NetEnvelope::IceCandidates {
+                ufrag,
+                pwd,
+                candidates,
+            } => {
+                // Peer is initiating P2P connection
+                let conn = self
+                    .handle_p2p_request(
+                        from_party_id,
+                        ufrag,
+                        pwd,
+                        candidates,
+                        signaling_connection,
+                    )
+                    .await?;
+                Ok(Some(conn))
+            }
+            NetEnvelope::RelayRequest { target_party_id } => {
+                // Future: Handle relay request
+                warn!(
+                    "Relay request from {} for {} - not implemented",
+                    from_party_id, target_party_id
+                );
+                Ok(None)
+            }
+            _ => {
+                // Not a NAT traversal message
+                Ok(None)
+            }
+        }
     }
 }
 

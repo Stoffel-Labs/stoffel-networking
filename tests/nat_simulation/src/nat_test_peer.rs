@@ -238,14 +238,19 @@ async fn main() -> Result<(), BoxError> {
     };
     info!("Role: {:?}", role);
 
-    // Get remote reflexive address for hole punching
+    // Get remote address for hole punching - prefer server-reflexive, fall back to host
     let remote_srflx = remote_peer
         .candidates
         .candidates
         .iter()
         .find(|c| matches!(c.candidate_type, CandidateType::ServerReflexive))
+        .or_else(|| {
+            info!("No server-reflexive candidate, falling back to host candidate");
+            remote_peer.candidates.candidates.iter()
+                .find(|c| matches!(c.candidate_type, CandidateType::Host))
+        })
         .map(|c| c.address)
-        .ok_or("No server-reflexive candidate from remote peer")?;
+        .ok_or("No usable candidate from remote peer")?;
 
     info!("Phase 1: STUN hole punching to {}", remote_srflx);
 

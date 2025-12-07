@@ -1,0 +1,257 @@
+# NAT Hole Punching Integration Test
+#
+# Network topology:
+#
+#   peer_a (10.101.0.10:5001) <---> nat_a (public: 10.100.0.2) <--->
+#                                                                    |
+#                                 signaling (10.100.0.10)  <---------+-- "public" network
+#                                 stun (10.100.0.11)       <---------+
+#                                                                    |
+#   peer_b (10.102.0.10:5002) <---> nat_b (public: 10.100.0.3) <--->
+#
+# - peer_a and peer_b are on separate private networks (simulating home LANs)
+# - nat_a and nat_b provide NAT translation (simulating home routers)
+# - All NAT routers, signaling server, and STUN server connect via the "public" network
+# - Peers can only reach the public network through their NAT router
+# - STUN server allows peers to discover their external UDP port mappings
+#
+# NAT Type: Full Cone NAT
+# - Outbound packets create a mapping (internal IP:port -> external IP:port)
+# - Once a mapping is created, any external host can send packets to the external port
+# - This is the most permissive NAT type and easiest to hole punch
+#
+# Note: Port-Restricted Cone NAT was attempted but has issues with Linux conntrack
+# tuple collision when both peers use symmetric port mappings. Real-world NAT
+# traversal typically includes TURN relay as a fallback for restrictive NATs.
+
+networks:
+  # "Public" internet - where NAT routers have public IPs
+  public:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.0.0/24
+
+  # Private network A (peer_a's LAN)
+  private_a:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.101.0.0/24
+
+  # Private network B (peer_b's LAN)
+  private_b:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.102.0.0/24
+
+services:
+  # Signaling server - only on public network with fixed IP
+  # Peers reach it through NAT and see their NAT-translated addresses
+  signaling:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.signaling
+    networks:
+      public:
+        ipv4_address: 10.100.0.10
+    ports:
+      - "9000:9000"
+    environment:
+      - RUST_LOG=info
+      - BIND_ADDR=0.0.0.0:9000
+
+  # STUN server - provides UDP reflexive address discovery
+  # Peers use this to discover their external IP:port mappings for UDP traffic
+  stun:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.stun
+    networks:
+      public:
+        ipv4_address: 10.100.0.11
+    ports:
+      - "3478:3478/udp"
+    environment:
+      - RUST_LOG=info
+      - BIND_ADDR=0.0.0.0:3478
+
+  # NAT router A - provides NAT for private_a
+  # Configured as Port-Restricted Cone NAT (realistic home router behavior)
+  # Linux netfilter with MASQUERADE + conntrack creates this behavior:
+  # - Tracks connection state per (src IP, src port, dst IP, dst port)
+  # - Inbound UDP only allowed if internal host previously sent to that exact IP:port
+  nat_a:
+    image: alpine:latest
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.netfilter.nf_conntrack_udp_timeout=120
+      - net.netfilter.nf_conntrack_udp_timeout_stream=180
+    networks:
+      public:
+        ipv4_address: 10.100.0.2
+      private_a:
+    command: >
+      sh -c "
+        apk add --no-cache iptables conntrack-tools &&
+
+        # Find interface names dynamically based on which network they connect to
+        # 10.100.0.0/24 is public, 10.101.0.0/24 is private_a
+        PUBLIC_IF=$$(ip -o addr show | grep '10\\.100\\.0\\.' | awk '{print $$2}') &&
+        PRIVATE_IF=$$(ip -o addr show | grep '10\\.101\\.0\\.' | awk '{print $$2}') &&
+        PUBLIC_IP=$$(ip -o addr show $$PUBLIC_IF | awk '{print $$4}' | cut -d/ -f1) &&
+        echo \"Public interface: $$PUBLIC_IF ($$PUBLIC_IP), Private interface: $$PRIVATE_IF\" &&
+
+        # Full Cone NAT: Static port mapping for hole punching
+        # SNAT for outbound: rewrite source to public IP with port preservation
+        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -p udp --sport 5001 -j SNAT --to-source $$PUBLIC_IP:5001 &&
+        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -p udp --sport 5002 -j SNAT --to-source $$PUBLIC_IP:5002 &&
+        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -j MASQUERADE &&
+
+        # DNAT for inbound: redirect public port to internal peer (Full Cone NAT)
+        # This allows ANY external host to reach the internal peer once the mapping exists
+        iptables -t nat -A PREROUTING -i $$PUBLIC_IF -p udp --dport 5001 -j DNAT --to-destination 10.101.0.10:5001 &&
+
+        # Debug: show variables before use
+        echo \"Before rules: PRIVATE_IF=[$$PRIVATE_IF] PUBLIC_IF=[$$PUBLIC_IF]\" &&
+
+        # Allow all FORWARD traffic for Full Cone NAT behavior
+        iptables -A FORWARD -j ACCEPT &&
+
+        echo 'NAT A configured (Full Cone NAT with DNAT)' &&
+        iptables -L FORWARD -v -n &&
+        iptables -t nat -L -v -n &&
+        tail -f /dev/null
+      "
+    healthcheck:
+      test: ["CMD", "sh", "-c", "iptables -t nat -L POSTROUTING | grep -q MASQUERADE"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # NAT router B - provides NAT for private_b
+  # Configured as Port-Restricted Cone NAT (realistic home router behavior)
+  nat_b:
+    image: alpine:latest
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.netfilter.nf_conntrack_udp_timeout=120
+      - net.netfilter.nf_conntrack_udp_timeout_stream=180
+    networks:
+      public:
+        ipv4_address: 10.100.0.3
+      private_b:
+    command: >
+      sh -c "
+        apk add --no-cache iptables conntrack-tools &&
+
+        # Find interface names dynamically based on which network they connect to
+        # 10.100.0.0/24 is public, 10.102.0.0/24 is private_b
+        PUBLIC_IF=$$(ip -o addr show | grep '10\\.100\\.0\\.' | awk '{print $$2}') &&
+        PRIVATE_IF=$$(ip -o addr show | grep '10\\.102\\.0\\.' | awk '{print $$2}') &&
+        PUBLIC_IP=$$(ip -o addr show $$PUBLIC_IF | awk '{print $$4}' | cut -d/ -f1) &&
+        echo \"Public interface: $$PUBLIC_IF ($$PUBLIC_IP), Private interface: $$PRIVATE_IF\" &&
+
+        # Full Cone NAT: Static port mapping for hole punching
+        # SNAT for outbound: rewrite source to public IP with port preservation
+        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -p udp --sport 5001 -j SNAT --to-source $$PUBLIC_IP:5001 &&
+        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -p udp --sport 5002 -j SNAT --to-source $$PUBLIC_IP:5002 &&
+        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -j MASQUERADE &&
+
+        # DNAT for inbound: redirect public port to internal peer (Full Cone NAT)
+        # This allows ANY external host to reach the internal peer once the mapping exists
+        iptables -t nat -A PREROUTING -i $$PUBLIC_IF -p udp --dport 5002 -j DNAT --to-destination 10.102.0.10:5002 &&
+
+        # Allow all FORWARD traffic for Full Cone NAT behavior
+        iptables -A FORWARD -j ACCEPT &&
+
+        echo 'NAT B configured (Full Cone NAT with DNAT)' &&
+        iptables -L FORWARD -v -n &&
+        iptables -t nat -L -v -n &&
+        tail -f /dev/null
+      "
+    healthcheck:
+      test: ["CMD", "sh", "-c", "iptables -t nat -L POSTROUTING | grep -q MASQUERADE"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # Peer A - behind NAT A
+  # Uses port 5001 to avoid conntrack tuple collision with peer_b's port 5002
+  peer_a:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.peer
+    networks:
+      private_a:
+        ipv4_address: 10.101.0.10
+    environment:
+      - RUST_LOG=debug
+      - PEER_ID=1
+      - PEER_NAME=peer_a
+      - SIGNALING_SERVER=10.100.0.10:9000
+      - STUN_SERVER=10.100.0.11:3478
+      - LOCAL_ADDR=0.0.0.0:5001
+    depends_on:
+      signaling:
+        condition: service_started
+      stun:
+        condition: service_started
+      nat_a:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+        NAT_IP=$$(getent hosts nat_a | awk '{print $$1}' | head -1) &&
+        echo \"Setting default gateway to NAT at $$NAT_IP\" &&
+        ip route del default || true &&
+        ip route add default via $$NAT_IP &&
+        echo 'Waiting for signaling server...' &&
+        sleep 3 &&
+        /app/nat_test_peer
+      "
+
+  # Peer B - behind NAT B
+  # Uses port 5002 to avoid conntrack tuple collision with peer_a's port 5001
+  # Starts slightly after peer_a to avoid race conditions in candidate exchange
+  peer_b:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.peer
+    networks:
+      private_b:
+        ipv4_address: 10.102.0.10
+    environment:
+      - RUST_LOG=debug
+      - PEER_ID=2
+      - PEER_NAME=peer_b
+      - SIGNALING_SERVER=10.100.0.10:9000
+      - STUN_SERVER=10.100.0.11:3478
+      - LOCAL_ADDR=0.0.0.0:5002
+    depends_on:
+      signaling:
+        condition: service_started
+      stun:
+        condition: service_started
+      nat_b:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+        NAT_IP=$$(getent hosts nat_b | awk '{print $$1}' | head -1) &&
+        echo \"Setting default gateway to NAT at $$NAT_IP\" &&
+        ip route del default || true &&
+        ip route add default via $$NAT_IP &&
+        echo 'Waiting for signaling server and peer_a to register...' &&
+        sleep 5 &&
+        /app/nat_test_peer
+      "

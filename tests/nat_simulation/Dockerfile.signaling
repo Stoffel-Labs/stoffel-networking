@@ -1,0 +1,38 @@
+# Dockerfile for the signaling server
+# Used to exchange ICE candidates between peers during NAT traversal testing
+
+FROM rust:1.83-slim-bookworm AS builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests first for better caching
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Create the signaling server binary
+COPY tests/nat_simulation/src/signaling_server.rs ./tests/nat_simulation/src/signaling_server.rs
+
+# Build the signaling server
+RUN cargo build --release --bin nat_signaling_server
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/nat_signaling_server /app/nat_signaling_server
+
+WORKDIR /app
+
+EXPOSE 9000
+
+CMD ["/app/nat_signaling_server"]

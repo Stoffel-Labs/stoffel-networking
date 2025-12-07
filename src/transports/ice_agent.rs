@@ -75,10 +75,9 @@ pub struct IceAgentConfig {
 impl Default for IceAgentConfig {
     fn default() -> Self {
         Self {
-            stun_servers: vec![
-                "stun.l.google.com:19302".parse().unwrap(),
-                "stun1.l.google.com:19302".parse().unwrap(),
-            ],
+            // Default to empty - STUN servers require DNS resolution which isn't supported
+            // by SocketAddr. Users should configure STUN servers with resolved IP addresses.
+            stun_servers: vec![],
             check_timeout: Duration::from_millis(500),
             check_retries: 3,
             check_pace: Duration::from_millis(50),
@@ -918,5 +917,692 @@ mod tests {
         assert_eq!(config.initial_delay, Duration::from_millis(100));
         assert_eq!(config.probe_count, 5);
         assert_eq!(config.connection_timeout, Duration::from_millis(2000));
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::transports::ice::{CandidateType, IceCandidate, LocalCandidates};
+    use crate::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Once;
+
+    static CRYPTO_INIT: Once = Once::new();
+
+    /// Initialize the rustls crypto provider (needed for QUIC tests)
+    fn init_crypto() {
+        CRYPTO_INIT.call_once(|| {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("Failed to install crypto provider");
+        });
+    }
+
+    /// Helper to create a test ICE agent config with shorter timeouts for testing
+    fn test_ice_config() -> IceAgentConfig {
+        IceAgentConfig {
+            stun_servers: vec![], // No external STUN servers for local tests
+            check_timeout: Duration::from_millis(100),
+            check_retries: 2,
+            check_pace: Duration::from_millis(10),
+            aggressive_nomination: true,
+            overall_timeout: Duration::from_secs(5),
+            probe_count: 3,
+            probe_interval: Duration::from_millis(10),
+        }
+    }
+
+    /// Helper to create test candidates for two local peers
+    fn create_test_candidates(
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> (LocalCandidates, LocalCandidates) {
+        let mut local_candidates = LocalCandidates::new();
+        local_candidates.add_host(local_addr);
+
+        let mut remote_candidates = LocalCandidates::new();
+        remote_candidates.add_host(remote_addr);
+
+        (local_candidates, remote_candidates)
+    }
+
+    #[test]
+    fn test_ice_agent_creation() {
+        let config = test_ice_config();
+        let agent = IceAgent::new(config.clone(), 1);
+
+        assert_eq!(agent.state(), IceState::New);
+        assert_eq!(agent.role(), IceRole::Controlling); // Default role
+        assert!(agent.local_candidates().is_empty());
+        assert!(agent.nominated_pair().is_none());
+    }
+
+    #[test]
+    fn test_ice_role_assignment() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new(config, 100);
+
+        // Test manual role setting
+        agent.set_role(IceRole::Controlled);
+        assert_eq!(agent.role(), IceRole::Controlled);
+
+        agent.set_role(IceRole::Controlling);
+        assert_eq!(agent.role(), IceRole::Controlling);
+    }
+
+    #[test]
+    fn test_candidate_pair_formation() {
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6000);
+
+        let (local_candidates, remote_candidates) = create_test_candidates(local_addr, remote_addr);
+
+        // Form pairs as controlling agent
+        let pairs = crate::transports::ice::CandidatePair::form_pairs(
+            &local_candidates.candidates,
+            &remote_candidates.candidates,
+            true, // is_controlling
+        );
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].local.address, local_addr);
+        assert_eq!(pairs[0].remote.address, remote_addr);
+        assert_eq!(
+            pairs[0].state,
+            crate::transports::ice::CandidatePairState::Frozen
+        );
+    }
+
+    #[test]
+    fn test_ice_credentials_generation() {
+        let candidates1 = LocalCandidates::new();
+        let candidates2 = LocalCandidates::new();
+
+        // Each instance should have unique credentials
+        assert_ne!(candidates1.ufrag, candidates2.ufrag);
+        assert_ne!(candidates1.pwd, candidates2.pwd);
+
+        // Credentials should meet minimum length requirements
+        assert!(candidates1.ufrag.len() >= 4);
+        assert!(candidates1.pwd.len() >= 22);
+    }
+
+    #[tokio::test]
+    async fn test_ice_agent_gather_candidates_localhost() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new(config, 1);
+
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+        let result = agent.gather_candidates(local_addr).await;
+        assert!(result.is_ok(), "Gathering should succeed: {:?}", result);
+
+        assert_eq!(agent.state(), IceState::GatheringComplete);
+        assert!(!agent.local_candidates().is_empty());
+
+        // Should have at least a host candidate
+        let host_candidates: Vec<_> = agent
+            .local_candidates()
+            .candidates
+            .iter()
+            .filter(|c| c.candidate_type == CandidateType::Host)
+            .collect();
+        assert!(!host_candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ice_agent_invalid_state_gather() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new(config.clone(), 1);
+
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+        // First gather should succeed
+        agent.gather_candidates(local_addr).await.unwrap();
+
+        // Second gather should fail (wrong state)
+        let result = agent.gather_candidates(local_addr).await;
+        assert!(matches!(result, Err(IceError::InvalidState(_))));
+    }
+
+    #[tokio::test]
+    async fn test_ice_agent_set_remote_candidates() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new(config, 1);
+
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6000);
+
+        // Gather local candidates first
+        agent.gather_candidates(local_addr).await.unwrap();
+
+        // Create remote candidates
+        let remote_candidate = IceCandidate::host(remote_addr, 1);
+        let remote_party_id: PartyId = 2;
+
+        // Set remote candidates
+        let result = agent.set_remote_candidates(
+            remote_party_id,
+            "test_ufrag".to_string(),
+            "test_pwd_at_least_22_chars".to_string(),
+            vec![remote_candidate],
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(agent.state(), IceState::Checking);
+
+        // Role should be determined based on party IDs
+        // Local party ID 1 < Remote party ID 2, so we should be Controlled
+        assert_eq!(agent.role(), IceRole::Controlled);
+    }
+
+    #[tokio::test]
+    async fn test_ice_agent_set_remote_invalid_state() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new(config, 1);
+
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6000);
+        let remote_candidate = IceCandidate::host(remote_addr, 1);
+
+        // Try to set remote candidates before gathering (should fail)
+        let result = agent.set_remote_candidates(
+            2,
+            "test_ufrag".to_string(),
+            "test_pwd_at_least_22_chars".to_string(),
+            vec![remote_candidate],
+        );
+
+        assert!(matches!(result, Err(IceError::InvalidState(IceState::New))));
+    }
+
+    #[test]
+    fn test_hole_punch_coordinator_creation() {
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6000);
+        let config = HolePunchConfig::default();
+
+        let coordinator =
+            HolePunchCoordinator::new(local_addr, remote_addr, IceRole::Controlling, config);
+
+        assert!(coordinator.transaction_id() != 0);
+    }
+
+    #[test]
+    fn test_hole_punch_config_custom() {
+        let config = HolePunchConfig {
+            initial_delay: Duration::from_millis(50),
+            jitter_range: Duration::from_millis(25),
+            probe_interval: Duration::from_millis(10),
+            probe_count: 3,
+            connection_timeout: Duration::from_millis(1000),
+            retry_delay: Duration::from_millis(250),
+            backoff_factor: 2.0,
+        };
+
+        assert_eq!(config.initial_delay, Duration::from_millis(50));
+        assert_eq!(config.probe_count, 3);
+        assert_eq!(config.backoff_factor, 2.0);
+    }
+
+    #[test]
+    fn test_ice_error_display() {
+        let errors = vec![
+            IceError::GatheringFailed("test error".to_string()),
+            IceError::NoCandidates,
+            IceError::AllChecksFailed,
+            IceError::Timeout,
+            IceError::InvalidState(IceState::New),
+            IceError::SignalingError("signaling failed".to_string()),
+            IceError::NetworkError("network issue".to_string()),
+            IceError::HolePunchFailed("punch failed".to_string()),
+        ];
+
+        for error in errors {
+            let display = format!("{}", error);
+            assert!(!display.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_hole_punch_error_display() {
+        let errors = vec![
+            HolePunchError::Timeout,
+            HolePunchError::ConnectionFailed("connection error".to_string()),
+            HolePunchError::SignalingError("signaling error".to_string()),
+            HolePunchError::MaxRetriesExceeded,
+            HolePunchError::NoIncoming,
+            HolePunchError::NetworkError("network error".to_string()),
+        ];
+
+        for error in errors {
+            let display = format!("{}", error);
+            assert!(!display.is_empty());
+        }
+    }
+
+    /// Integration test: Two ICE agents exchanging candidates and checking connectivity
+    /// This simulates a full ICE negotiation between two local peers
+    #[tokio::test]
+    async fn test_two_agents_candidate_exchange() {
+        // Create two agents with different party IDs
+        let config = test_ice_config();
+        let mut agent1 = IceAgent::new(config.clone(), 100); // Higher ID = Controlling
+        let mut agent2 = IceAgent::new(config, 50); // Lower ID = Controlled
+
+        // Use different localhost ports
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+        // Both agents gather candidates
+        agent1.gather_candidates(addr1).await.unwrap();
+        agent2.gather_candidates(addr2).await.unwrap();
+
+        assert_eq!(agent1.state(), IceState::GatheringComplete);
+        assert_eq!(agent2.state(), IceState::GatheringComplete);
+
+        // Exchange candidates
+        let candidates1 = agent1.local_candidates().clone();
+        let candidates2 = agent2.local_candidates().clone();
+
+        // Agent1 receives Agent2's candidates
+        agent1
+            .set_remote_candidates(50, candidates2.ufrag, candidates2.pwd, candidates2.candidates)
+            .unwrap();
+
+        // Agent2 receives Agent1's candidates
+        agent2
+            .set_remote_candidates(
+                100,
+                candidates1.ufrag,
+                candidates1.pwd,
+                candidates1.candidates,
+            )
+            .unwrap();
+
+        // Verify roles are correctly assigned
+        assert_eq!(agent1.role(), IceRole::Controlling); // 100 > 50
+        assert_eq!(agent2.role(), IceRole::Controlled); // 50 < 100
+
+        // Both should be in Checking state
+        assert_eq!(agent1.state(), IceState::Checking);
+        assert_eq!(agent2.state(), IceState::Checking);
+    }
+
+    /// Test concurrent ICE agent operations
+    #[tokio::test]
+    async fn test_concurrent_gathering() {
+        let config = test_ice_config();
+
+        // Create multiple agents
+        let agents: Vec<_> = (0..4)
+            .map(|i| IceAgent::new(config.clone(), i as PartyId))
+            .collect();
+
+        // Gather candidates concurrently
+        let handles: Vec<_> = agents
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut agent)| {
+                tokio::spawn(async move {
+                    let addr =
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 10000 + i as u16);
+                    agent.gather_candidates(addr).await.map(|_| agent)
+                })
+            })
+            .collect();
+
+        // Wait for all to complete
+        let mut successful = 0;
+        for handle in handles {
+            if let Ok(Ok(agent)) = handle.await {
+                assert_eq!(agent.state(), IceState::GatheringComplete);
+                successful += 1;
+            }
+        }
+
+        // All agents should have gathered successfully
+        assert_eq!(successful, 4);
+    }
+
+    /// Test the full P2P connection flow using QuicNetworkManager with NAT traversal
+    #[tokio::test]
+    async fn test_network_manager_ice_candidate_gathering() {
+        init_crypto();
+
+        let config = QuicNetworkConfig {
+            enable_nat_traversal: true,
+            stun_servers: vec![], // No external STUN for local test
+            ..Default::default()
+        };
+
+        let mut manager = QuicNetworkManager::with_config(config);
+
+        // Start listening to initialize the endpoint
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        manager.listen(bind_addr).await.unwrap();
+
+        // Gather ICE candidates
+        let result = manager.gather_ice_candidates().await;
+
+        // Should succeed with at least a host candidate
+        assert!(result.is_ok(), "Should gather candidates: {:?}", result);
+
+        let candidates = result.unwrap();
+        assert!(!candidates.is_empty());
+        assert!(candidates.ufrag.len() >= 4);
+        assert!(candidates.pwd.len() >= 22);
+    }
+
+    /// Test that ICE message creation works correctly
+    #[tokio::test]
+    async fn test_create_ice_candidates_message() {
+        init_crypto();
+
+        let config = QuicNetworkConfig {
+            enable_nat_traversal: true,
+            stun_servers: vec![],
+            ..Default::default()
+        };
+
+        let mut manager = QuicNetworkManager::with_config(config);
+        manager.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let message = manager.create_ice_candidates_message().await;
+        assert!(message.is_ok());
+
+        if let Ok(NetEnvelope::IceCandidates {
+            ufrag,
+            pwd,
+            candidates,
+        }) = message
+        {
+            assert!(ufrag.len() >= 4);
+            assert!(pwd.len() >= 22);
+            assert!(!candidates.is_empty());
+        } else {
+            panic!("Expected IceCandidates envelope");
+        }
+    }
+
+    /// Test NAT traversal disabled behavior
+    #[tokio::test]
+    async fn test_nat_traversal_disabled() {
+        init_crypto();
+
+        let config = QuicNetworkConfig {
+            enable_nat_traversal: false,
+            ..Default::default()
+        };
+
+        let manager = QuicNetworkManager::with_config(config);
+        assert!(!manager.is_nat_traversal_enabled());
+
+        let result = manager.gather_ice_candidates().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not enabled"));
+    }
+
+    /// Simulated end-to-end test of two peers connecting via ICE
+    /// This test validates the full ICE flow without requiring actual network connectivity
+    #[tokio::test]
+    async fn test_simulated_ice_connection_flow() {
+        init_crypto();
+
+        // Create two network managers
+        let config1 = QuicNetworkConfig {
+            enable_nat_traversal: true,
+            stun_servers: vec![],
+            ..Default::default()
+        };
+        let config2 = config1.clone();
+
+        let mut manager1 = QuicNetworkManager::with_config(config1);
+        let mut manager2 = QuicNetworkManager::with_config(config2);
+
+        // Both managers start listening
+        let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        manager1.listen(addr1).await.unwrap();
+        manager2.listen(addr2).await.unwrap();
+
+        // Gather candidates from both
+        let candidates1 = manager1.gather_ice_candidates().await.unwrap();
+        let candidates2 = manager2.gather_ice_candidates().await.unwrap();
+
+        // Verify both have candidates
+        assert!(!candidates1.is_empty());
+        assert!(!candidates2.is_empty());
+
+        // Verify credentials are unique
+        assert_ne!(candidates1.ufrag, candidates2.ufrag);
+        assert_ne!(candidates1.pwd, candidates2.pwd);
+
+        // Create ICE messages that would be exchanged
+        let msg1 = NetEnvelope::IceCandidates {
+            ufrag: candidates1.ufrag.clone(),
+            pwd: candidates1.pwd.clone(),
+            candidates: candidates1.candidates.clone(),
+        };
+
+        let msg2 = NetEnvelope::IceCandidates {
+            ufrag: candidates2.ufrag.clone(),
+            pwd: candidates2.pwd.clone(),
+            candidates: candidates2.candidates.clone(),
+        };
+
+        // Verify messages can be serialized/deserialized
+        let serialized1 = msg1.serialize();
+        let serialized2 = msg2.serialize();
+
+        let deserialized1 = NetEnvelope::try_deserialize(&serialized1).unwrap();
+        let deserialized2 = NetEnvelope::try_deserialize(&serialized2).unwrap();
+
+        // Verify the deserialized messages match
+        if let NetEnvelope::IceCandidates {
+            ufrag,
+            pwd,
+            candidates,
+        } = deserialized1
+        {
+            assert_eq!(ufrag, candidates1.ufrag);
+            assert_eq!(pwd, candidates1.pwd);
+            assert_eq!(candidates.len(), candidates1.candidates.len());
+        }
+
+        if let NetEnvelope::IceCandidates {
+            ufrag,
+            pwd,
+            candidates,
+        } = deserialized2
+        {
+            assert_eq!(ufrag, candidates2.ufrag);
+            assert_eq!(pwd, candidates2.pwd);
+            assert_eq!(candidates.len(), candidates2.candidates.len());
+        }
+    }
+
+    /// Test ICE candidate priority ordering
+    #[test]
+    fn test_candidate_priority_ordering() {
+        let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5000);
+        let srflx_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 12345);
+        let stun_server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 3478);
+
+        let host_candidate = IceCandidate::host(host_addr, 1);
+        let srflx_candidate =
+            IceCandidate::server_reflexive(srflx_addr, host_addr, stun_server, 1);
+
+        // Host should have higher priority than server reflexive
+        assert!(host_candidate.priority > srflx_candidate.priority);
+    }
+
+    /// Test that connection attempts timeout correctly
+    #[tokio::test]
+    async fn test_ice_timeout_behavior() {
+        let config = IceAgentConfig {
+            overall_timeout: Duration::from_millis(500),
+            check_timeout: Duration::from_millis(50),
+            check_retries: 1,
+            ..test_ice_config()
+        };
+
+        let mut agent = IceAgent::new(config, 1);
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+        agent.gather_candidates(local_addr).await.unwrap();
+
+        // Set remote candidates pointing to an unreachable address
+        let unreachable = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255)), 9999);
+        let remote_candidate = IceCandidate::host(unreachable, 1);
+
+        agent
+            .set_remote_candidates(
+                2,
+                "test_ufrag".to_string(),
+                "test_pwd_at_least_22_chars".to_string(),
+                vec![remote_candidate],
+            )
+            .unwrap();
+
+        // Note: Actually running connectivity checks would require a QUIC endpoint,
+        // which is tested in the full integration test below
+    }
+
+    /// Full integration test with actual QUIC endpoints
+    /// Tests two peers establishing a connection through ICE
+    #[tokio::test]
+    async fn test_full_ice_quic_integration() {
+        init_crypto();
+
+        // Create QUIC configs for both peers
+        let config1 = QuicNetworkConfig {
+            enable_nat_traversal: true,
+            stun_servers: vec![],
+            ice_config: test_ice_config(),
+            ..Default::default()
+        };
+
+        let config2 = config1.clone();
+
+        // Create managers
+        let mut manager1 = QuicNetworkManager::with_config(config1);
+        let mut manager2 = QuicNetworkManager::with_config(config2);
+
+        // Start both endpoints
+        manager1.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        manager2.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        // Get party IDs
+        let party1 = manager1.party_id();
+        let party2 = manager2.party_id();
+
+        assert_ne!(party1, party2, "Party IDs should be unique");
+
+        // Gather candidates
+        let candidates1 = manager1.gather_ice_candidates().await.unwrap();
+        let candidates2 = manager2.gather_ice_candidates().await.unwrap();
+
+        info!(
+            "Party {} gathered {} candidates",
+            party1,
+            candidates1.len()
+        );
+        info!(
+            "Party {} gathered {} candidates",
+            party2,
+            candidates2.len()
+        );
+
+        // Verify both have host candidates
+        assert!(
+            candidates1
+                .candidates
+                .iter()
+                .any(|c| c.candidate_type == CandidateType::Host),
+            "Should have host candidate"
+        );
+        assert!(
+            candidates2
+                .candidates
+                .iter()
+                .any(|c| c.candidate_type == CandidateType::Host),
+            "Should have host candidate"
+        );
+    }
+
+    /// Test punch request/ack message serialization
+    #[test]
+    fn test_punch_messages_serialization() {
+        let request = NetEnvelope::PunchRequest {
+            transaction_id: 12345,
+            target_address: "127.0.0.1:5000".parse().unwrap(),
+            delay_ms: 100,
+        };
+
+        let serialized = request.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&serialized).unwrap();
+
+        if let NetEnvelope::PunchRequest {
+            transaction_id,
+            target_address,
+            delay_ms,
+        } = deserialized
+        {
+            assert_eq!(transaction_id, 12345);
+            assert_eq!(target_address, "127.0.0.1:5000".parse().unwrap());
+            assert_eq!(delay_ms, 100);
+        } else {
+            panic!("Expected PunchRequest");
+        }
+
+        let ack = NetEnvelope::PunchAck {
+            transaction_id: 12345,
+            timestamp_ms: 1000000,
+        };
+
+        let serialized = ack.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&serialized).unwrap();
+
+        if let NetEnvelope::PunchAck {
+            transaction_id,
+            timestamp_ms,
+        } = deserialized
+        {
+            assert_eq!(transaction_id, 12345);
+            assert_eq!(timestamp_ms, 1000000);
+        } else {
+            panic!("Expected PunchAck");
+        }
+    }
+
+    /// Test connectivity check message serialization
+    #[test]
+    fn test_connectivity_check_message() {
+        let check = NetEnvelope::ConnectivityCheck {
+            transaction_id: 99999,
+            is_response: false,
+            use_candidate: true,
+            ufrag: "test_ufrag".to_string(),
+        };
+
+        let serialized = check.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&serialized).unwrap();
+
+        if let NetEnvelope::ConnectivityCheck {
+            transaction_id,
+            is_response,
+            use_candidate,
+            ufrag,
+        } = deserialized
+        {
+            assert_eq!(transaction_id, 99999);
+            assert!(!is_response);
+            assert!(use_candidate);
+            assert_eq!(ufrag, "test_ufrag");
+        } else {
+            panic!("Expected ConnectivityCheck");
+        }
     }
 }

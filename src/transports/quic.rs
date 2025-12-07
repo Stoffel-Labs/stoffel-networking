@@ -10,7 +10,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use dashmap::{DashMap, DashSet};
@@ -681,10 +681,9 @@ impl Default for QuicNetworkConfig {
             max_retries: 3,
             use_tls: true,
             enable_nat_traversal: false,
-            stun_servers: vec![
-                "stun.l.google.com:19302".parse().unwrap(),
-                "stun1.l.google.com:19302".parse().unwrap(),
-            ],
+            // Default to empty - STUN servers require DNS resolution which isn't supported
+            // by SocketAddr. Users should configure STUN servers with resolved IP addresses.
+            stun_servers: vec![],
             enable_hole_punching: true,
             hole_punch_timeout_ms: 10000,
             ice_config: crate::transports::ice_agent::IceAgentConfig::default(),
@@ -1108,6 +1107,64 @@ impl QuicNetworkManager {
         self.node_id
     }
 
+    /// Discovers local IP addresses by attempting to connect to external addresses
+    ///
+    /// This is a common technique to find local IPs that have routes to the internet.
+    async fn discover_local_ips(&self) -> Vec<IpAddr> {
+        let mut ips = Vec::new();
+
+        // Try to discover the default local IP by "connecting" to a public address
+        // (no actual connection is made, just route lookup)
+        let targets = [
+            "8.8.8.8:53",     // Google DNS
+            "1.1.1.1:53",     // Cloudflare DNS
+        ];
+
+        for target in targets {
+            if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if let Ok(target_addr) = target.parse::<SocketAddr>() {
+                    if socket.connect(target_addr).is_ok() {
+                        if let Ok(local_addr) = socket.local_addr() {
+                            let ip = local_addr.ip();
+                            if !ips.contains(&ip) && !ip.is_unspecified() && !ip.is_loopback() {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also try to find IPs from local interfaces by binding to specific ports
+        // and checking what IPs we can use
+        if ips.is_empty() {
+            // Try common private network ranges
+            let test_addrs = [
+                "10.0.0.1:1",
+                "192.168.1.1:1",
+                "172.16.0.1:1",
+            ];
+
+            for target in test_addrs {
+                if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                    if let Ok(target_addr) = target.parse::<SocketAddr>() {
+                        if socket.connect(target_addr).is_ok() {
+                            if let Ok(local_addr) = socket.local_addr() {
+                                let ip = local_addr.ip();
+                                if !ips.contains(&ip) && !ip.is_unspecified() && !ip.is_loopback() {
+                                    ips.push(ip);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("Discovered {} local IP(s): {:?}", ips.len(), ips);
+        ips
+    }
+
     /// Gathers ICE candidates for NAT traversal
     ///
     /// Discovers local host addresses and queries STUN servers for
@@ -1146,9 +1203,30 @@ impl QuicNetworkManager {
                 .map_err(|e| format!("Failed to get local address: {}", e))?
         };
 
-        // Add host candidate
-        candidates.add_host(local_addr);
-        debug!("Added host candidate: {}", local_addr);
+        let port = local_addr.port();
+
+        // If bound to 0.0.0.0, discover actual local IP addresses
+        if local_addr.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+            // Try to discover local IP by connecting to a known address
+            // This is a common technique to find the "default" local IP
+            let discovered_ips = self.discover_local_ips().await;
+
+            if discovered_ips.is_empty() {
+                // Fallback: just add the unspecified address
+                candidates.add_host(local_addr);
+                debug!("Added host candidate (fallback): {}", local_addr);
+            } else {
+                for ip in discovered_ips {
+                    let addr = SocketAddr::new(ip, port);
+                    candidates.add_host(addr);
+                    debug!("Added host candidate: {}", addr);
+                }
+            }
+        } else {
+            // Add host candidate as-is
+            candidates.add_host(local_addr);
+            debug!("Added host candidate: {}", local_addr);
+        }
 
         // Gather server reflexive candidates via STUN
         if let Some(ref stun_client) = self.stun_client {

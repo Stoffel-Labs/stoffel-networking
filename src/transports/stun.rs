@@ -49,7 +49,8 @@ impl StunServerConfig {
 impl Default for StunServerConfig {
     fn default() -> Self {
         Self {
-            address: "stun.l.google.com:19302".parse().unwrap(),
+            // Use localhost as a placeholder - users should configure actual STUN servers
+            address: "127.0.0.1:3478".parse().unwrap(),
             timeout: Duration::from_millis(500),
             max_retries: 3,
         }
@@ -108,14 +109,14 @@ impl StunClient {
         Self { servers }
     }
 
-    /// Creates a STUN client with default Google STUN servers
+    /// Creates a STUN client with no servers configured
+    ///
+    /// Note: Google STUN servers (stun.l.google.com:19302) require DNS resolution
+    /// which SocketAddr doesn't support. Users should resolve addresses and use
+    /// `StunClient::new()` with resolved IP addresses.
     pub fn with_default_servers() -> Self {
         Self {
-            servers: vec![
-                StunServerConfig::new("stun.l.google.com:19302".parse().unwrap()),
-                StunServerConfig::new("stun1.l.google.com:19302".parse().unwrap()),
-                StunServerConfig::new("stun2.l.google.com:19302".parse().unwrap()),
-            ],
+            servers: vec![],
         }
     }
 
@@ -494,19 +495,19 @@ mod tests {
     fn test_symmetric_nat_detection() {
         let result1 = StunBindingResult {
             reflexive_address: "203.0.113.1:12345".parse().unwrap(),
-            server_address: "stun1.example.com:3478".parse().unwrap(),
+            server_address: "8.8.8.8:3478".parse().unwrap(),
             rtt: Duration::from_millis(50),
         };
 
         let result2 = StunBindingResult {
             reflexive_address: "203.0.113.1:12345".parse().unwrap(),
-            server_address: "stun2.example.com:3478".parse().unwrap(),
+            server_address: "8.8.4.4:3478".parse().unwrap(),
             rtt: Duration::from_millis(60),
         };
 
         let result3 = StunBindingResult {
             reflexive_address: "203.0.113.1:12346".parse().unwrap(), // Different port!
-            server_address: "stun3.example.com:3478".parse().unwrap(),
+            server_address: "1.1.1.1:3478".parse().unwrap(),
             rtt: Duration::from_millis(70),
         };
 

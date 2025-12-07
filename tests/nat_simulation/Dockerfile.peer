@@ -1,0 +1,38 @@
+# Dockerfile for NAT test peers
+# Each peer runs behind a simulated NAT and attempts hole punching
+
+FROM rust:1.83-slim-bookworm AS builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests first for better caching
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Copy test binary source
+COPY tests/nat_simulation/src/nat_test_peer.rs ./tests/nat_simulation/src/nat_test_peer.rs
+
+# Build the peer binary
+RUN cargo build --release --bin nat_test_peer
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    iproute2 \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/nat_test_peer /app/nat_test_peer
+
+WORKDIR /app
+
+CMD ["/app/nat_test_peer"]

@@ -84,8 +84,14 @@ async fn main() -> Result<(), BoxError> {
     let reader = Arc::new(Mutex::new(BufReader::new(reader)));
     let writer = Arc::new(Mutex::new(writer));
 
-    // Phase 1: Discover reflexive address using STUN
-    // We bind to port 5000, discover our public address, then release the socket
+    // Phase 1: Bind the ONE socket we'll use for everything
+    // This socket will be used for STUN discovery, hole punching, and QUIC
+    // Keeping the same socket preserves NAT mappings throughout
+    let socket = UdpSocket::bind(local_addr).await
+        .map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
+    info!("Bound UDP socket to {} - will reuse for STUN and QUIC", socket.local_addr()?);
+
+    // Discover reflexive address using STUN (using the same socket)
     let stun_reflexive: Option<SocketAddr> = if let Some(stun_addr_str) = &stun_server {
         let stun_addr: SocketAddr = stun_addr_str
             .to_socket_addrs()
@@ -95,12 +101,9 @@ async fn main() -> Result<(), BoxError> {
 
         info!("Querying STUN server at {} for reflexive address", stun_addr);
 
-        let stun_socket = UdpSocket::bind(local_addr).await
-            .map_err(|e| format!("Failed to bind UDP socket for STUN: {}", e))?;
-
         let stun_client = StunClient::new(vec![StunServerConfig::new(stun_addr)]);
 
-        match stun_client.discover_reflexive(&stun_socket).await {
+        match stun_client.discover_reflexive(&socket).await {
             Ok(result) => {
                 info!("STUN discovered reflexive address: {} (RTT: {:?})",
                       result.reflexive_address, result.rtt);
@@ -111,7 +114,7 @@ async fn main() -> Result<(), BoxError> {
                 None
             }
         }
-        // Socket dropped here
+        // Socket NOT dropped - we keep it for QUIC
     } else {
         None
     };
@@ -252,37 +255,22 @@ async fn main() -> Result<(), BoxError> {
         .map(|c| c.address)
         .ok_or("No usable candidate from remote peer")?;
 
-    info!("Phase 1: STUN hole punching to {}", remote_srflx);
+    // Skip separate STUN hole punch phase - QUIC Initial packets will punch the hole directly
+    // This is based on the paper "Implementing NAT Hole Punching with QUIC" (arXiv:2408.01791)
+    // which shows QUIC hole punching is 0.5 RTT faster than TCP because the Initial packets
+    // themselves create the NAT mapping
+    info!("Skipping STUN hole punch - QUIC Initial packets will punch the hole directly");
 
-    // Do STUN hole punching BEFORE starting QUIC
-    // Both peers do this simultaneously to punch holes in their NATs
-    let hole_punch_result = stun_hole_punch(remote_srflx, local_addr, Duration::from_secs(15)).await;
-
-    let punched_socket = match hole_punch_result {
-        Ok((true, socket)) => {
-            info!("STUN hole punch successful");
-            Some(socket)
-        },
-        Ok((false, socket)) => {
-            warn!("STUN hole punch did not confirm connectivity, proceeding anyway");
-            Some(socket)
-        },
-        Err(e) => {
-            warn!("STUN hole punch error: {}, will create new socket", e);
-            None
-        },
-    };
-
-    // Option B: Signal that we've completed hole punching and wait for peer
+    // Signal that we're ready to start QUIC
     {
         let mut w = writer.lock().await;
         w.write_all(format!("HOLE_PUNCHED {}\n", peer_id).as_bytes()).await?;
         w.flush().await?;
     }
-    info!("Signaled HOLE_PUNCHED, waiting for peer...");
+    info!("Signaled ready for QUIC, waiting for peer...");
 
     // Wait for START_QUIC signal (with timeout)
-    let start_quic_timeout = Duration::from_secs(10);
+    let start_quic_timeout = Duration::from_secs(5);
     let start_quic_result = tokio::time::timeout(
         start_quic_timeout,
         wait_for_start_quic(reader.clone())
@@ -294,46 +282,49 @@ async fn main() -> Result<(), BoxError> {
         Err(_) => warn!("Timeout waiting for START_QUIC, proceeding anyway"),
     }
 
-    // Phase 2: Now start QUIC using the SAME socket that was used for hole punching
-    // This is critical - we must reuse the socket to preserve the NAT mapping
-    info!("Phase 2: Starting QUIC and connecting to {}", remote_srflx);
+    // Phase 2: Start QUIC using the SAME socket used for STUN discovery
+    // This preserves the NAT mapping created during STUN
+    info!("Phase 2: Starting QUIC directly to {} (no separate hole punch)", remote_srflx);
 
-    // Option E: Pre-QUIC UDP warming
-    // Option A: Spawn UDP keep-alive (requires cloning socket before giving to QUIC)
-    let (endpoint, keepalive_handle) = if let Some(socket) = punched_socket {
-        // Option E: Send warming burst before QUIC
-        if let Err(e) = udp_warmup(&socket, remote_srflx).await {
-            warn!("UDP warmup failed: {}", e);
+    // Clone socket for keep-alive before converting to QUIC endpoint
+    let std_socket = socket.into_std()?;
+
+    // Pre-QUIC UDP warmup: Send packets to punch holes BEFORE creating QUIC endpoint
+    // This creates NAT mappings so QUIC Initial packets can get through
+    // We convert back to tokio socket temporarily for the warmup
+    let socket = UdpSocket::from_std(std_socket)?;
+    udp_warmup(&socket, remote_srflx).await?;
+
+    // Drain any buffered warmup packets from the socket before starting QUIC
+    // This prevents them from being received by the QUIC endpoint as "invalid CID"
+    info!("Draining any buffered warmup packets...");
+    let mut drain_buf = [0u8; 2048];
+    let mut drained_count = 0;
+    loop {
+        // Non-blocking receive to drain any buffered packets
+        match tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut drain_buf)).await {
+            Ok(Ok((len, from))) => {
+                debug!("Drained warmup packet: {} bytes from {}", len, from);
+                drained_count += 1;
+            }
+            _ => {
+                // No more packets
+                break;
+            }
         }
+    }
+    info!("Drained {} warmup packets", drained_count);
 
-        // Option A: Clone socket for keep-alive before converting to QUIC endpoint
-        let std_socket = socket.into_std()?;
-        let keepalive_socket = std_socket.try_clone()
-            .map_err(|e| format!("Failed to clone socket for keep-alive: {}", e))?;
+    let std_socket = socket.into_std()?;
 
-        // Spawn keep-alive task
-        let keepalive_handle = spawn_udp_keepalive(keepalive_socket, remote_srflx);
-
-        // Create QUIC endpoint from the socket
-        info!("Creating QUIC endpoint from hole-punched socket");
-        let endpoint = create_quic_endpoint_from_std_socket(std_socket).await?;
-
-        (endpoint, Some(keepalive_handle))
-    } else {
-        info!("Creating fresh QUIC endpoint (no hole-punched socket)");
-        let endpoint = create_quic_endpoint(local_addr).await?;
-        (endpoint, None)
-    };
+    // Create QUIC endpoint from the socket
+    info!("Creating QUIC endpoint from STUN-discovery socket");
+    let endpoint = create_quic_endpoint_from_std_socket(std_socket).await?;
 
     info!("QUIC endpoint listening on {:?}", endpoint.local_addr());
 
     // Attempt QUIC connection
     let result = attempt_quic_connection_with_endpoint(&endpoint, peer_id, remote_srflx, role).await;
-
-    // Stop keep-alive task
-    if let Some(handle) = keepalive_handle {
-        handle.abort();
-    }
 
     // Report result to signaling server
     let (success, message) = match &result {
@@ -599,9 +590,10 @@ async fn attempt_quic_connection_with_endpoint(
 ) -> Result<SocketAddr, BoxError> {
     use tokio::sync::oneshot;
 
-    // Option C: Aggressive retry parameters
+    // Increase timeout to allow handshake to complete through NAT
+    // QUIC handshake needs time for Initial → Handshake → 1-RTT exchange
     let overall_timeout = Duration::from_secs(30);
-    let attempt_timeout = Duration::from_secs(3);
+    let attempt_timeout = Duration::from_secs(10);  // Increased from 3s to allow full handshake
 
     // Channel to signal success from either direction
     let (success_tx, success_rx) = oneshot::channel::<SocketAddr>();
@@ -641,36 +633,21 @@ async fn attempt_quic_connection_with_endpoint(
         }
     });
 
-    // Option D: Bidirectional - spawn connect task
-    // Role determines initial delay (Controlling starts faster)
-    let initial_delay = match role {
-        IceRole::Controlling => Duration::from_millis(50),
-        IceRole::Controlled => Duration::from_millis(200),
-    };
+    // Both peers initiate connections - QUIC handles the race gracefully
+    // The first successful handshake wins. Both peers sending Initial packets
+    // simultaneously helps punch holes from both directions.
+    let connect_handle = {
+        let handle = tokio::spawn(async move {
+            // Small delay to let accept task start
+            tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let connect_handle = tokio::spawn(async move {
-        tokio::time::sleep(initial_delay).await;
-
-        let mut attempt = 0;
-        let mut base_delay = 100u64; // Start with 100ms between attempts
-
-        loop {
-            attempt += 1;
-
-            // Option C: Log attempts
-            if attempt <= 3 || attempt % 5 == 0 {
-                info!("QUIC connect attempt {} to {}", attempt, remote_addr);
-            }
+            info!("QUIC connect attempt to {} (timeout: {:?}) - role: {:?}", remote_addr, attempt_timeout, role);
 
             let connecting = match endpoint_connect.connect(remote_addr, "localhost") {
                 Ok(c) => c,
                 Err(e) => {
-                    debug!("QUIC connect call failed: {}", e);
-                    // Option C: Exponential backoff with jitter
-                    let jitter = rand::random::<u64>() % 100;
-                    tokio::time::sleep(Duration::from_millis(base_delay + jitter)).await;
-                    base_delay = (base_delay * 3 / 2).min(1000); // Cap at 1 second
-                    continue;
+                    error!("QUIC connect call failed: {}", e);
+                    return Err::<SocketAddr, BoxError>(e.into());
                 }
             };
 
@@ -682,22 +659,20 @@ async fn attempt_quic_connection_with_endpoint(
                     if let Some(tx) = success_tx_connect.lock().unwrap().take() {
                         let _ = tx.send(addr);
                     }
-                    return Ok::<_, BoxError>(addr);
+                    Ok(addr)
                 }
                 Ok(Err(e)) => {
                     debug!("QUIC handshake failed: {}", e);
+                    Err(e.into())
                 }
                 Err(_) => {
-                    debug!("QUIC connect attempt {} timed out", attempt);
+                    debug!("QUIC connect attempt timed out");
+                    Err("Connection timed out".into())
                 }
             }
-
-            // Option C: Exponential backoff with jitter between attempts
-            let jitter = rand::random::<u64>() % 100;
-            tokio::time::sleep(Duration::from_millis(base_delay + jitter)).await;
-            base_delay = (base_delay * 3 / 2).min(1000); // Cap at 1 second
-        }
-    });
+        });
+        Some(handle)
+    };
 
     info!("Starting bidirectional QUIC connection (role: {:?})", role);
 
@@ -706,7 +681,9 @@ async fn attempt_quic_connection_with_endpoint(
 
     // Clean up tasks
     accept_handle.abort();
-    connect_handle.abort();
+    if let Some(handle) = connect_handle {
+        handle.abort();
+    }
 
     match result {
         Ok(Ok(addr)) => {
@@ -725,13 +702,14 @@ async fn attempt_quic_connection_with_endpoint(
 
 /// Option E: Pre-QUIC UDP warming phase
 /// Sends a burst of UDP packets to prime the NAT path before QUIC handshake
+/// Extended to 500ms to ensure NAT mappings are established before QUIC starts
 async fn udp_warmup(socket: &UdpSocket, remote_addr: SocketAddr) -> Result<(), BoxError> {
     use byteorder::{BigEndian, ByteOrder};
 
     const STUN_BINDING_REQUEST: u16 = 0x0001;
     const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 
-    info!("Pre-QUIC UDP warming: sending burst to {}", remote_addr);
+    info!("Pre-QUIC UDP warming: sending burst to {} over 500ms", remote_addr);
 
     // Generate a random transaction ID
     let mut transaction_id = [0u8; 12];
@@ -746,25 +724,36 @@ async fn udp_warmup(socket: &UdpSocket, remote_addr: SocketAddr) -> Result<(), B
     BigEndian::write_u32(&mut packet[4..8], STUN_MAGIC_COOKIE);
     packet[8..20].copy_from_slice(&transaction_id);
 
-    // Send 20 packets in quick succession
-    for i in 0..20 {
-        socket.send_to(&packet, remote_addr).await?;
-        if i % 5 == 4 {
-            // Small delay every 5 packets
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    // Send packets over 500ms to ensure NAT mappings are created
+    // and both peers have time to send packets to each other
+    let warmup_duration = Duration::from_millis(500);
+    let start = std::time::Instant::now();
+    let mut count = 0;
+
+    while start.elapsed() < warmup_duration {
+        // Regenerate transaction ID periodically
+        if count % 10 == 0 {
+            for i in 0..12 {
+                transaction_id[i] = rand::random();
+            }
+            packet[8..20].copy_from_slice(&transaction_id);
         }
+
+        socket.send_to(&packet, remote_addr).await?;
+        count += 1;
+
+        // Send every 10ms = ~50 packets over 500ms
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // Wait a moment for path to stabilize
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    info!("UDP warming complete");
+    info!("UDP warming complete: sent {} packets over {:?}", count, start.elapsed());
     Ok(())
 }
 
-/// Option A: Spawn a background task that sends UDP keep-alive packets
+/// Spawn an aggressive keep-alive task that sends packets during QUIC handshake
+/// Sends packets every 20ms to keep NAT mapping alive and help punch hole
 /// Returns a handle that can be used to stop the keep-alive
-fn spawn_udp_keepalive(
+fn spawn_aggressive_keepalive(
     socket: std::net::UdpSocket,
     remote_addr: SocketAddr,
 ) -> tokio::task::JoinHandle<()> {
@@ -786,11 +775,31 @@ fn spawn_udp_keepalive(
         BigEndian::write_u32(&mut packet[4..8], STUN_MAGIC_COOKIE);
         packet[8..20].copy_from_slice(&transaction_id);
 
-        // Send keep-alive every 100ms
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        // First phase: aggressive burst to punch hole (every 10ms for 500ms)
+        info!("Starting aggressive keep-alive burst to {}", remote_addr);
+        let burst_end = std::time::Instant::now() + Duration::from_millis(500);
+        let mut count = 0;
+        while std::time::Instant::now() < burst_end {
+            if let Err(e) = socket.send_to(&packet, remote_addr) {
+                debug!("Keep-alive send failed: {}", e);
+                break;
+            }
+            count += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        debug!("Sent {} burst packets in 500ms", count);
+
+        // Second phase: steady keep-alive every 50ms
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
 
         loop {
             interval.tick().await;
+            // Regenerate transaction ID periodically for variety
+            for i in 0..12 {
+                transaction_id[i] = rand::random();
+            }
+            packet[8..20].copy_from_slice(&transaction_id);
+
             if let Err(e) = socket.send_to(&packet, remote_addr) {
                 debug!("Keep-alive send failed: {}", e);
                 break;

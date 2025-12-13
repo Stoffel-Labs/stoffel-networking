@@ -1346,16 +1346,28 @@ impl QuicNetworkManager {
         );
 
         // 4. Create and configure ICE agent
-        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id);
+        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
+            .map_err(|e| format!("Failed to create ICE agent: {}", e))?;
 
-        // Gather candidates using our local address
-        let local_addr = local_candidates
-            .best_candidate()
+        // Gather candidates using our local addresses
+        let host_addresses: Vec<_> = local_candidates
+            .candidates
+            .iter()
             .map(|c| c.address)
-            .ok_or("No local candidates")?;
+            .collect();
+
+        if host_addresses.is_empty() {
+            return Err("No local candidates".to_string());
+        }
+
+        // Create a temporary socket for STUN queries
+        // TODO: Consider reusing the QUIC endpoint's socket for accurate NAT mappings
+        let stun_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("Failed to create STUN socket: {}", e))?;
 
         ice_agent
-            .gather_candidates(local_addr)
+            .gather_candidates(&host_addresses, &stun_socket)
             .await
             .map_err(|e| format!("ICE gathering failed: {}", e))?;
 
@@ -1478,15 +1490,28 @@ impl QuicNetworkManager {
             .map_err(|e| format!("Failed to send ICE candidates: {}", e))?;
 
         // 3. Create ICE agent
-        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id);
+        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
+            .map_err(|e| format!("Failed to create ICE agent: {}", e))?;
 
-        let local_addr = local_candidates
-            .best_candidate()
+        // Gather candidates using our local addresses
+        let host_addresses: Vec<_> = local_candidates
+            .candidates
+            .iter()
             .map(|c| c.address)
-            .ok_or("No local candidates")?;
+            .collect();
+
+        if host_addresses.is_empty() {
+            return Err("No local candidates".to_string());
+        }
+
+        // Create a temporary socket for STUN queries
+        // TODO: Consider reusing the QUIC endpoint's socket for accurate NAT mappings
+        let stun_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("Failed to create STUN socket: {}", e))?;
 
         ice_agent
-            .gather_candidates(local_addr)
+            .gather_candidates(&host_addresses, &stun_socket)
             .await
             .map_err(|e| format!("ICE gathering failed: {}", e))?;
 

@@ -146,12 +146,23 @@ impl StunClient {
         Err(StunError::AllRetriesFailed)
     }
 
-    /// Discovers reflexive addresses from all available servers
+    /// Discovers reflexive addresses from all available servers.
     ///
     /// Returns results from all servers that respond successfully.
     /// Useful for detecting symmetric NAT (different mappings per destination).
+    ///
+    /// # Design Note
+    ///
+    /// This method intentionally does NOT call `discover_reflexive` because the behaviors
+    /// differ significantly:
+    /// - `discover_reflexive`: Returns on first success (early exit), suitable for
+    ///   simple NAT traversal where any server-reflexive address suffices.
+    /// - `discover_all`: Queries ALL servers to collect multiple mappings, needed for
+    ///   symmetric NAT detection where each destination may produce different mappings.
+    ///
+    /// Both methods use `query_server` as the common underlying implementation.
     pub async fn discover_all(&self, socket: &UdpSocket) -> Vec<StunBindingResult> {
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(self.servers.len());
 
         for server in &self.servers {
             match self.query_server(socket, server).await {

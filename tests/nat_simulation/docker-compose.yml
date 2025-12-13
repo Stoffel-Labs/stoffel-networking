@@ -15,14 +15,13 @@
 # - Peers can only reach the public network through their NAT router
 # - STUN server allows peers to discover their external UDP port mappings
 #
-# NAT Type: Full Cone NAT
-# - Outbound packets create a mapping (internal IP:port -> external IP:port)
-# - Once a mapping is created, any external host can send packets to the external port
-# - This is the most permissive NAT type and easiest to hole punch
+# NAT Type: Endpoint-Independent NAT (Full Cone)
+# - Outbound packets from 10.101.0.10:5000 always map to 10.100.0.2:5000
+# - ANY external host can send to 10.100.0.2:5000 and reach the internal peer
+# - This is the most permissive NAT type and easiest to traverse
 #
-# Note: Port-Restricted Cone NAT was attempted but has issues with Linux conntrack
-# tuple collision when both peers use symmetric port mappings. Real-world NAT
-# traversal typically includes TURN relay as a fallback for restrictive NATs.
+# Implementation: SNAT with fixed port + DNAT for inbound
+# MASQUERADE is used as fallback for other traffic (STUN queries, signaling)
 
 networks:
   # "Public" internet - where NAT routers have public IPs
@@ -33,15 +32,21 @@ networks:
         - subnet: 10.100.0.0/24
 
   # Private network A (peer_a's LAN)
+  # Disable IP masquerading so traffic goes through NAT container
   private_a:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
     ipam:
       config:
         - subnet: 10.101.0.0/24
 
   # Private network B (peer_b's LAN)
+  # Disable IP masquerading so traffic goes through NAT container
   private_b:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
     ipam:
       config:
         - subnet: 10.102.0.0/24
@@ -78,10 +83,8 @@ services:
       - BIND_ADDR=0.0.0.0:3478
 
   # NAT router A - provides NAT for private_a
-  # Configured as Port-Restricted Cone NAT (realistic home router behavior)
-  # Linux netfilter with MASQUERADE + conntrack creates this behavior:
-  # - Tracks connection state per (src IP, src port, dst IP, dst port)
-  # - Inbound UDP only allowed if internal host previously sent to that exact IP:port
+  # Endpoint-Independent NAT (Full Cone) simulation
+  # Uses SNAT with fixed port mapping + DNAT for inbound
   nat_a:
     image: alpine:latest
     cap_add:
@@ -94,47 +97,75 @@ services:
       public:
         ipv4_address: 10.100.0.2
       private_a:
-    command: >
-      sh -c "
-        apk add --no-cache iptables conntrack-tools &&
+        ipv4_address: 10.101.0.2
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache iptables conntrack-tools tcpdump
 
-        # Find interface names dynamically based on which network they connect to
-        # 10.100.0.0/24 is public, 10.101.0.0/24 is private_a
-        PUBLIC_IF=$$(ip -o addr show | grep '10\\.100\\.0\\.' | awk '{print $$2}') &&
-        PRIVATE_IF=$$(ip -o addr show | grep '10\\.101\\.0\\.' | awk '{print $$2}') &&
-        PUBLIC_IP=$$(ip -o addr show $$PUBLIC_IF | awk '{print $$4}' | cut -d/ -f1) &&
-        echo \"Public interface: $$PUBLIC_IF ($$PUBLIC_IP), Private interface: $$PRIVATE_IF\" &&
+        # Wait for interfaces to stabilize
+        sleep 1
 
-        # Full Cone NAT: Static port mapping for hole punching
-        # SNAT for outbound: rewrite source to public IP with port preservation
-        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -p udp --sport 5001 -j SNAT --to-source $$PUBLIC_IP:5001 &&
-        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -p udp --sport 5002 -j SNAT --to-source $$PUBLIC_IP:5002 &&
-        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -j MASQUERADE &&
+        # Detect interfaces by IP address - check multiple times to ensure stability
+        for attempt in 1 2 3; do
+          PUBLIC_IF=""
+          PRIVATE_IF=""
+          PUBLIC_IP=""
+          for iface in eth0 eth1 eth2; do
+            IP=$$(ip -o addr show dev $$iface 2>/dev/null | grep 'inet ' | awk '{print $$4}' | cut -d/ -f1)
+            case "$$IP" in
+              10.100.0.*) PUBLIC_IF=$$iface; PUBLIC_IP=$$IP ;;
+              10.101.0.*) PRIVATE_IF=$$iface ;;
+            esac
+          done
+          if [ -n "$$PUBLIC_IF" ] && [ -n "$$PRIVATE_IF" ]; then
+            break
+          fi
+          sleep 0.5
+        done
 
-        # DNAT for inbound: redirect public port to internal peer (Full Cone NAT)
-        # This allows ANY external host to reach the internal peer once the mapping exists
-        iptables -t nat -A PREROUTING -i $$PUBLIC_IF -p udp --dport 5001 -j DNAT --to-destination 10.101.0.10:5001 &&
+        echo "NAT A: Public=$$PUBLIC_IF ($$PUBLIC_IP), Private=$$PRIVATE_IF"
 
-        # Debug: show variables before use
-        echo \"Before rules: PRIVATE_IF=[$$PRIVATE_IF] PUBLIC_IF=[$$PUBLIC_IF]\" &&
+        if [ -z "$$PUBLIC_IF" ] || [ -z "$$PRIVATE_IF" ]; then
+          echo "ERROR: Failed to detect interfaces!"
+          ip addr show
+          exit 1
+        fi
 
-        # Allow all FORWARD traffic for Full Cone NAT behavior
-        iptables -A FORWARD -j ACCEPT &&
+        # Full Cone NAT for port 5000
+        # NOTE: Using destination IP matching instead of interface names because Docker
+        # on macOS can reassign IPs between interfaces after container startup
 
-        echo 'NAT A configured (Full Cone NAT with DNAT)' &&
-        iptables -L FORWARD -v -n &&
-        iptables -t nat -L -v -n &&
+        # === NAT RULES ===
+        # NOTE: We allow all forwarding because Docker Desktop on macOS has internal
+        # routing that can bypass container NAT. The SNAT/DNAT rules still apply
+        # to traffic that goes through this container.
+        iptables -A FORWARD -j ACCEPT
+        # Outbound: SNAT all UDP from peer's port 5000 to our public IP
+        # This applies when peer sends to ANY destination (public network or other NAT)
+        iptables -t nat -A POSTROUTING -s 10.101.0.10 -p udp --sport 5000 -j SNAT --to-source 10.100.0.2:5000
+
+        # Inbound: DNAT any UDP to our public IP:5000 -> forward to internal peer
+        # Full Cone NAT: NO source restriction - accept from ANY source
+        iptables -t nat -A PREROUTING -d 10.100.0.2 -p udp --dport 5000 -j DNAT --to-destination 10.101.0.10:5000
+
+        # General MASQUERADE for other traffic (TCP signaling, STUN queries, etc)
+        iptables -t nat -A POSTROUTING -s 10.101.0.0/24 ! -d 10.101.0.0/24 -j MASQUERADE
+
+        echo "NAT A configured (Full Cone with firewall)"
+        iptables -t nat -L -v -n
         tail -f /dev/null
-      "
     healthcheck:
-      test: ["CMD", "sh", "-c", "iptables -t nat -L POSTROUTING | grep -q MASQUERADE"]
+      test: ["CMD", "sh", "-c", "iptables -t nat -L POSTROUTING | grep -q SNAT"]
       interval: 3s
       timeout: 5s
       retries: 20
       start_period: 30s
 
   # NAT router B - provides NAT for private_b
-  # Configured as Port-Restricted Cone NAT (realistic home router behavior)
+  # Endpoint-Independent NAT (Full Cone) simulation
+  # Uses SNAT with fixed port mapping + DNAT for inbound
   nat_b:
     image: alpine:latest
     cap_add:
@@ -147,37 +178,67 @@ services:
       public:
         ipv4_address: 10.100.0.3
       private_b:
-    command: >
-      sh -c "
-        apk add --no-cache iptables conntrack-tools &&
+        ipv4_address: 10.102.0.2
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache iptables conntrack-tools tcpdump
 
-        # Find interface names dynamically based on which network they connect to
-        # 10.100.0.0/24 is public, 10.102.0.0/24 is private_b
-        PUBLIC_IF=$$(ip -o addr show | grep '10\\.100\\.0\\.' | awk '{print $$2}') &&
-        PRIVATE_IF=$$(ip -o addr show | grep '10\\.102\\.0\\.' | awk '{print $$2}') &&
-        PUBLIC_IP=$$(ip -o addr show $$PUBLIC_IF | awk '{print $$4}' | cut -d/ -f1) &&
-        echo \"Public interface: $$PUBLIC_IF ($$PUBLIC_IP), Private interface: $$PRIVATE_IF\" &&
+        # Wait for interfaces to stabilize
+        sleep 1
 
-        # Full Cone NAT: Static port mapping for hole punching
-        # SNAT for outbound: rewrite source to public IP with port preservation
-        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -p udp --sport 5001 -j SNAT --to-source $$PUBLIC_IP:5001 &&
-        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -p udp --sport 5002 -j SNAT --to-source $$PUBLIC_IP:5002 &&
-        iptables -t nat -A POSTROUTING -o $$PUBLIC_IF -j MASQUERADE &&
+        # Detect interfaces by IP address - check multiple times to ensure stability
+        for attempt in 1 2 3; do
+          PUBLIC_IF=""
+          PRIVATE_IF=""
+          PUBLIC_IP=""
+          for iface in eth0 eth1 eth2; do
+            IP=$$(ip -o addr show dev $$iface 2>/dev/null | grep 'inet ' | awk '{print $$4}' | cut -d/ -f1)
+            case "$$IP" in
+              10.100.0.*) PUBLIC_IF=$$iface; PUBLIC_IP=$$IP ;;
+              10.102.0.*) PRIVATE_IF=$$iface ;;
+            esac
+          done
+          if [ -n "$$PUBLIC_IF" ] && [ -n "$$PRIVATE_IF" ]; then
+            break
+          fi
+          sleep 0.5
+        done
 
-        # DNAT for inbound: redirect public port to internal peer (Full Cone NAT)
-        # This allows ANY external host to reach the internal peer once the mapping exists
-        iptables -t nat -A PREROUTING -i $$PUBLIC_IF -p udp --dport 5002 -j DNAT --to-destination 10.102.0.10:5002 &&
+        echo "NAT B: Public=$$PUBLIC_IF ($$PUBLIC_IP), Private=$$PRIVATE_IF"
 
-        # Allow all FORWARD traffic for Full Cone NAT behavior
-        iptables -A FORWARD -j ACCEPT &&
+        if [ -z "$$PUBLIC_IF" ] || [ -z "$$PRIVATE_IF" ]; then
+          echo "ERROR: Failed to detect interfaces!"
+          ip addr show
+          exit 1
+        fi
 
-        echo 'NAT B configured (Full Cone NAT with DNAT)' &&
-        iptables -L FORWARD -v -n &&
-        iptables -t nat -L -v -n &&
+        # Full Cone NAT for port 5000
+        # NOTE: Using destination IP matching instead of interface names because Docker
+        # on macOS can reassign IPs between interfaces after container startup
+
+        # === NAT RULES ===
+        # NOTE: We allow all forwarding because Docker Desktop on macOS has internal
+        # routing that can bypass container NAT. The SNAT/DNAT rules still apply
+        # to traffic that goes through this container.
+        iptables -A FORWARD -j ACCEPT
+        # Outbound: SNAT all UDP from peer's port 5000 to our public IP
+        # This applies when peer sends to ANY destination (public network or other NAT)
+        iptables -t nat -A POSTROUTING -s 10.102.0.10 -p udp --sport 5000 -j SNAT --to-source 10.100.0.3:5000
+
+        # Inbound: DNAT any UDP to our public IP:5000 -> forward to internal peer
+        # Full Cone NAT: NO source restriction - accept from ANY source
+        iptables -t nat -A PREROUTING -d 10.100.0.3 -p udp --dport 5000 -j DNAT --to-destination 10.102.0.10:5000
+
+        # General MASQUERADE for other traffic (TCP signaling, STUN queries, etc)
+        iptables -t nat -A POSTROUTING -s 10.102.0.0/24 ! -d 10.102.0.0/24 -j MASQUERADE
+
+        echo "NAT B configured (Full Cone with firewall)"
+        iptables -t nat -L -v -n
         tail -f /dev/null
-      "
     healthcheck:
-      test: ["CMD", "sh", "-c", "iptables -t nat -L POSTROUTING | grep -q MASQUERADE"]
+      test: ["CMD", "sh", "-c", "iptables -t nat -L POSTROUTING | grep -q SNAT"]
       interval: 3s
       timeout: 5s
       retries: 20
@@ -198,7 +259,7 @@ services:
       - PEER_NAME=peer_a
       - SIGNALING_SERVER=10.100.0.10:9000
       - STUN_SERVER=10.100.0.11:3478
-      - LOCAL_ADDR=0.0.0.0:5001
+      - LOCAL_ADDR=0.0.0.0:5000
     depends_on:
       signaling:
         condition: service_started
@@ -235,7 +296,7 @@ services:
       - PEER_NAME=peer_b
       - SIGNALING_SERVER=10.100.0.10:9000
       - STUN_SERVER=10.100.0.11:3478
-      - LOCAL_ADDR=0.0.0.0:5002
+      - LOCAL_ADDR=0.0.0.0:5000
     depends_on:
       signaling:
         condition: service_started

@@ -89,6 +89,121 @@ impl Default for IceAgentConfig {
     }
 }
 
+/// Configuration validation errors
+#[derive(Debug, Clone)]
+pub enum ConfigError {
+    /// Check timeout must be positive
+    InvalidCheckTimeout,
+    /// Check retries must be at least 1
+    InvalidCheckRetries,
+    /// Probe count must be at least 1
+    InvalidProbeCount,
+    /// Overall timeout must be greater than check timeout
+    InvalidOverallTimeout,
+    /// Probe interval must be positive
+    InvalidProbeInterval,
+    /// Check pace must be positive
+    InvalidCheckPace,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCheckTimeout => write!(f, "Check timeout must be positive"),
+            Self::InvalidCheckRetries => write!(f, "Check retries must be at least 1"),
+            Self::InvalidProbeCount => write!(f, "Probe count must be at least 1"),
+            Self::InvalidOverallTimeout => {
+                write!(f, "Overall timeout must be greater than check timeout")
+            }
+            Self::InvalidProbeInterval => write!(f, "Probe interval must be positive"),
+            Self::InvalidCheckPace => write!(f, "Check pace must be positive"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl IceAgentConfig {
+    /// Creates a new configuration with the specified STUN servers
+    pub fn new(stun_servers: Vec<SocketAddr>) -> Self {
+        Self {
+            stun_servers,
+            ..Default::default()
+        }
+    }
+
+    /// Builder method: set STUN servers
+    pub fn with_stun_servers(mut self, servers: Vec<SocketAddr>) -> Self {
+        self.stun_servers = servers;
+        self
+    }
+
+    /// Builder method: set check timeout
+    pub fn with_check_timeout(mut self, timeout: Duration) -> Self {
+        self.check_timeout = timeout;
+        self
+    }
+
+    /// Builder method: set check retries
+    pub fn with_check_retries(mut self, retries: u32) -> Self {
+        self.check_retries = retries;
+        self
+    }
+
+    /// Builder method: set check pacing interval
+    pub fn with_check_pace(mut self, pace: Duration) -> Self {
+        self.check_pace = pace;
+        self
+    }
+
+    /// Builder method: enable/disable aggressive nomination
+    pub fn with_aggressive_nomination(mut self, enabled: bool) -> Self {
+        self.aggressive_nomination = enabled;
+        self
+    }
+
+    /// Builder method: set overall timeout
+    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
+        self.overall_timeout = timeout;
+        self
+    }
+
+    /// Builder method: set probe count for hole punching
+    pub fn with_probe_count(mut self, count: u32) -> Self {
+        self.probe_count = count;
+        self
+    }
+
+    /// Builder method: set probe interval for hole punching
+    pub fn with_probe_interval(mut self, interval: Duration) -> Self {
+        self.probe_interval = interval;
+        self
+    }
+
+    /// Validates the configuration and returns any errors
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.check_timeout.is_zero() {
+            return Err(ConfigError::InvalidCheckTimeout);
+        }
+        if self.check_retries == 0 {
+            return Err(ConfigError::InvalidCheckRetries);
+        }
+        if self.probe_count == 0 {
+            return Err(ConfigError::InvalidProbeCount);
+        }
+        if self.overall_timeout <= self.check_timeout {
+            return Err(ConfigError::InvalidOverallTimeout);
+        }
+        if self.probe_interval.is_zero() {
+            return Err(ConfigError::InvalidProbeInterval);
+        }
+        if self.check_pace.is_zero() {
+            return Err(ConfigError::InvalidCheckPace);
+        }
+        Ok(())
+    }
+}
+
 /// Result of a connectivity check
 #[derive(Debug, Clone)]
 pub struct CheckResult {
@@ -129,6 +244,8 @@ pub enum IceError {
     NetworkError(String),
     /// Hole punching failed
     HolePunchFailed(String),
+    /// Configuration error
+    ConfigError(ConfigError),
 }
 
 impl std::fmt::Display for IceError {
@@ -142,7 +259,14 @@ impl std::fmt::Display for IceError {
             Self::SignalingError(msg) => write!(f, "Signaling error: {}", msg),
             Self::NetworkError(msg) => write!(f, "Network error: {}", msg),
             Self::HolePunchFailed(msg) => write!(f, "Hole punch failed: {}", msg),
+            Self::ConfigError(err) => write!(f, "Configuration error: {}", err),
         }
+    }
+}
+
+impl From<ConfigError> for IceError {
+    fn from(err: ConfigError) -> Self {
+        IceError::ConfigError(err)
     }
 }
 
@@ -179,8 +303,48 @@ pub struct IceAgent {
 }
 
 impl IceAgent {
-    /// Creates a new ICE agent with the given configuration
-    pub fn new(config: IceAgentConfig, local_party_id: PartyId) -> Self {
+    /// Creates a new ICE agent with the given configuration.
+    ///
+    /// Returns an error if the configuration is invalid.
+    ///
+    /// # Arguments
+    /// * `config` - The ICE agent configuration (will be validated)
+    /// * `local_party_id` - The local party's unique identifier
+    pub fn new(config: IceAgentConfig, local_party_id: PartyId) -> Result<Self, IceError> {
+        // Validate configuration before creating the agent
+        config.validate()?;
+
+        let stun_servers = config
+            .stun_servers
+            .iter()
+            .map(|addr| crate::transports::stun::StunServerConfig::new(*addr))
+            .collect();
+
+        Ok(Self {
+            state: IceState::New,
+            // Role is undetermined until we know the remote party ID.
+            // It will be set when set_remote_candidates is called.
+            role: IceRole::Controlled, // Safe default - controlled agents don't initiate
+            config,
+            local_party_id,
+            remote_party_id: None,
+            local_candidates: LocalCandidates::new(),
+            remote_candidates: None,
+            check_list: Vec::new(),
+            nominated_pair: None,
+            transaction_counter: 0,
+            pending_transactions: DashMap::new(),
+            start_time: None,
+            stun_client: StunClient::new(stun_servers),
+        })
+    }
+
+    /// Creates a new ICE agent without validating the configuration.
+    ///
+    /// # Safety
+    /// This bypasses configuration validation. Use only in tests or when you
+    /// have already validated the configuration externally.
+    pub fn new_unchecked(config: IceAgentConfig, local_party_id: PartyId) -> Self {
         let stun_servers = config
             .stun_servers
             .iter()
@@ -189,7 +353,7 @@ impl IceAgent {
 
         Self {
             state: IceState::New,
-            role: IceRole::Controlling, // Will be determined later
+            role: IceRole::Controlled,
             config,
             local_party_id,
             remote_party_id: None,
@@ -233,22 +397,88 @@ impl IceAgent {
         &self.local_candidates
     }
 
-    /// Returns the nominated pair if ICE completed
+    /// Returns the nominated pair if ICE has completed successfully.
+    ///
+    /// Returns `None` if:
+    /// - ICE has not completed (state is not `Completed`)
+    /// - No pair has been nominated yet
     pub fn nominated_pair(&self) -> Option<&CandidatePair> {
+        if self.state != IceState::Completed {
+            return None;
+        }
         self.nominated_pair.map(|idx| &self.check_list[idx])
     }
 
-    /// Generates a new transaction ID
+    /// Generates a deterministic transaction ID based on local party ID and sequence.
+    ///
+    /// The transaction ID format is:
+    /// - Upper 32 bits: local_party_id (for identifying the originating agent)
+    /// - Lower 32 bits: sequence counter (for uniqueness within this agent)
+    ///
+    /// This makes it easy to verify that a STUN response corresponds to our request
+    /// by checking if the upper bits match our party ID.
     fn next_transaction_id(&mut self) -> u64 {
         self.transaction_counter += 1;
-        let mut rng = rand::thread_rng();
-        (self.transaction_counter << 32) | (rng.r#gen::<u32>() as u64)
+        ((self.local_party_id as u64) << 32) | (self.transaction_counter & 0xFFFFFFFF)
     }
 
-    /// Phase 1: Gather local candidates
-    pub async fn gather_candidates(&mut self, local_addr: SocketAddr) -> Result<(), IceError> {
+    /// Extracts the party ID from a transaction ID.
+    ///
+    /// Returns the party ID that generated this transaction.
+    pub fn party_id_from_transaction(transaction_id: u64) -> PartyId {
+        (transaction_id >> 32) as PartyId
+    }
+
+    /// Checks if a transaction ID belongs to this agent.
+    pub fn is_our_transaction(&self, transaction_id: u64) -> bool {
+        Self::party_id_from_transaction(transaction_id) == self.local_party_id
+    }
+
+    /// Phase 1: Gather local candidates using a provided UDP socket.
+    ///
+    /// This is the primary method for gathering ICE candidates. It accepts a list of
+    /// host addresses and a UDP socket for STUN queries.
+    ///
+    /// # Host Candidate Assumptions (per ICE RFC 8445)
+    ///
+    /// The provided host addresses are assumed to be:
+    /// - Valid local IP addresses bound to network interfaces on this machine
+    /// - Reachable by the peer (not localhost unless testing locally)
+    /// - Not link-local addresses (169.254.x.x) unless intentionally testing
+    /// - For IPv4, typically private (10.x, 172.16-31.x, 192.168.x) or public addresses
+    ///
+    /// No validation is performed on host candidates to allow flexibility for:
+    /// - Local testing with localhost addresses
+    /// - VPN/tunnel interfaces with unusual addresses
+    /// - Container/VM networking with virtual interfaces
+    ///
+    /// The caller is responsible for providing appropriate host addresses based on
+    /// their network topology and connectivity requirements.
+    ///
+    /// # Arguments
+    ///
+    /// * `host_addresses` - List of local addresses to use as host candidates.
+    ///   Per RFC 8445, a host may have multiple network interfaces, each providing
+    ///   a potential host candidate. Pass all relevant interface addresses.
+    /// * `socket` - UDP socket to use for STUN queries. This should be the same
+    ///   socket used for the actual QUIC transport to ensure consistent NAT mappings.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if at least one candidate was gathered (either host or
+    /// server-reflexive). Returns `Err(IceError::NoCandidates)` if no candidates
+    /// could be gathered.
+    pub async fn gather_candidates(
+        &mut self,
+        host_addresses: &[SocketAddr],
+        socket: &UdpSocket,
+    ) -> Result<(), IceError> {
         if self.state != IceState::New {
             return Err(IceError::InvalidState(self.state));
+        }
+
+        if host_addresses.is_empty() {
+            return Err(IceError::NoCandidates);
         }
 
         self.state = IceState::Gathering;
@@ -256,39 +486,51 @@ impl IceAgent {
 
         info!("ICE gathering started for party {}", self.local_party_id);
 
-        // Add host candidate
-        self.local_candidates.add_host(local_addr);
-        debug!("Added host candidate: {}", local_addr);
+        // Add all host candidates
+        // Per RFC 8445 Section 5.1.1, an agent should gather host candidates from
+        // all available network interfaces that it wishes to use for connectivity.
+        // Note: QUIC uses a single component (component ID 1), so all host candidates
+        // share the same component ID.
+        for host_addr in host_addresses {
+            self.local_candidates.add_host(*host_addr);
+            debug!("Added host candidate: {}", host_addr);
+        }
 
-        // Gather server reflexive candidates via STUN
+        // Gather server-reflexive candidates via STUN using the provided socket
+        // The socket should be the same one used for QUIC to ensure NAT mappings
+        // are created on the correct port.
         if self.stun_client.has_servers() {
-            // Create a temporary socket for STUN queries
-            // In production, this should share the QUIC endpoint's socket
-            let socket = UdpSocket::bind("0.0.0.0:0")
-                .await
-                .map_err(|e| IceError::NetworkError(e.to_string()))?;
-
-            let results = self.stun_client.discover_all(&socket).await;
+            let results = self.stun_client.discover_all(socket).await;
 
             for result in results {
-                // Only add if different from host candidate
-                if result.reflexive_address != local_addr {
+                // Only add server-reflexive if it differs from all host candidates
+                // (i.e., we're actually behind a NAT)
+                let is_duplicate = host_addresses
+                    .iter()
+                    .any(|host| host == &result.reflexive_address);
+
+                if !is_duplicate {
+                    // Use component 1 for the primary candidate
                     self.local_candidates.add_server_reflexive(
                         result.reflexive_address,
-                        local_addr,
+                        host_addresses[0], // Base is the primary host address
                         result.server_address,
                     );
                     debug!(
-                        "Added server reflexive candidate: {} (from {})",
+                        "Added server-reflexive candidate: {} (from STUN server {})",
                         result.reflexive_address, result.server_address
                     );
                 }
             }
+        } else {
+            debug!("No STUN servers configured, skipping server-reflexive candidate gathering");
         }
 
-        if self.local_candidates.is_empty() {
-            return Err(IceError::NoCandidates);
-        }
+        // At this point we should have at least the host candidates we added above
+        debug_assert!(
+            !self.local_candidates.is_empty(),
+            "Should have at least host candidates"
+        );
 
         self.state = IceState::GatheringComplete;
         info!(
@@ -299,42 +541,31 @@ impl IceAgent {
         Ok(())
     }
 
-    /// Gather candidates using a shared UDP socket (for accurate NAT mapping)
-    pub async fn gather_candidates_with_socket(
+    /// Simplified gather for single host address (convenience wrapper).
+    ///
+    /// Creates a temporary UDP socket for STUN queries. Note that this socket
+    /// will have a different port than the QUIC endpoint, which may cause NAT
+    /// mapping issues with some NAT types. For production use, prefer
+    /// `gather_candidates` with a shared socket.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use gather_candidates with explicit socket for accurate NAT mappings"
+    )]
+    pub async fn gather_candidates_simple(
         &mut self,
         local_addr: SocketAddr,
-        socket: &UdpSocket,
     ) -> Result<(), IceError> {
-        if self.state != IceState::New {
-            return Err(IceError::InvalidState(self.state));
-        }
+        // Create a temporary socket - note this may not produce accurate NAT mappings
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| IceError::NetworkError(e.to_string()))?;
 
-        self.state = IceState::Gathering;
-        self.start_time = Some(Instant::now());
+        warn!(
+            "Using temporary socket for STUN queries; NAT mappings may be inaccurate. \
+             Consider using gather_candidates() with a shared socket instead."
+        );
 
-        // Add host candidate
-        self.local_candidates.add_host(local_addr);
-
-        // Gather STUN candidates using provided socket
-        if self.stun_client.has_servers() {
-            let results = self.stun_client.discover_all(socket).await;
-            for result in results {
-                if result.reflexive_address != local_addr {
-                    self.local_candidates.add_server_reflexive(
-                        result.reflexive_address,
-                        local_addr,
-                        result.server_address,
-                    );
-                }
-            }
-        }
-
-        if self.local_candidates.is_empty() {
-            return Err(IceError::NoCandidates);
-        }
-
-        self.state = IceState::GatheringComplete;
-        Ok(())
+        self.gather_candidates(&[local_addr], &socket).await
     }
 
     /// Phase 2: Set remote candidates and form pairs
@@ -905,9 +1136,86 @@ mod tests {
     #[test]
     fn test_ice_state_transitions() {
         let config = IceAgentConfig::default();
-        let agent = IceAgent::new(config, 1);
+        let agent = IceAgent::new(config, 1).expect("config should be valid");
 
         assert_eq!(agent.state(), IceState::New);
+    }
+
+    #[test]
+    fn test_ice_agent_config_validation() {
+        // Valid config should pass
+        let valid_config = IceAgentConfig::default();
+        assert!(valid_config.validate().is_ok());
+
+        // Zero check timeout should fail
+        let invalid_config = IceAgentConfig::default().with_check_timeout(Duration::ZERO);
+        assert!(matches!(
+            invalid_config.validate(),
+            Err(ConfigError::InvalidCheckTimeout)
+        ));
+
+        // Zero check retries should fail
+        let invalid_config = IceAgentConfig::default().with_check_retries(0);
+        assert!(matches!(
+            invalid_config.validate(),
+            Err(ConfigError::InvalidCheckRetries)
+        ));
+
+        // Zero probe count should fail
+        let invalid_config = IceAgentConfig::default().with_probe_count(0);
+        assert!(matches!(
+            invalid_config.validate(),
+            Err(ConfigError::InvalidProbeCount)
+        ));
+
+        // Overall timeout <= check timeout should fail
+        let invalid_config = IceAgentConfig::default()
+            .with_check_timeout(Duration::from_secs(10))
+            .with_overall_timeout(Duration::from_secs(5));
+        assert!(matches!(
+            invalid_config.validate(),
+            Err(ConfigError::InvalidOverallTimeout)
+        ));
+    }
+
+    #[test]
+    fn test_ice_agent_config_builder() {
+        let stun_server: std::net::SocketAddr = "8.8.8.8:3478".parse().unwrap();
+        let config = IceAgentConfig::new(vec![stun_server])
+            .with_check_timeout(Duration::from_millis(200))
+            .with_check_retries(5)
+            .with_aggressive_nomination(false)
+            .with_probe_count(10);
+
+        assert_eq!(config.stun_servers, vec![stun_server]);
+        assert_eq!(config.check_timeout, Duration::from_millis(200));
+        assert_eq!(config.check_retries, 5);
+        assert!(!config.aggressive_nomination);
+        assert_eq!(config.probe_count, 10);
+    }
+
+    #[test]
+    fn test_transaction_id_determinism() {
+        let config = IceAgentConfig::default();
+        let mut agent = IceAgent::new_unchecked(config, 42);
+
+        let tx1 = agent.next_transaction_id();
+        let tx2 = agent.next_transaction_id();
+
+        // Transaction IDs should be different
+        assert_ne!(tx1, tx2);
+
+        // Party ID should be extractable from transaction ID
+        assert_eq!(IceAgent::party_id_from_transaction(tx1), 42);
+        assert_eq!(IceAgent::party_id_from_transaction(tx2), 42);
+
+        // Should recognize our own transactions
+        assert!(agent.is_our_transaction(tx1));
+        assert!(agent.is_our_transaction(tx2));
+
+        // Should not recognize transactions from other agents
+        let other_tx = (100u64 << 32) | 1;
+        assert!(!agent.is_our_transaction(other_tx));
     }
 
     #[test]
@@ -927,6 +1235,7 @@ mod integration_tests {
     use crate::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Once;
+    use tokio::net::UdpSocket;
 
     static CRYPTO_INIT: Once = Once::new();
 
@@ -970,10 +1279,11 @@ mod integration_tests {
     #[test]
     fn test_ice_agent_creation() {
         let config = test_ice_config();
-        let agent = IceAgent::new(config.clone(), 1);
+        let agent = IceAgent::new_unchecked(config.clone(), 1);
 
         assert_eq!(agent.state(), IceState::New);
-        assert_eq!(agent.role(), IceRole::Controlling); // Default role
+        // Default role is Controlled until remote party is known
+        assert_eq!(agent.role(), IceRole::Controlled);
         assert!(agent.local_candidates().is_empty());
         assert!(agent.nominated_pair().is_none());
     }
@@ -981,7 +1291,7 @@ mod integration_tests {
     #[test]
     fn test_ice_role_assignment() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new(config, 100);
+        let mut agent = IceAgent::new_unchecked(config, 100);
 
         // Test manual role setting
         agent.set_role(IceRole::Controlled);
@@ -1031,11 +1341,12 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ice_agent_gather_candidates_localhost() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, 1);
 
-        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let result = agent.gather_candidates(local_addr).await;
+        let result = agent.gather_candidates(&[local_addr], &socket).await;
         assert!(result.is_ok(), "Gathering should succeed: {:?}", result);
 
         assert_eq!(agent.state(), IceState::GatheringComplete);
@@ -1052,30 +1363,69 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_ice_agent_gather_multiple_hosts() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new_unchecked(config, 1);
+
+        // Simulate multiple host addresses (e.g., multiple network interfaces)
+        let hosts = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5001),
+        ];
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let result = agent.gather_candidates(&hosts, &socket).await;
+        assert!(result.is_ok());
+
+        // Should have host candidates for each address
+        let host_count = agent
+            .local_candidates()
+            .candidates
+            .iter()
+            .filter(|c| c.candidate_type == CandidateType::Host)
+            .count();
+        assert_eq!(host_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_ice_agent_gather_empty_hosts_fails() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new_unchecked(config, 1);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Empty host list should fail
+        let result = agent.gather_candidates(&[], &socket).await;
+        assert!(matches!(result, Err(IceError::NoCandidates)));
+    }
+
+    #[tokio::test]
     async fn test_ice_agent_invalid_state_gather() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new(config.clone(), 1);
+        let mut agent = IceAgent::new_unchecked(config.clone(), 1);
 
-        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // First gather should succeed
-        agent.gather_candidates(local_addr).await.unwrap();
+        agent.gather_candidates(&[local_addr], &socket).await.unwrap();
 
         // Second gather should fail (wrong state)
-        let result = agent.gather_candidates(local_addr).await;
+        let result = agent.gather_candidates(&[local_addr], &socket).await;
         assert!(matches!(result, Err(IceError::InvalidState(_))));
     }
 
     #[tokio::test]
     async fn test_ice_agent_set_remote_candidates() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, 1);
 
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6000);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Gather local candidates first
-        agent.gather_candidates(local_addr).await.unwrap();
+        agent.gather_candidates(&[local_addr], &socket).await.unwrap();
 
         // Create remote candidates
         let remote_candidate = IceCandidate::host(remote_addr, 1);
@@ -1100,7 +1450,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ice_agent_set_remote_invalid_state() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, 1);
 
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6000);
         let remote_candidate = IceCandidate::host(remote_addr, 1);
@@ -1156,6 +1506,7 @@ mod integration_tests {
             IceError::SignalingError("signaling failed".to_string()),
             IceError::NetworkError("network issue".to_string()),
             IceError::HolePunchFailed("punch failed".to_string()),
+            IceError::ConfigError(ConfigError::InvalidCheckTimeout),
         ];
 
         for error in errors {
@@ -1187,16 +1538,18 @@ mod integration_tests {
     async fn test_two_agents_candidate_exchange() {
         // Create two agents with different party IDs
         let config = test_ice_config();
-        let mut agent1 = IceAgent::new(config.clone(), 100); // Higher ID = Controlling
-        let mut agent2 = IceAgent::new(config, 50); // Lower ID = Controlled
+        let mut agent1 = IceAgent::new_unchecked(config.clone(), 100); // Higher ID = Controlling
+        let mut agent2 = IceAgent::new_unchecked(config, 50); // Lower ID = Controlled
 
         // Use different localhost ports
-        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5001);
+        let socket1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Both agents gather candidates
-        agent1.gather_candidates(addr1).await.unwrap();
-        agent2.gather_candidates(addr2).await.unwrap();
+        agent1.gather_candidates(&[addr1], &socket1).await.unwrap();
+        agent2.gather_candidates(&[addr2], &socket2).await.unwrap();
 
         assert_eq!(agent1.state(), IceState::GatheringComplete);
         assert_eq!(agent2.state(), IceState::GatheringComplete);
@@ -1236,7 +1589,7 @@ mod integration_tests {
 
         // Create multiple agents
         let agents: Vec<_> = (0..4)
-            .map(|i| IceAgent::new(config.clone(), i as PartyId))
+            .map(|i| IceAgent::new_unchecked(config.clone(), i as PartyId))
             .collect();
 
         // Gather candidates concurrently
@@ -1247,7 +1600,8 @@ mod integration_tests {
                 tokio::spawn(async move {
                     let addr =
                         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 10000 + i as u16);
-                    agent.gather_candidates(addr).await.map(|_| agent)
+                    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    agent.gather_candidates(&[addr], &socket).await.map(|_| agent)
                 })
             })
             .collect();
@@ -1448,10 +1802,11 @@ mod integration_tests {
             ..test_ice_config()
         };
 
-        let mut agent = IceAgent::new(config, 1);
-        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let mut agent = IceAgent::new_unchecked(config, 1);
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        agent.gather_candidates(local_addr).await.unwrap();
+        agent.gather_candidates(&[local_addr], &socket).await.unwrap();
 
         // Set remote candidates pointing to an unreachable address
         let unreachable = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255)), 9999);

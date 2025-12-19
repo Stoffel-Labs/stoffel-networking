@@ -337,7 +337,8 @@ impl StunClient {
 
             match attr_type {
                 ATTR_XOR_MAPPED_ADDRESS => {
-                    xor_mapped_addr = Self::parse_xor_mapped_address(attr_data, &data[4..8]);
+                    xor_mapped_addr =
+                        Self::parse_xor_mapped_address(attr_data, &data[4..8], &data[8..20]);
                 }
                 ATTR_MAPPED_ADDRESS => {
                     mapped_addr = Self::parse_mapped_address(attr_data);
@@ -357,8 +358,12 @@ impl StunClient {
             .ok_or_else(|| StunError::InvalidResponse("No mapped address in response".to_string()))
     }
 
-    /// Parses XOR-MAPPED-ADDRESS attribute
-    fn parse_xor_mapped_address(data: &[u8], magic_cookie: &[u8]) -> Option<SocketAddr> {
+    /// Parses XOR-MAPPED-ADDRESS attribute (RFC 5389 Section 15.2)
+    fn parse_xor_mapped_address(
+        data: &[u8],
+        magic_cookie: &[u8],
+        transaction_id: &[u8],
+    ) -> Option<SocketAddr> {
         if data.len() < 8 {
             return None;
         }
@@ -380,17 +385,18 @@ impl StunClient {
             }
             0x02 => {
                 // IPv6
-                if data.len() < 20 {
+                if data.len() < 20 || transaction_id.len() < 12 {
                     return None;
                 }
                 let mut addr_bytes = [0u8; 16];
                 addr_bytes.copy_from_slice(&data[4..20]);
-                // XOR with magic cookie (first 4 bytes) and transaction ID (last 12 bytes)
+                // XOR with magic cookie (first 4 bytes) and transaction ID (remaining 12 bytes)
                 for i in 0..4 {
                     addr_bytes[i] ^= magic_cookie[i];
                 }
-                // Note: For full compliance, we'd need transaction ID here
-                // This is a simplified implementation
+                for i in 0..12 {
+                    addr_bytes[4 + i] ^= transaction_id[i];
+                }
                 let ip = std::net::Ipv6Addr::from(addr_bytes);
                 Some(SocketAddr::new(ip.into(), port))
             }

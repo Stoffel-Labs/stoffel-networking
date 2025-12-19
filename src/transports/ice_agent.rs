@@ -723,6 +723,27 @@ impl IceAgent {
             tokio::time::sleep(self.config.check_pace).await;
         }
 
+        // Timeout reached - but check if we have any successful pairs we can use
+        if let Some(nominated_idx) = self.nominated_pair {
+            self.state = IceState::Completed;
+            return Ok(self.check_list[nominated_idx].clone());
+        }
+
+        // Find the best succeeded pair (highest priority) even if not nominated
+        let best_succeeded = self
+            .check_list
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.state == CandidatePairState::Succeeded)
+            .max_by_key(|(_, p)| p.priority);
+
+        if let Some((idx, _)) = best_succeeded {
+            self.check_list[idx].nominated = true;
+            self.nominated_pair = Some(idx);
+            self.state = IceState::Completed;
+            return Ok(self.check_list[idx].clone());
+        }
+
         self.state = IceState::Failed;
         Err(IceError::Timeout)
     }

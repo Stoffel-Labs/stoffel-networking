@@ -1,5 +1,6 @@
 pub mod transports;
 pub mod network_utils;
+pub mod ffi;
 
 use std::future::Future;
 use std::net::SocketAddr;

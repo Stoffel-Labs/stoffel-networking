@@ -1,0 +1,65 @@
+# cbindgen configuration for stoffel-networking
+# Generate C header file with: cbindgen --config cbindgen.toml --output include/stoffelnet.h
+
+[defines]
+# No conditional defines needed
+
+[export]
+# Prefix for all exported symbols
+prefix = ""
+
+# Items to include in the header
+include = [
+    "STOFFELNET_OK",
+    "STOFFELNET_ERR_NULL_POINTER",
+    "STOFFELNET_ERR_INVALID_ADDRESS",
+    "STOFFELNET_ERR_CONNECTION",
+    "STOFFELNET_ERR_SEND",
+    "STOFFELNET_ERR_RECEIVE",
+    "STOFFELNET_ERR_TIMEOUT",
+    "STOFFELNET_ERR_PARTY_NOT_FOUND",
+    "STOFFELNET_ERR_RUNTIME",
+    "STOFFELNET_ERR_INVALID_UTF8",
+    "STOFFELNET_ERR_CANCELLED",
+    "STOFFELNET_STATE_CONNECTED",
+    "STOFFELNET_STATE_CLOSING",
+    "STOFFELNET_STATE_CLOSED",
+    "STOFFELNET_STATE_DISCONNECTED",
+]
+
+# Rename types to match C conventions
+[export.rename]
+"StoffelRuntimeHandle" = "StoffelTokioRuntimeHandle"
+
+[fn]
+# Rename functions if needed (none for now)
+
+[enum]
+# Enum generation settings
+rename_variants = "None"
+
+[struct]
+# Struct settings
+rename_fields = "None"
+
+[layout]
+# Memory layout
+packed = "None"
+aligned_n = 0
+
+[parse]
+# Parsing options
+parse_deps = false
+include = ["stoffelnet"]
+
+[parse.expand]
+# Crates to expand macros for
+crates = []
+
+[output]
+# Output configuration
+line_length = 100
+
+[language]
+# Target language
+# header language is C

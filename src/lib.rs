@@ -2,10 +2,9 @@ pub mod transports;
 pub mod network_utils;
 pub mod ffi;
 
-use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 
 /// Represents a connection to a peer
 ///

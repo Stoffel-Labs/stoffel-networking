@@ -1,0 +1,318 @@
+# NAT Hole Punching Integration Test
+#
+# Network topology:
+#
+#   peer_a (10.101.0.10:5001) <---> nat_a (public: 10.100.0.2) <--->
+#                                                                    |
+#                                 signaling (10.100.0.10)  <---------+-- "public" network
+#                                 stun (10.100.0.11)       <---------+
+#                                                                    |
+#   peer_b (10.102.0.10:5002) <---> nat_b (public: 10.100.0.3) <--->
+#
+# - peer_a and peer_b are on separate private networks (simulating home LANs)
+# - nat_a and nat_b provide NAT translation (simulating home routers)
+# - All NAT routers, signaling server, and STUN server connect via the "public" network
+# - Peers can only reach the public network through their NAT router
+# - STUN server allows peers to discover their external UDP port mappings
+#
+# NAT Type: Endpoint-Independent NAT (Full Cone)
+# - Outbound packets from 10.101.0.10:5000 always map to 10.100.0.2:5000
+# - ANY external host can send to 10.100.0.2:5000 and reach the internal peer
+# - This is the most permissive NAT type and easiest to traverse
+#
+# Implementation: SNAT with fixed port + DNAT for inbound
+# MASQUERADE is used as fallback for other traffic (STUN queries, signaling)
+
+networks:
+  # "Public" internet - where NAT routers have public IPs
+  public:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.0.0/24
+
+  # Private network A (peer_a's LAN)
+  # Disable IP masquerading so traffic goes through NAT container
+  private_a:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam:
+      config:
+        - subnet: 10.101.0.0/24
+
+  # Private network B (peer_b's LAN)
+  # Disable IP masquerading so traffic goes through NAT container
+  private_b:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam:
+      config:
+        - subnet: 10.102.0.0/24
+
+services:
+  # Signaling server - only on public network with fixed IP
+  # Peers reach it through NAT and see their NAT-translated addresses
+  signaling:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.signaling
+    networks:
+      public:
+        ipv4_address: 10.100.0.10
+    ports:
+      - "9000:9000"
+    environment:
+      - RUST_LOG=info
+      - BIND_ADDR=0.0.0.0:9000
+
+  # STUN server - provides UDP reflexive address discovery
+  # Peers use this to discover their external IP:port mappings for UDP traffic
+  stun:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.stun
+    networks:
+      public:
+        ipv4_address: 10.100.0.11
+    ports:
+      - "3478:3478/udp"
+    environment:
+      - RUST_LOG=info
+      - BIND_ADDR=0.0.0.0:3478
+
+  # NAT router A - provides NAT for private_a
+  # Endpoint-Independent NAT (Full Cone) simulation
+  # Uses SNAT with fixed port mapping + DNAT for inbound
+  nat_a:
+    image: alpine:latest
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.netfilter.nf_conntrack_udp_timeout=120
+      - net.netfilter.nf_conntrack_udp_timeout_stream=180
+    networks:
+      public:
+        ipv4_address: 10.100.0.2
+      private_a:
+        ipv4_address: 10.101.0.2
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache iptables conntrack-tools tcpdump
+
+        # Wait for interfaces to stabilize
+        sleep 1
+
+        # Detect interfaces by IP address - check multiple times to ensure stability
+        for attempt in 1 2 3; do
+          PUBLIC_IF=""
+          PRIVATE_IF=""
+          PUBLIC_IP=""
+          for iface in eth0 eth1 eth2; do
+            IP=$$(ip -o addr show dev $$iface 2>/dev/null | grep 'inet ' | awk '{print $$4}' | cut -d/ -f1)
+            case "$$IP" in
+              10.100.0.*) PUBLIC_IF=$$iface; PUBLIC_IP=$$IP ;;
+              10.101.0.*) PRIVATE_IF=$$iface ;;
+            esac
+          done
+          if [ -n "$$PUBLIC_IF" ] && [ -n "$$PRIVATE_IF" ]; then
+            break
+          fi
+          sleep 0.5
+        done
+
+        echo "NAT A: Public=$$PUBLIC_IF ($$PUBLIC_IP), Private=$$PRIVATE_IF"
+
+        if [ -z "$$PUBLIC_IF" ] || [ -z "$$PRIVATE_IF" ]; then
+          echo "ERROR: Failed to detect interfaces!"
+          ip addr show
+          exit 1
+        fi
+
+        # Full Cone NAT for port 5000
+        # NOTE: Using destination IP matching instead of interface names because Docker
+        # on macOS can reassign IPs between interfaces after container startup
+
+        # === NAT RULES ===
+        # NOTE: We allow all forwarding because Docker Desktop on macOS has internal
+        # routing that can bypass container NAT. The SNAT/DNAT rules still apply
+        # to traffic that goes through this container.
+        iptables -A FORWARD -j ACCEPT
+        # Outbound: SNAT all UDP from peer's port 5000 to our public IP
+        # This applies when peer sends to ANY destination (public network or other NAT)
+        iptables -t nat -A POSTROUTING -s 10.101.0.10 -p udp --sport 5000 -j SNAT --to-source 10.100.0.2:5000
+
+        # Inbound: DNAT any UDP to our public IP:5000 -> forward to internal peer
+        # Full Cone NAT: NO source restriction - accept from ANY source
+        iptables -t nat -A PREROUTING -d 10.100.0.2 -p udp --dport 5000 -j DNAT --to-destination 10.101.0.10:5000
+
+        # General MASQUERADE for other traffic (TCP signaling, STUN queries, etc)
+        iptables -t nat -A POSTROUTING -s 10.101.0.0/24 ! -d 10.101.0.0/24 -j MASQUERADE
+
+        echo "NAT A configured (Full Cone with firewall)"
+        iptables -t nat -L -v -n
+        tail -f /dev/null
+    healthcheck:
+      test: ["CMD", "sh", "-c", "iptables -t nat -L POSTROUTING | grep -q SNAT"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # NAT router B - provides NAT for private_b
+  # Endpoint-Independent NAT (Full Cone) simulation
+  # Uses SNAT with fixed port mapping + DNAT for inbound
+  nat_b:
+    image: alpine:latest
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.netfilter.nf_conntrack_udp_timeout=120
+      - net.netfilter.nf_conntrack_udp_timeout_stream=180
+    networks:
+      public:
+        ipv4_address: 10.100.0.3
+      private_b:
+        ipv4_address: 10.102.0.2
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache iptables conntrack-tools tcpdump
+
+        # Wait for interfaces to stabilize
+        sleep 1
+
+        # Detect interfaces by IP address - check multiple times to ensure stability
+        for attempt in 1 2 3; do
+          PUBLIC_IF=""
+          PRIVATE_IF=""
+          PUBLIC_IP=""
+          for iface in eth0 eth1 eth2; do
+            IP=$$(ip -o addr show dev $$iface 2>/dev/null | grep 'inet ' | awk '{print $$4}' | cut -d/ -f1)
+            case "$$IP" in
+              10.100.0.*) PUBLIC_IF=$$iface; PUBLIC_IP=$$IP ;;
+              10.102.0.*) PRIVATE_IF=$$iface ;;
+            esac
+          done
+          if [ -n "$$PUBLIC_IF" ] && [ -n "$$PRIVATE_IF" ]; then
+            break
+          fi
+          sleep 0.5
+        done
+
+        echo "NAT B: Public=$$PUBLIC_IF ($$PUBLIC_IP), Private=$$PRIVATE_IF"
+
+        if [ -z "$$PUBLIC_IF" ] || [ -z "$$PRIVATE_IF" ]; then
+          echo "ERROR: Failed to detect interfaces!"
+          ip addr show
+          exit 1
+        fi
+
+        # Full Cone NAT for port 5000
+        # NOTE: Using destination IP matching instead of interface names because Docker
+        # on macOS can reassign IPs between interfaces after container startup
+
+        # === NAT RULES ===
+        # NOTE: We allow all forwarding because Docker Desktop on macOS has internal
+        # routing that can bypass container NAT. The SNAT/DNAT rules still apply
+        # to traffic that goes through this container.
+        iptables -A FORWARD -j ACCEPT
+        # Outbound: SNAT all UDP from peer's port 5000 to our public IP
+        # This applies when peer sends to ANY destination (public network or other NAT)
+        iptables -t nat -A POSTROUTING -s 10.102.0.10 -p udp --sport 5000 -j SNAT --to-source 10.100.0.3:5000
+
+        # Inbound: DNAT any UDP to our public IP:5000 -> forward to internal peer
+        # Full Cone NAT: NO source restriction - accept from ANY source
+        iptables -t nat -A PREROUTING -d 10.100.0.3 -p udp --dport 5000 -j DNAT --to-destination 10.102.0.10:5000
+
+        # General MASQUERADE for other traffic (TCP signaling, STUN queries, etc)
+        iptables -t nat -A POSTROUTING -s 10.102.0.0/24 ! -d 10.102.0.0/24 -j MASQUERADE
+
+        echo "NAT B configured (Full Cone with firewall)"
+        iptables -t nat -L -v -n
+        tail -f /dev/null
+    healthcheck:
+      test: ["CMD", "sh", "-c", "iptables -t nat -L POSTROUTING | grep -q SNAT"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # Peer A - behind NAT A
+  # Uses port 5001 to avoid conntrack tuple collision with peer_b's port 5002
+  peer_a:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.peer
+    networks:
+      private_a:
+        ipv4_address: 10.101.0.10
+    environment:
+      - RUST_LOG=debug
+      - PEER_ID=1
+      - PEER_NAME=peer_a
+      - SIGNALING_SERVER=10.100.0.10:9000
+      - STUN_SERVER=10.100.0.11:3478
+      - LOCAL_ADDR=0.0.0.0:5000
+    depends_on:
+      signaling:
+        condition: service_started
+      stun:
+        condition: service_started
+      nat_a:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+        NAT_IP=$$(getent hosts nat_a | awk '{print $$1}' | head -1) &&
+        echo \"Setting default gateway to NAT at $$NAT_IP\" &&
+        ip route del default || true &&
+        ip route add default via $$NAT_IP &&
+        echo 'Waiting for signaling server...' &&
+        sleep 3 &&
+        /app/nat_test_peer
+      "
+
+  # Peer B - behind NAT B
+  # Uses port 5002 to avoid conntrack tuple collision with peer_a's port 5001
+  # Starts slightly after peer_a to avoid race conditions in candidate exchange
+  peer_b:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.peer
+    networks:
+      private_b:
+        ipv4_address: 10.102.0.10
+    environment:
+      - RUST_LOG=debug
+      - PEER_ID=2
+      - PEER_NAME=peer_b
+      - SIGNALING_SERVER=10.100.0.10:9000
+      - STUN_SERVER=10.100.0.11:3478
+      - LOCAL_ADDR=0.0.0.0:5000
+    depends_on:
+      signaling:
+        condition: service_started
+      stun:
+        condition: service_started
+      nat_b:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+        NAT_IP=$$(getent hosts nat_b | awk '{print $$1}' | head -1) &&
+        echo \"Setting default gateway to NAT at $$NAT_IP\" &&
+        ip route del default || true &&
+        ip route add default via $$NAT_IP &&
+        echo 'Waiting for signaling server and peer_a to register...' &&
+        sleep 5 &&
+        /app/nat_test_peer
+      "

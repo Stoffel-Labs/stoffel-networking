@@ -631,7 +631,7 @@ pub extern "C" fn stoffelnet_manager_connect_to_party(
             .map(|n| n.address());
 
         match node_addr {
-            Some(addr) => manager.connect_as_server(addr, party_id as PartyId).await,
+            Some(addr) => manager.connect_as_server(addr).await,
             None => Err(format!("Party {} not found", party_id)),
         }
     });
@@ -693,7 +693,7 @@ pub extern "C" fn stoffelnet_manager_connect_to_party_async(
                 .map(|n| n.address());
 
             match node_addr {
-                Some(addr) => manager.connect_as_server(addr, party_id as PartyId).await,
+                Some(addr) => manager.connect_as_server(addr).await,
                 None => Err(format!("Party {} not found", party_id)),
             }
         };

@@ -20,7 +20,10 @@ use ark_ff::Field;
 use async_trait::async_trait;
 use uuid::Uuid;
 use std::time::Duration;
-// Note: NetEnvelope is no longer needed for handshakes since IDs are derived from public keys
+use crate::transports::net_envelope::NetEnvelope;
+use crate::transports::ice::LocalCandidates;
+use crate::transports::ice_agent::IceAgent;
+use crate::transports::stun::StunClient;
 use tracing::{debug, info, warn, trace};
 use x509_parser::prelude::*;
 
@@ -815,6 +818,12 @@ pub struct QuicNetworkManager {
     local_public_key: Option<NodePublicKey>,
     /// Connected peers' public keys (for sender_id computation)
     peer_public_keys: Arc<DashMap<PartyId, NodePublicKey>>,
+    /// STUN client for NAT traversal
+    stun_client: Option<Arc<StunClient>>,
+    /// Cached local ICE candidates
+    local_candidates: Arc<Mutex<Option<LocalCandidates>>>,
+    /// Pending ICE agents for hole punching
+    pending_ice_agents: Arc<DashMap<PartyId, IceAgent>>,
 }
 
 impl Default for QuicNetworkManager {
@@ -838,6 +847,9 @@ impl QuicNetworkManager {
             local_key_der: None,
             local_public_key: None,
             peer_public_keys: Arc::new(DashMap::new()),
+            stun_client: None,
+            local_candidates: Arc::new(Mutex::new(None)),
+            pending_ice_agents: Arc::new(DashMap::new()),
         }
     }
 
@@ -867,6 +879,10 @@ impl QuicNetworkManager {
             connections: Arc::new(DashMap::new()),
             client_connections: Arc::new(DashMap::new()),
             client_ids: Arc::new(DashSet::new()),
+            local_cert_der: None,
+            local_key_der: None,
+            local_public_key: None,
+            peer_public_keys: Arc::new(DashMap::new()),
             stun_client,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -1650,30 +1666,15 @@ impl QuicNetworkManager {
             .set_remote_candidates(target_party_id, remote_ufrag, remote_pwd, remote_candidates)
             .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
 
-        // Store agent for potential later use
-        self.pending_ice_agents.insert(
-            target_party_id,
-            Arc::new(Mutex::new(ice_agent)),
-        );
-
         // 5. Ensure endpoint exists
-        self.ensure_client_endpoint().await?;
+        self.ensure_client_endpoint(ClientType::Server).await?;
         let endpoint = self.endpoint.as_ref().unwrap();
 
-        // 6. Get the agent back and run connectivity checks
-        let agent_arc = self
-            .pending_ice_agents
-            .get(&target_party_id)
-            .map(|e| Arc::clone(e.value()))
-            .ok_or("ICE agent not found")?;
-
-        let nominated_pair = {
-            let mut agent = agent_arc.lock().await;
-            agent
-                .run_connectivity_checks(endpoint)
-                .await
-                .map_err(|e| format!("ICE connectivity checks failed: {}", e))?
-        };
+        // 6. Run connectivity checks
+        let nominated_pair = ice_agent
+            .run_connectivity_checks(endpoint)
+            .await
+            .map_err(|e| format!("ICE connectivity checks failed: {}", e))?;
 
         info!(
             "ICE completed: {} -> {} (RTT: {:?}ms)",
@@ -1682,6 +1683,9 @@ impl QuicNetworkManager {
             nominated_pair.rtt_ms
         );
 
+        // Store agent for potential later use
+        self.pending_ice_agents.insert(target_party_id, ice_agent);
+
         // 7. Establish QUIC connection on the successful pair
         let connection = endpoint
             .connect(nominated_pair.remote.address, "localhost")
@@ -1689,31 +1693,30 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-        // Open stream and perform handshake
-        let (mut send, mut recv) = connection
+        // Get connection role from ALPN negotiation
+        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
+            warn!("ALPN extraction failed: {}, defaulting to Server", e);
+            ClientType::Server
+        });
+
+        // Extract peer's public key from TLS certificate
+        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+
+        // Open stream and sync
+        let (mut send, recv) = connection
             .open_bi()
             .await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-        send_handshake(&mut send, "SERVER", self.node_id)
-            .await
-            .map_err(|e| format!("Failed to send handshake: {}", e))?;
-
-        let handshake = recv_handshake(&mut recv)
-            .await
-            .map_err(|e| format!("Failed to receive handshake: {}", e))?;
-
-        let connection_role = if let Some((role, _)) = handshake {
-            client_type_from_role(&role)
-        } else {
-            ClientType::Server
-        };
+        send_stream_sync(&mut send).await
+            .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
         let conn = Arc::new(QuicPeerConnection::new(
             connection,
             send,
             recv,
             connection_role,
+            peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
         // Store connection
@@ -1794,7 +1797,7 @@ impl QuicNetworkManager {
             .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
 
         // 4. Run connectivity checks
-        self.ensure_client_endpoint().await?;
+        self.ensure_client_endpoint(ClientType::Server).await?;
         let endpoint = self.endpoint.as_ref().unwrap();
 
         let nominated_pair = ice_agent
@@ -1818,25 +1821,26 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
-        let (mut send, mut recv) = connection
+        // Get connection role from ALPN negotiation
+        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
+            warn!("ALPN extraction failed: {}, defaulting to Server", e);
+            ClientType::Server
+        });
+
+        // Extract peer's public key from TLS certificate
+        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+
+        let (send, recv) = connection
             .accept_bi()
             .await
             .map_err(|e| format!("Failed to accept stream: {}", e))?;
-
-        // Read and respond to handshake
-        let _handshake = recv_handshake(&mut recv)
-            .await
-            .map_err(|e| format!("Failed to read handshake: {}", e))?;
-
-        send_handshake(&mut send, "SERVER", self.node_id)
-            .await
-            .map_err(|e| format!("Failed to send handshake: {}", e))?;
 
         let conn = Arc::new(QuicPeerConnection::new(
             connection,
             send,
             recv,
-            ClientType::Server,
+            connection_role,
+            peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
         self.connections.insert(from_party_id, Arc::clone(&conn));
@@ -1862,7 +1866,7 @@ impl QuicNetworkManager {
 
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
-                self.connect_as_server(addr, self.node_id),
+                self.connect_as_server(addr),
             )
             .await;
 

@@ -497,7 +497,9 @@ mod tests {
         BigEndian::write_u16(&mut data[2..4], xor_port);
         BigEndian::write_u32(&mut data[4..8], xor_addr);
 
-        let result = StunClient::parse_xor_mapped_address(&data, &magic);
+        // Transaction ID (12 bytes) - not used for IPv4 XOR
+        let transaction_id = [0u8; 12];
+        let result = StunClient::parse_xor_mapped_address(&data, &magic, &transaction_id);
         assert!(result.is_some());
 
         let addr = result.unwrap();

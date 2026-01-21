@@ -1263,9 +1263,8 @@ mod integration_tests {
     /// Initialize the rustls crypto provider (needed for QUIC tests)
     fn init_crypto() {
         CRYPTO_INIT.call_once(|| {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("Failed to install crypto provider");
+            // Ignore error if provider is already installed by another test
+            let _ = rustls::crypto::ring::default_provider().install_default();
         });
     }
 

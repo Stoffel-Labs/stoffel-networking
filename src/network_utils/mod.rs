@@ -23,6 +23,31 @@ pub enum NetworkError {
 pub type PartyId = usize;
 pub type ClientId = usize;
 
+/// Represents a node's public key (DER-encoded SubjectPublicKeyInfo).
+/// Used for deterministic sender_id computation across all participants.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodePublicKey(pub Vec<u8>);
+
+impl NodePublicKey {
+    /// Derives a stable ID from this public key.
+    /// Uses a simple hash-like computation over the public key bytes.
+    /// The result is deterministic and unique for different public keys.
+    pub fn derive_id(&self) -> usize {
+        // Use a simple FNV-1a-like hash for deterministic ID derivation
+        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        let mut hash = FNV_OFFSET_BASIS;
+        for byte in &self.0 {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+
+        // Convert to usize (truncate on 32-bit systems)
+        hash as usize
+    }
+}
+
 /// Describes how the remote endpoint identifies itself during the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientType {

@@ -1,7 +1,10 @@
 [package]
 name = "stoffelnet"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 quinn = "0.11.8"
@@ -15,5 +18,6 @@ thiserror = "2.0.12"
 async-trait = "0.1.88"
 bincode = "1.3.3"
 tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "7.0.0-rc2"
 x509-parser = "0.16"

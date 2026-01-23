@@ -818,9 +818,9 @@ pub struct QuicNetworkManager {
     nodes: Vec<QuicNode>,
     node_id: PartyId,
     network_config: QuicNetworkConfig,
-    /// Replaced Mutex<HashMap> with DashMap for better concurrent access
-    connections: Arc<DashMap<PartyId, Arc<dyn PeerConnection>>>,
-    /// Replaced Mutex<HashMap> with DashMap for client connections
+    /// Server-role connections (peer-to-peer MPC party connections)
+    server_connections: Arc<DashMap<PartyId, Arc<dyn PeerConnection>>>,
+    /// Client-role connections (external clients connected to this server)
     client_connections: Arc<DashMap<ClientId, Arc<dyn PeerConnection>>>,
     /// Replaced Mutex<HashSet> with DashSet for client IDs
     client_ids: Arc<DashSet<ClientId>>,
@@ -854,7 +854,7 @@ impl QuicNetworkManager {
             nodes: Vec::new(),
             node_id,
             network_config: QuicNetworkConfig::default(),
-            connections: Arc::new(DashMap::new()),
+            server_connections: Arc::new(DashMap::new()),
             client_connections: Arc::new(DashMap::new()),
             client_ids: Arc::new(DashSet::new()),
             local_cert_der: None,
@@ -890,7 +890,7 @@ impl QuicNetworkManager {
             nodes: Vec::new(),
             node_id: Uuid::new_v4().as_u128() as PartyId,
             network_config: config,
-            connections: Arc::new(DashMap::new()),
+            server_connections: Arc::new(DashMap::new()),
             client_connections: Arc::new(DashMap::new()),
             client_ids: Arc::new(DashSet::new()),
             local_cert_der: None,
@@ -918,33 +918,46 @@ impl QuicNetworkManager {
 
     /// Ensures loopback connection exists for self-delivery
     pub async fn ensure_loopback_installed(&self) {
-        if !self.connections.contains_key(&self.node_id) {
+        if !self.server_connections.contains_key(&self.node_id) {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            self.connections.insert(
+            self.server_connections.insert(
                 self.node_id,
                 Arc::new(LoopbackPeerConnection::new(addr, Some(self.local_derived_id()))) as Arc<dyn PeerConnection>
             );
         }
     }
 
-    /// Gets a connection by party ID (for actor model usage)
+    /// Gets a server connection by party ID
     pub async fn get_connection(&self, party_id: PartyId) -> Option<Arc<dyn PeerConnection>> {
-        self.connections.get(&party_id).map(|entry| Arc::clone(entry.value()))
+        self.server_connections.get(&party_id).map(|entry| Arc::clone(entry.value()))
     }
 
-    /// Gets all party connections (for actor model usage)
-    pub async fn get_all_connections(&self) -> Vec<(PartyId, Arc<dyn PeerConnection>)> {
-        self.connections
+    /// Gets all server connections (peer-to-peer MPC party connections)
+    pub fn get_all_server_connections(&self) -> Vec<(PartyId, Arc<dyn PeerConnection>)> {
+        self.server_connections
             .iter()
             .map(|entry| (*entry.key(), Arc::clone(entry.value())))
             .collect()
     }
 
-    /// Removes dead connections from the connection map
+    /// Gets all client connections (external clients connected to this server)
+    pub fn get_all_client_connections(&self) -> Vec<(ClientId, Arc<dyn PeerConnection>)> {
+        self.client_connections
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect()
+    }
+
+    /// Gets a specific client connection by ID
+    pub fn get_client_connection(&self, client_id: ClientId) -> Option<Arc<dyn PeerConnection>> {
+        self.client_connections.get(&client_id).map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Removes dead connections from both server and client connection maps
     pub async fn cleanup_dead_connections(&self) {
         let mut to_remove = Vec::new();
 
-        for entry in self.connections.iter() {
+        for entry in self.server_connections.iter() {
             let party_id = *entry.key();
             let conn = entry.value();
             if !conn.is_connected().await {
@@ -953,13 +966,28 @@ impl QuicNetworkManager {
         }
 
         for party_id in to_remove {
-            self.connections.remove(&party_id);
+            self.server_connections.remove(&party_id);
+        }
+
+        let mut clients_to_remove = Vec::new();
+
+        for entry in self.client_connections.iter() {
+            let client_id = *entry.key();
+            let conn = entry.value();
+            if !conn.is_connected().await {
+                clients_to_remove.push(client_id);
+            }
+        }
+
+        for client_id in clients_to_remove {
+            self.client_connections.remove(&client_id);
+            self.client_ids.remove(&client_id);
         }
     }
 
     /// Checks connection health for a specific party
     pub async fn is_party_connected(&self, party_id: PartyId) -> bool {
-        if let Some(conn_ref) = self.connections.get(&party_id) {
+        if let Some(conn_ref) = self.server_connections.get(&party_id) {
             conn_ref.value().is_connected().await
         } else {
             false
@@ -1176,12 +1204,12 @@ impl QuicNetworkManager {
 
         // Check if this is our own public key (loopback)
         if Some(&pk) == self.local_public_key.as_ref() {
-            return self.connections.get(&self.node_id).map(|r| r.value().clone());
+            return self.server_connections.get(&self.node_id).map(|r| r.value().clone());
         }
 
         // Find the connection for this peer's public key
         let derived_id = pk.derive_id();
-        self.connections.get(&derived_id).map(|r| r.value().clone())
+        self.server_connections.get(&derived_id).map(|r| r.value().clone())
     }
 
     /// Computes the sender_id by sorting all public keys (local + peers) lexicographically
@@ -1300,7 +1328,7 @@ impl QuicNetworkManager {
         )) as Arc<dyn PeerConnection>;
 
         // Store connection with the server's derived ID
-        self.connections.insert(server_id, Arc::clone(&conn));
+        self.server_connections.insert(server_id, Arc::clone(&conn));
 
         // Log our own derived client ID for debugging
         let client_id = self.local_public_key.as_ref()
@@ -1386,7 +1414,7 @@ impl QuicNetworkManager {
             peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
-        self.connections.insert(peer_id, Arc::clone(&conn));
+        self.server_connections.insert(peer_id, Arc::clone(&conn));
 
         // Log our own derived ID for debugging
         let our_id = self.local_public_key.as_ref()
@@ -1734,7 +1762,7 @@ impl QuicNetworkManager {
         )) as Arc<dyn PeerConnection>;
 
         // Store connection
-        self.connections.insert(target_party_id, Arc::clone(&conn));
+        self.server_connections.insert(target_party_id, Arc::clone(&conn));
 
         // Cleanup ICE agent
         self.pending_ice_agents.remove(&target_party_id);
@@ -1857,7 +1885,7 @@ impl QuicNetworkManager {
             peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
-        self.connections.insert(from_party_id, Arc::clone(&conn));
+        self.server_connections.insert(from_party_id, Arc::clone(&conn));
 
         Ok(conn)
     }
@@ -2061,7 +2089,7 @@ impl NetworkManager for QuicNetworkManager {
                     }
 
                     // Store connection
-                    self.connections.insert(peer_id, Arc::clone(&conn));
+                    self.server_connections.insert(peer_id, Arc::clone(&conn));
                 }
             }
 
@@ -2161,7 +2189,7 @@ impl Network for QuicNetworkManager {
 
         // If no parties found, try legacy loopback as fallback
         if party_count == 0 {
-            if let Some(connection_ref) = self.connections.get(&self.node_id) {
+            if let Some(connection_ref) = self.server_connections.get(&self.node_id) {
                 let connection = connection_ref.value();
                 if connection.is_connected().await && connection.send(message).await.is_ok() {
                     debug!("Successfully broadcasted message to self (loopback fallback)");

@@ -133,6 +133,10 @@ pub trait PeerConnection: Send + Sync {
 
     /// Returns how the remote peer identified itself in the handshake
     fn get_connection_role(&self) -> ClientType;
+
+    /// Returns the sender ID (PartyId) of the remote peer, if known.
+    /// Derived from the peer's public key for QUIC connections.
+    fn sender_id(&self) -> Option<PartyId>;
 }
 
 impl Debug for dyn PeerConnection {
@@ -441,6 +445,10 @@ impl PeerConnection for QuicPeerConnection {
     fn get_connection_role(&self) -> ClientType {
         self.connection_role
     }
+
+    fn sender_id(&self) -> Option<PartyId> {
+        self.peer_public_key.as_ref().map(|pk| pk.derive_id())
+    }
 }
 
 // ============================================================================
@@ -453,10 +461,11 @@ pub struct LoopbackPeerConnection {
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     state: Arc<Mutex<ConnectionState>>,
     connection_role: ClientType,
+    local_sender_id: Option<PartyId>,
 }
 
 impl LoopbackPeerConnection {
-    pub fn new(remote_addr: SocketAddr) -> Self {
+    pub fn new(remote_addr: SocketAddr, sender_id: Option<PartyId>) -> Self {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
         Self {
             remote_addr,
@@ -464,6 +473,7 @@ impl LoopbackPeerConnection {
             rx: Arc::new(Mutex::new(rx)),
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
             connection_role: ClientType::Server,
+            local_sender_id: sender_id,
         }
     }
 
@@ -587,6 +597,10 @@ impl PeerConnection for LoopbackPeerConnection {
 
     fn get_connection_role(&self) -> ClientType {
         self.connection_role
+    }
+
+    fn sender_id(&self) -> Option<PartyId> {
+        self.local_sender_id
     }
 }
 
@@ -908,7 +922,7 @@ impl QuicNetworkManager {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             self.connections.insert(
                 self.node_id,
-                Arc::new(LoopbackPeerConnection::new(addr)) as Arc<dyn PeerConnection>
+                Arc::new(LoopbackPeerConnection::new(addr, Some(self.local_derived_id()))) as Arc<dyn PeerConnection>
             );
         }
     }

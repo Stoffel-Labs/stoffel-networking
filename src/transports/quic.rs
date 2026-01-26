@@ -135,8 +135,12 @@ pub trait PeerConnection: Send + Sync {
     fn get_connection_role(&self) -> ClientType;
 
     /// Returns the sender ID (PartyId) of the remote peer, if known.
-    /// Derived from the peer's public key for QUIC connections.
+    /// Based on the sorted public key list position.
     fn sender_id(&self) -> Option<PartyId>;
+
+    /// Sets the sender ID for this connection.
+    /// Called by the network manager once all peers are connected.
+    fn set_sender_id(&self, sender_id: PartyId);
 }
 
 impl Debug for dyn PeerConnection {
@@ -276,6 +280,8 @@ pub struct QuicPeerConnection {
     connection_role: ClientType,
     /// Peer's public key extracted from TLS certificate
     peer_public_key: Option<NodePublicKey>,
+    /// Computed sender_id based on sorted public key list (set by manager)
+    computed_sender_id: Arc<std::sync::Mutex<Option<PartyId>>>,
 }
 
 impl QuicPeerConnection {
@@ -296,6 +302,7 @@ impl QuicPeerConnection {
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
             connection_role,
             peer_public_key,
+            computed_sender_id: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -321,12 +328,25 @@ impl QuicPeerConnection {
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
             connection_role,
             peer_public_key,
+            computed_sender_id: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
     /// Returns the peer's public key if available
     pub fn get_peer_public_key(&self) -> Option<&NodePublicKey> {
         self.peer_public_key.as_ref()
+    }
+
+    /// Sets the computed sender_id (called by manager once all peers are connected)
+    pub fn set_sender_id(&self, sender_id: PartyId) {
+        if let Ok(mut id) = self.computed_sender_id.lock() {
+            *id = Some(sender_id);
+        }
+    }
+
+    /// Gets the computed sender_id if set
+    pub fn get_computed_sender_id(&self) -> Option<PartyId> {
+        self.computed_sender_id.lock().ok().and_then(|id| *id)
     }
 
     /// Updates connection state
@@ -447,7 +467,13 @@ impl PeerConnection for QuicPeerConnection {
     }
 
     fn sender_id(&self) -> Option<PartyId> {
-        self.peer_public_key.as_ref().map(|pk| pk.derive_id())
+        self.get_computed_sender_id()
+    }
+
+    fn set_sender_id(&self, sender_id: PartyId) {
+        if let Ok(mut id) = self.computed_sender_id.lock() {
+            *id = Some(sender_id);
+        }
     }
 }
 
@@ -461,7 +487,7 @@ pub struct LoopbackPeerConnection {
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     state: Arc<Mutex<ConnectionState>>,
     connection_role: ClientType,
-    local_sender_id: Option<PartyId>,
+    local_sender_id: Arc<std::sync::Mutex<Option<PartyId>>>,
 }
 
 impl LoopbackPeerConnection {
@@ -473,7 +499,7 @@ impl LoopbackPeerConnection {
             rx: Arc::new(Mutex::new(rx)),
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
             connection_role: ClientType::Server,
-            local_sender_id: sender_id,
+            local_sender_id: Arc::new(std::sync::Mutex::new(sender_id)),
         }
     }
 
@@ -600,7 +626,13 @@ impl PeerConnection for LoopbackPeerConnection {
     }
 
     fn sender_id(&self) -> Option<PartyId> {
-        self.local_sender_id
+        self.local_sender_id.lock().ok().and_then(|id| *id)
+    }
+
+    fn set_sender_id(&self, sender_id: PartyId) {
+        if let Ok(mut id) = self.local_sender_id.lock() {
+            *id = Some(sender_id);
+        }
     }
 }
 
@@ -1239,6 +1271,61 @@ impl QuicNetworkManager {
         } else {
             None
         }
+    }
+
+    /// Assigns sender_ids to all connections based on the sorted public key list.
+    /// Call this once all peers are connected to finalize sender_ids.
+    /// Returns the number of connections that were assigned sender_ids.
+    pub fn assign_sender_ids(&self) -> usize {
+        let sorted_keys = self.get_sorted_public_keys();
+        let mut assigned = 0;
+
+        // Assign sender_ids to server connections (except loopback)
+        for entry in self.server_connections.iter() {
+            let derived_id = *entry.key();
+            let conn = entry.value();
+
+            // Skip loopback - handle separately
+            if derived_id == self.node_id {
+                continue;
+            }
+
+            // Look up public key by derived_id
+            if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
+                let peer_pk = pk_entry.value();
+                if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
+                    conn.set_sender_id(pos);
+                    assigned += 1;
+                }
+            }
+        }
+
+        // Assign sender_ids to client connections
+        for entry in self.client_connections.iter() {
+            let derived_id = *entry.key();
+            let conn = entry.value();
+
+            // Look up public key by derived_id
+            if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
+                let peer_pk = pk_entry.value();
+                if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
+                    conn.set_sender_id(pos);
+                    assigned += 1;
+                }
+            }
+        }
+
+        // Assign sender_id to loopback connection
+        if let Some(local_pk) = &self.local_public_key {
+            if let Some(pos) = sorted_keys.iter().position(|k| k == local_pk) {
+                if let Some(loopback) = self.server_connections.get(&self.node_id) {
+                    loopback.set_sender_id(pos);
+                    assigned += 1;
+                }
+            }
+        }
+
+        assigned
     }
 
     /// Returns the number of parties (local + peers)
@@ -2742,7 +2829,7 @@ mod tests {
 
         assert!(manager.endpoint.is_none());
         assert!(manager.nodes.is_empty());
-        assert!(manager.connections.is_empty());
+        assert!(manager.server_connections.is_empty());
         assert!(manager.client_connections.is_empty());
         assert!(manager.client_ids.is_empty());
         assert!(manager.local_cert_der.is_none());
@@ -2803,7 +2890,7 @@ mod tests {
         manager.listen(addr).await.expect("Failed to listen");
 
         // Loopback should be installed
-        assert!(manager.connections.contains_key(&manager.node_id));
+        assert!(manager.server_connections.contains_key(&manager.node_id));
     }
 
     #[tokio::test]
@@ -2839,7 +2926,7 @@ mod tests {
         // Check that connections were stored with derived IDs
         // Server1 should have a connection to server2 (by server2's derived ID)
         let server2_derived_id = server2.local_derived_id();
-        assert!(server1.connections.contains_key(&server2_derived_id),
+        assert!(server1.server_connections.contains_key(&server2_derived_id),
             "server1 should have connection to server2 with derived ID {}", server2_derived_id);
     }
 

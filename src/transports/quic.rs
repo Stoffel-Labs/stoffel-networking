@@ -14,7 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use dashmap::{DashMap, DashSet};
-use crate::network_utils::{ClientId, ClientType, Message, Network, NetworkError, Node, NodePublicKey, PartyId};
+use crate::network_utils::{ClientId, ClientType, Message, Network, NetworkError, Node, NodePublicKey, PartyId, SenderId};
 use tokio::sync::{Mutex, mpsc};
 use ark_ff::Field;
 use async_trait::async_trait;
@@ -134,13 +134,13 @@ pub trait PeerConnection: Send + Sync {
     /// Returns how the remote peer identified itself in the handshake
     fn get_connection_role(&self) -> ClientType;
 
-    /// Returns the sender ID (PartyId) of the remote peer, if known.
+    /// Returns the sender ID of the remote peer, if known.
     /// Based on the sorted public key list position.
-    fn sender_id(&self) -> Option<PartyId>;
+    fn sender_id(&self) -> Option<SenderId>;
 
     /// Sets the sender ID for this connection.
     /// Called by the network manager once all peers are connected.
-    fn set_sender_id(&self, sender_id: PartyId);
+    fn set_sender_id(&self, sender_id: SenderId);
 }
 
 impl Debug for dyn PeerConnection {
@@ -281,7 +281,7 @@ pub struct QuicPeerConnection {
     /// Peer's public key extracted from TLS certificate
     peer_public_key: Option<NodePublicKey>,
     /// Computed sender_id based on sorted public key list (set by manager)
-    computed_sender_id: Arc<std::sync::Mutex<Option<PartyId>>>,
+    computed_sender_id: Arc<std::sync::Mutex<Option<SenderId>>>,
 }
 
 impl QuicPeerConnection {
@@ -338,14 +338,14 @@ impl QuicPeerConnection {
     }
 
     /// Sets the computed sender_id (called by manager once all peers are connected)
-    pub fn set_sender_id(&self, sender_id: PartyId) {
+    pub fn set_sender_id(&self, sender_id: SenderId) {
         if let Ok(mut id) = self.computed_sender_id.lock() {
             *id = Some(sender_id);
         }
     }
 
     /// Gets the computed sender_id if set
-    pub fn get_computed_sender_id(&self) -> Option<PartyId> {
+    pub fn get_computed_sender_id(&self) -> Option<SenderId> {
         self.computed_sender_id.lock().ok().and_then(|id| *id)
     }
 
@@ -466,11 +466,11 @@ impl PeerConnection for QuicPeerConnection {
         self.connection_role
     }
 
-    fn sender_id(&self) -> Option<PartyId> {
+    fn sender_id(&self) -> Option<SenderId> {
         self.get_computed_sender_id()
     }
 
-    fn set_sender_id(&self, sender_id: PartyId) {
+    fn set_sender_id(&self, sender_id: SenderId) {
         if let Ok(mut id) = self.computed_sender_id.lock() {
             *id = Some(sender_id);
         }
@@ -487,11 +487,11 @@ pub struct LoopbackPeerConnection {
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     state: Arc<Mutex<ConnectionState>>,
     connection_role: ClientType,
-    local_sender_id: Arc<std::sync::Mutex<Option<PartyId>>>,
+    local_sender_id: Arc<std::sync::Mutex<Option<SenderId>>>,
 }
 
 impl LoopbackPeerConnection {
-    pub fn new(remote_addr: SocketAddr, sender_id: Option<PartyId>) -> Self {
+    pub fn new(remote_addr: SocketAddr, sender_id: Option<SenderId>) -> Self {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
         Self {
             remote_addr,
@@ -625,11 +625,11 @@ impl PeerConnection for LoopbackPeerConnection {
         self.connection_role
     }
 
-    fn sender_id(&self) -> Option<PartyId> {
+    fn sender_id(&self) -> Option<SenderId> {
         self.local_sender_id.lock().ok().and_then(|id| *id)
     }
 
-    fn set_sender_id(&self, sender_id: PartyId) {
+    fn set_sender_id(&self, sender_id: SenderId) {
         if let Ok(mut id) = self.local_sender_id.lock() {
             *id = Some(sender_id);
         }
@@ -728,8 +728,8 @@ impl QuicNode {
         Self { uuid, address }
     }
 
-    pub fn from_party_id(id: PartyId, address: SocketAddr) -> Self {
-        let uuid = Uuid::from_u128(id as u128);
+    pub fn from_party_id(id: SenderId, address: SocketAddr) -> Self {
+        let uuid = Uuid::from_u128(id.raw() as u128);
         Self { uuid, address }
     }
 
@@ -743,8 +743,8 @@ impl QuicNode {
 }
 
 impl Node for QuicNode {
-    fn id(&self) -> PartyId {
-        self.uuid.as_u128() as PartyId
+    fn id(&self) -> SenderId {
+        SenderId::new(self.uuid.as_u128() as usize)
     }
 
     fn scalar_id<F: Field>(&self) -> F {
@@ -816,12 +816,12 @@ impl QuicNetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicMessage {
-    sender_id: PartyId,
+    sender_id: SenderId,
     content: Vec<u8>,
 }
 
 impl QuicMessage {
-    pub fn new(sender_id: PartyId, content: Vec<u8>) -> Self {
+    pub fn new(sender_id: SenderId, content: Vec<u8>) -> Self {
         Self { sender_id, content }
     }
 
@@ -831,7 +831,7 @@ impl QuicMessage {
 }
 
 impl Message for QuicMessage {
-    fn sender_id(&self) -> PartyId {
+    fn sender_id(&self) -> SenderId {
         self.sender_id
     }
 
@@ -880,7 +880,7 @@ impl Default for QuicNetworkManager {
 
 impl QuicNetworkManager {
     pub fn new() -> Self {
-        let node_id = Uuid::new_v4().as_u128() as PartyId;
+        let node_id = SenderId::new(Uuid::new_v4().as_u128() as usize);
         Self {
             endpoint: None,
             nodes: Vec::new(),
@@ -920,7 +920,7 @@ impl QuicNetworkManager {
         Self {
             endpoint: None,
             nodes: Vec::new(),
-            node_id: Uuid::new_v4().as_u128() as PartyId,
+            node_id: SenderId::new(Uuid::new_v4().as_u128() as usize),
             network_config: config,
             server_connections: Arc::new(DashMap::new()),
             client_connections: Arc::new(DashMap::new()),
@@ -1217,21 +1217,21 @@ impl QuicNetworkManager {
 
     /// Gets the public key for a given sender_id (0..N-1).
     /// Returns None if sender_id is out of range.
-    pub fn get_public_key_for_sender_id(&self, sender_id: PartyId) -> Option<NodePublicKey> {
+    pub fn get_public_key_for_sender_id(&self, sender_id: SenderId) -> Option<NodePublicKey> {
         let sorted_keys = self.get_sorted_public_keys();
-        sorted_keys.get(sender_id).cloned()
+        sorted_keys.get(sender_id.raw()).cloned()
     }
 
     /// Gets the sender_id (0..N-1) for a given public key.
     /// Returns None if the public key is not known.
-    pub fn get_sender_id_for_public_key(&self, pk: &NodePublicKey) -> Option<PartyId> {
+    pub fn get_sender_id_for_public_key(&self, pk: &NodePublicKey) -> Option<SenderId> {
         let sorted_keys = self.get_sorted_public_keys();
-        sorted_keys.iter().position(|k| k == pk).map(|pos| pos as PartyId)
+        sorted_keys.iter().position(|k| k == pk).map(|pos| SenderId::new(pos))
     }
 
     /// Gets the connection for a given sender_id (0..N-1).
     /// For MPC protocols, use this instead of direct connection lookup.
-    pub fn get_connection_by_sender_id(&self, sender_id: PartyId) -> Option<Arc<dyn PeerConnection>> {
+    pub fn get_connection_by_sender_id(&self, sender_id: SenderId) -> Option<Arc<dyn PeerConnection>> {
         let pk = self.get_public_key_for_sender_id(sender_id)?;
 
         // Check if this is our own public key (loopback)
@@ -1247,13 +1247,13 @@ impl QuicNetworkManager {
     /// Computes the sender_id by sorting all public keys (local + peers) lexicographically
     /// and returning this node's position in the sorted list.
     /// Returns None if local_public_key is not set.
-    pub fn compute_sender_id(&self) -> Option<PartyId> {
+    pub fn compute_sender_id(&self) -> Option<SenderId> {
         let local_pk = self.local_public_key.as_ref()?;
         self.get_sender_id_for_public_key(local_pk)
     }
 
     /// Returns the computed sender_id, falling back to node_id if not computable
-    pub fn sender_id(&self) -> PartyId {
+    pub fn sender_id(&self) -> SenderId {
         self.compute_sender_id().unwrap_or(self.node_id)
     }
 
@@ -1265,7 +1265,7 @@ impl QuicNetworkManager {
     }
 
     /// Returns the finalized sender_id only if fully connected to all expected parties
-    pub fn finalized_sender_id(&self, expected_count: usize) -> Option<PartyId> {
+    pub fn finalized_sender_id(&self, expected_count: usize) -> Option<SenderId> {
         if self.is_fully_connected(expected_count) {
             self.compute_sender_id()
         } else {
@@ -1294,7 +1294,7 @@ impl QuicNetworkManager {
             if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
                 let peer_pk = pk_entry.value();
                 if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
-                    conn.set_sender_id(pos);
+                    conn.set_sender_id(SenderId::new(pos));
                     assigned += 1;
                 }
             }
@@ -1309,7 +1309,7 @@ impl QuicNetworkManager {
             if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
                 let peer_pk = pk_entry.value();
                 if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
-                    conn.set_sender_id(pos);
+                    conn.set_sender_id(SenderId::new(pos));
                     assigned += 1;
                 }
             }
@@ -1319,7 +1319,7 @@ impl QuicNetworkManager {
         if let Some(local_pk) = &self.local_public_key {
             if let Some(pos) = sorted_keys.iter().position(|k| k == local_pk) {
                 if let Some(loopback) = self.server_connections.get(&self.node_id) {
-                    loopback.set_sender_id(pos);
+                    loopback.set_sender_id(SenderId::new(pos));
                     assigned += 1;
                 }
             }
@@ -1340,13 +1340,13 @@ impl QuicNetworkManager {
     }
 
     /// Returns the node_id (legacy ID, used as fallback)
-    pub fn get_node_id(&self) -> PartyId {
+    pub fn get_node_id(&self) -> SenderId {
         self.node_id
     }
 
     /// Returns the ID derived from this node's public key.
     /// Falls back to node_id if no certificate has been generated yet.
-    pub fn local_derived_id(&self) -> PartyId {
+    pub fn local_derived_id(&self) -> SenderId {
         self.local_public_key
             .as_ref()
             .map(|pk| pk.derive_id())
@@ -1522,7 +1522,7 @@ impl QuicNetworkManager {
     }
 
     /// Returns the local party ID
-    pub fn party_id(&self) -> PartyId {
+    pub fn party_id(&self) -> SenderId {
         self.node_id
     }
 
@@ -2252,7 +2252,8 @@ impl Network for QuicNetworkManager {
         let party_count = self.party_count();
 
         // Broadcast to all parties using sender_id (0..N-1)
-        for sender_id in 0..party_count {
+        for sender_id_raw in 0..party_count {
+            let sender_id = SenderId::new(sender_id_raw);
             if let Some(connection) = self.get_connection_by_sender_id(sender_id) {
                 // Check connection health before sending
                 if !connection.is_connected().await {
@@ -2627,7 +2628,7 @@ mod tests {
 
         // With only local node, sender_id should be 0
         let sender_id = manager.compute_sender_id();
-        assert_eq!(sender_id, Some(0));
+        assert_eq!(sender_id, Some(SenderId::new(0)));
     }
 
     #[test]
@@ -2641,15 +2642,15 @@ mod tests {
         let pk_before = NodePublicKey(vec![0x00]); // Likely before any real key
         let pk_after = NodePublicKey(vec![0xFF; 1000]); // Likely after any real key
 
-        manager.peer_public_keys.insert(1, pk_before);
-        manager.peer_public_keys.insert(2, pk_after);
+        manager.peer_public_keys.insert(SenderId::new(1), pk_before);
+        manager.peer_public_keys.insert(SenderId::new(2), pk_after);
 
         // Compute sender_id
         let sender_id = manager.compute_sender_id().expect("Should compute sender_id");
 
         // Local key should be in the middle (position 1)
         // Since pk_before < local_pk < pk_after when sorted
-        assert_eq!(sender_id, 1);
+        assert_eq!(sender_id, SenderId::new(1));
     }
 
     #[test]
@@ -2668,14 +2669,14 @@ mod tests {
         let pk3 = manager3.local_public_key.clone().unwrap();
 
         // Simulate full connectivity - each manager knows about others
-        manager1.peer_public_keys.insert(2, pk2.clone());
-        manager1.peer_public_keys.insert(3, pk3.clone());
+        manager1.peer_public_keys.insert(SenderId::new(2), pk2.clone());
+        manager1.peer_public_keys.insert(SenderId::new(3), pk3.clone());
 
-        manager2.peer_public_keys.insert(1, pk1.clone());
-        manager2.peer_public_keys.insert(3, pk3.clone());
+        manager2.peer_public_keys.insert(SenderId::new(1), pk1.clone());
+        manager2.peer_public_keys.insert(SenderId::new(3), pk3.clone());
 
-        manager3.peer_public_keys.insert(1, pk1.clone());
-        manager3.peer_public_keys.insert(2, pk2.clone());
+        manager3.peer_public_keys.insert(SenderId::new(1), pk1.clone());
+        manager3.peer_public_keys.insert(SenderId::new(2), pk2.clone());
 
         // Compute sender_ids
         let id1 = manager1.compute_sender_id().unwrap();
@@ -2685,7 +2686,7 @@ mod tests {
         // All sender_ids should be distinct and in range [0, 2]
         let mut ids = vec![id1, id2, id3];
         ids.sort();
-        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(ids, vec![SenderId::new(0), SenderId::new(1), SenderId::new(2)]);
     }
 
     #[test]
@@ -2712,10 +2713,10 @@ mod tests {
         // For count=3, need 2 peers
         assert!(!manager.is_fully_connected(3));
 
-        manager.peer_public_keys.insert(1, NodePublicKey(vec![0x01]));
+        manager.peer_public_keys.insert(SenderId::new(1), NodePublicKey(vec![0x01]));
         assert!(!manager.is_fully_connected(3)); // Still need 1 more
 
-        manager.peer_public_keys.insert(2, NodePublicKey(vec![0x02]));
+        manager.peer_public_keys.insert(SenderId::new(2), NodePublicKey(vec![0x02]));
         assert!(manager.is_fully_connected(3)); // Now fully connected
     }
 
@@ -2727,8 +2728,8 @@ mod tests {
         // Not fully connected yet
         assert!(manager.finalized_sender_id(3).is_none());
 
-        manager.peer_public_keys.insert(1, NodePublicKey(vec![0x01]));
-        manager.peer_public_keys.insert(2, NodePublicKey(vec![0x02]));
+        manager.peer_public_keys.insert(SenderId::new(1), NodePublicKey(vec![0x01]));
+        manager.peer_public_keys.insert(SenderId::new(2), NodePublicKey(vec![0x02]));
 
         // Now fully connected
         let finalized = manager.finalized_sender_id(3);
@@ -2840,7 +2841,7 @@ mod tests {
 
     #[test]
     fn test_manager_with_node_id() {
-        let custom_id = 12345;
+        let custom_id = SenderId::new(12345);
         let manager = QuicNetworkManager::with_node_id(custom_id);
 
         assert_eq!(manager.node_id, custom_id);
@@ -2897,8 +2898,8 @@ mod tests {
     async fn test_server_to_server_connection() {
         ensure_crypto_provider();
         // Create two managers
-        let mut server1 = QuicNetworkManager::with_node_id(1);
-        let mut server2 = QuicNetworkManager::with_node_id(2);
+        let mut server1 = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut server2 = QuicNetworkManager::with_node_id(SenderId::new(2));
 
         // Start listening on server1
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -2934,8 +2935,8 @@ mod tests {
     async fn test_client_to_server_connection() {
         ensure_crypto_provider();
         // Create server and client managers
-        let mut server = QuicNetworkManager::with_node_id(1);
-        let mut client = QuicNetworkManager::with_node_id(100);
+        let mut server = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut client = QuicNetworkManager::with_node_id(SenderId::new(100));
 
         // Start listening on server
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -2969,8 +2970,8 @@ mod tests {
     #[tokio::test]
     async fn test_connection_role_from_alpn() {
         ensure_crypto_provider();
-        let mut server = QuicNetworkManager::with_node_id(1);
-        let mut client = QuicNetworkManager::with_node_id(100);
+        let mut server = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut client = QuicNetworkManager::with_node_id(SenderId::new(100));
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -2991,8 +2992,8 @@ mod tests {
     #[tokio::test]
     async fn test_public_keys_exchanged_on_server_connection() {
         ensure_crypto_provider();
-        let mut server1 = QuicNetworkManager::with_node_id(1);
-        let mut server2 = QuicNetworkManager::with_node_id(2);
+        let mut server1 = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut server2 = QuicNetworkManager::with_node_id(SenderId::new(2));
 
         // Both servers need to have their certificates generated
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -3023,8 +3024,8 @@ mod tests {
     #[tokio::test]
     async fn test_send_receive_after_connection() {
         ensure_crypto_provider();
-        let mut server = QuicNetworkManager::with_node_id(1);
-        let mut client = QuicNetworkManager::with_node_id(100);
+        let mut server = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut client = QuicNetworkManager::with_node_id(SenderId::new(100));
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -3139,15 +3140,15 @@ mod tests {
         assert_eq!(sorted.len(), 2);
 
         // sender_id 0 should be the first in sorted order
-        let pk0 = manager.get_public_key_for_sender_id(0).unwrap();
+        let pk0 = manager.get_public_key_for_sender_id(SenderId::new(0)).unwrap();
         assert_eq!(pk0, sorted[0]);
 
         // sender_id 1 should be the second in sorted order
-        let pk1 = manager.get_public_key_for_sender_id(1).unwrap();
+        let pk1 = manager.get_public_key_for_sender_id(SenderId::new(1)).unwrap();
         assert_eq!(pk1, sorted[1]);
 
         // sender_id 2 should be None (out of range)
-        assert!(manager.get_public_key_for_sender_id(2).is_none());
+        assert!(manager.get_public_key_for_sender_id(SenderId::new(2)).is_none());
     }
 
     #[test]
@@ -3171,7 +3172,7 @@ mod tests {
         // Each key should map to its position in the sorted list
         for (expected_id, pk) in sorted.iter().enumerate() {
             let actual_id = manager.get_sender_id_for_public_key(pk).unwrap();
-            assert_eq!(actual_id, expected_id, "sender_id should match position in sorted list");
+            assert_eq!(actual_id, SenderId::new(expected_id), "sender_id should match position in sorted list");
         }
 
         // Unknown public key should return None
@@ -3206,8 +3207,8 @@ mod tests {
         ensure_crypto_provider();
 
         // Create two servers
-        let mut server1 = QuicNetworkManager::with_node_id(1);
-        let mut server2 = QuicNetworkManager::with_node_id(2);
+        let mut server1 = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut server2 = QuicNetworkManager::with_node_id(SenderId::new(2));
 
         // Start listening (generates certificates)
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -3235,8 +3236,8 @@ mod tests {
         let server2_sender_id = server2.compute_sender_id().unwrap();
 
         // One should be 0, the other should be 1
-        assert!(server1_sender_id == 0 || server1_sender_id == 1);
-        assert!(server2_sender_id == 0 || server2_sender_id == 1);
+        assert!(server1_sender_id == SenderId::new(0) || server1_sender_id == SenderId::new(1));
+        assert!(server2_sender_id == SenderId::new(0) || server2_sender_id == SenderId::new(1));
         assert_ne!(server1_sender_id, server2_sender_id, "Sender IDs should be different");
 
         // Verify the IDs are consistent across both servers

@@ -3,7 +3,7 @@
 //! Manages the ICE (Interactive Connectivity Establishment) process for
 //! establishing peer-to-peer connections through NAT.
 
-use crate::network_utils::PartyId;
+use crate::network_utils::{PartyId, SenderId};
 use crate::transports::ice::{
     CandidatePair, CandidatePairState, IceCandidate, LocalCandidates,
 };
@@ -419,14 +419,14 @@ impl IceAgent {
     /// by checking if the upper bits match our party ID.
     fn next_transaction_id(&mut self) -> u64 {
         self.transaction_counter += 1;
-        ((self.local_party_id as u64) << 32) | (self.transaction_counter & 0xFFFFFFFF)
+        ((self.local_party_id.raw() as u64) << 32) | (self.transaction_counter & 0xFFFFFFFF)
     }
 
     /// Extracts the party ID from a transaction ID.
     ///
     /// Returns the party ID that generated this transaction.
-    pub fn party_id_from_transaction(transaction_id: u64) -> PartyId {
-        (transaction_id >> 32) as PartyId
+    pub fn party_id_from_transaction(transaction_id: u64) -> SenderId {
+        SenderId::new((transaction_id >> 32) as usize)
     }
 
     /// Checks if a transaction ID belongs to this agent.
@@ -1145,19 +1145,20 @@ impl HolePunchCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network_utils::SenderId;
 
     #[test]
     fn test_role_determination() {
         // Higher party ID should be controlling
-        assert_eq!(IceAgent::determine_role(100, 50), IceRole::Controlling);
-        assert_eq!(IceAgent::determine_role(50, 100), IceRole::Controlled);
-        assert_eq!(IceAgent::determine_role(50, 50), IceRole::Controlled);
+        assert_eq!(IceAgent::determine_role(SenderId::new(100), SenderId::new(50)), IceRole::Controlling);
+        assert_eq!(IceAgent::determine_role(SenderId::new(50), SenderId::new(100)), IceRole::Controlled);
+        assert_eq!(IceAgent::determine_role(SenderId::new(50), SenderId::new(50)), IceRole::Controlled);
     }
 
     #[test]
     fn test_ice_state_transitions() {
         let config = IceAgentConfig::default();
-        let agent = IceAgent::new(config, 1).expect("config should be valid");
+        let agent = IceAgent::new(config, SenderId::new(1)).expect("config should be valid");
 
         assert_eq!(agent.state(), IceState::New);
     }
@@ -1218,7 +1219,7 @@ mod tests {
     #[test]
     fn test_transaction_id_determinism() {
         let config = IceAgentConfig::default();
-        let mut agent = IceAgent::new_unchecked(config, 42);
+        let mut agent = IceAgent::new_unchecked(config, SenderId::new(42));
 
         let tx1 = agent.next_transaction_id();
         let tx2 = agent.next_transaction_id();
@@ -1227,8 +1228,8 @@ mod tests {
         assert_ne!(tx1, tx2);
 
         // Party ID should be extractable from transaction ID
-        assert_eq!(IceAgent::party_id_from_transaction(tx1), 42);
-        assert_eq!(IceAgent::party_id_from_transaction(tx2), 42);
+        assert_eq!(IceAgent::party_id_from_transaction(tx1), SenderId::new(42));
+        assert_eq!(IceAgent::party_id_from_transaction(tx2), SenderId::new(42));
 
         // Should recognize our own transactions
         assert!(agent.is_our_transaction(tx1));
@@ -1252,6 +1253,7 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use crate::network_utils::SenderId;
     use crate::transports::ice::{CandidateType, IceCandidate, LocalCandidates};
     use crate::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1299,7 +1301,7 @@ mod integration_tests {
     #[test]
     fn test_ice_agent_creation() {
         let config = test_ice_config();
-        let agent = IceAgent::new_unchecked(config.clone(), 1);
+        let agent = IceAgent::new_unchecked(config.clone(), SenderId::new(1));
 
         assert_eq!(agent.state(), IceState::New);
         // Default role is Controlled until remote party is known
@@ -1311,7 +1313,7 @@ mod integration_tests {
     #[test]
     fn test_ice_role_assignment() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new_unchecked(config, 100);
+        let mut agent = IceAgent::new_unchecked(config, SenderId::new(100));
 
         // Test manual role setting
         agent.set_role(IceRole::Controlled);
@@ -1361,7 +1363,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ice_agent_gather_candidates_localhost() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new_unchecked(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, SenderId::new(1));
 
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1385,7 +1387,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ice_agent_gather_multiple_hosts() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new_unchecked(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, SenderId::new(1));
 
         // Simulate multiple host addresses (e.g., multiple network interfaces)
         let hosts = vec![
@@ -1410,7 +1412,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ice_agent_gather_empty_hosts_fails() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new_unchecked(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, SenderId::new(1));
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -1422,7 +1424,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ice_agent_invalid_state_gather() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new_unchecked(config.clone(), 1);
+        let mut agent = IceAgent::new_unchecked(config.clone(), SenderId::new(1));
 
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1438,7 +1440,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ice_agent_set_remote_candidates() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new_unchecked(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, SenderId::new(1));
 
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6000);
@@ -1449,7 +1451,7 @@ mod integration_tests {
 
         // Create remote candidates
         let remote_candidate = IceCandidate::host(remote_addr, 1);
-        let remote_party_id: PartyId = 2;
+        let remote_party_id: PartyId = SenderId::new(2);
 
         // Set remote candidates
         let result = agent.set_remote_candidates(
@@ -1470,14 +1472,14 @@ mod integration_tests {
     #[tokio::test]
     async fn test_ice_agent_set_remote_invalid_state() {
         let config = test_ice_config();
-        let mut agent = IceAgent::new_unchecked(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, SenderId::new(1));
 
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6000);
         let remote_candidate = IceCandidate::host(remote_addr, 1);
 
         // Try to set remote candidates before gathering (should fail)
         let result = agent.set_remote_candidates(
-            2,
+            SenderId::new(2),
             "test_ufrag".to_string(),
             "test_pwd_at_least_22_chars".to_string(),
             vec![remote_candidate],
@@ -1558,8 +1560,8 @@ mod integration_tests {
     async fn test_two_agents_candidate_exchange() {
         // Create two agents with different party IDs
         let config = test_ice_config();
-        let mut agent1 = IceAgent::new_unchecked(config.clone(), 100); // Higher ID = Controlling
-        let mut agent2 = IceAgent::new_unchecked(config, 50); // Lower ID = Controlled
+        let mut agent1 = IceAgent::new_unchecked(config.clone(), SenderId::new(100)); // Higher ID = Controlling
+        let mut agent2 = IceAgent::new_unchecked(config, SenderId::new(50)); // Lower ID = Controlled
 
         // Use different localhost ports
         let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
@@ -1580,13 +1582,13 @@ mod integration_tests {
 
         // Agent1 receives Agent2's candidates
         agent1
-            .set_remote_candidates(50, candidates2.ufrag, candidates2.pwd, candidates2.candidates)
+            .set_remote_candidates(SenderId::new(50), candidates2.ufrag, candidates2.pwd, candidates2.candidates)
             .unwrap();
 
         // Agent2 receives Agent1's candidates
         agent2
             .set_remote_candidates(
-                100,
+                SenderId::new(100),
                 candidates1.ufrag,
                 candidates1.pwd,
                 candidates1.candidates,
@@ -1609,7 +1611,7 @@ mod integration_tests {
 
         // Create multiple agents
         let agents: Vec<_> = (0..4)
-            .map(|i| IceAgent::new_unchecked(config.clone(), i as PartyId))
+            .map(|i| IceAgent::new_unchecked(config.clone(), SenderId::new(i)))
             .collect();
 
         // Gather candidates concurrently
@@ -1822,7 +1824,7 @@ mod integration_tests {
             ..test_ice_config()
         };
 
-        let mut agent = IceAgent::new_unchecked(config, 1);
+        let mut agent = IceAgent::new_unchecked(config, SenderId::new(1));
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -1834,7 +1836,7 @@ mod integration_tests {
 
         agent
             .set_remote_candidates(
-                2,
+                SenderId::new(2),
                 "test_ufrag".to_string(),
                 "test_pwd_at_least_22_chars".to_string(),
                 vec![remote_candidate],

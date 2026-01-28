@@ -14,14 +14,27 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use dashmap::{DashMap, DashSet};
-use crate::network_utils::{ClientId, ClientType, Message, Network, NetworkError, Node, PartyId};
+use crate::network_utils::{ClientId, ClientType, Message, Network, NetworkError, Node, NodePublicKey, PartyId, SenderId};
 use tokio::sync::{Mutex, mpsc};
 use ark_ff::Field;
 use async_trait::async_trait;
 use uuid::Uuid;
 use std::time::Duration;
 use crate::transports::net_envelope::NetEnvelope;
-use tracing::{debug, info, warn};
+use crate::transports::ice::LocalCandidates;
+use crate::transports::ice_agent::IceAgent;
+use crate::transports::stun::StunClient;
+use tracing::{debug, info, warn, trace};
+use x509_parser::prelude::*;
+
+// ============================================================================
+// ALPN PROTOCOL IDENTIFIERS
+// ============================================================================
+
+/// ALPN protocol identifier for CLIENT role connections
+const ALPN_CLIENT_PROTOCOL: &[u8] = b"client-protocol";
+/// ALPN protocol identifier for SERVER role connections
+const ALPN_SERVER_PROTOCOL: &[u8] = b"server-protocol";
 
 // ============================================================================
 // CONNECTION STATE
@@ -120,6 +133,14 @@ pub trait PeerConnection: Send + Sync {
 
     /// Returns how the remote peer identified itself in the handshake
     fn get_connection_role(&self) -> ClientType;
+
+    /// Returns the sender ID of the remote peer, if known.
+    /// Based on the sorted public key list position.
+    fn sender_id(&self) -> Option<SenderId>;
+
+    /// Sets the sender ID for this connection.
+    /// Called by the network manager once all peers are connected.
+    fn set_sender_id(&self, sender_id: SenderId);
 }
 
 impl Debug for dyn PeerConnection {
@@ -257,6 +278,10 @@ pub struct QuicPeerConnection {
     /// Connection state
     state: Arc<Mutex<ConnectionState>>,
     connection_role: ClientType,
+    /// Peer's public key extracted from TLS certificate
+    peer_public_key: Option<NodePublicKey>,
+    /// Computed sender_id based on sorted public key list (set by manager)
+    computed_sender_id: Arc<std::sync::Mutex<Option<SenderId>>>,
 }
 
 impl QuicPeerConnection {
@@ -266,6 +291,7 @@ impl QuicPeerConnection {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
         connection_role: ClientType,
+        peer_public_key: Option<NodePublicKey>,
     ) -> Self {
         let remote_addr = connection.remote_address();
         Self {
@@ -275,6 +301,8 @@ impl QuicPeerConnection {
             recv_stream: Arc::new(Mutex::new(recv)),
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
             connection_role,
+            peer_public_key,
+            computed_sender_id: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -282,6 +310,7 @@ impl QuicPeerConnection {
     pub async fn new_with_connection(
         connection: Connection,
         connection_role: ClientType,
+        peer_public_key: Option<NodePublicKey>,
     ) -> Result<Self, ConnectionError> {
         let remote_addr = connection.remote_address();
         let (send, recv) = connection
@@ -298,7 +327,26 @@ impl QuicPeerConnection {
             recv_stream: Arc::new(Mutex::new(recv)),
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
             connection_role,
+            peer_public_key,
+            computed_sender_id: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Returns the peer's public key if available
+    pub fn get_peer_public_key(&self) -> Option<&NodePublicKey> {
+        self.peer_public_key.as_ref()
+    }
+
+    /// Sets the computed sender_id (called by manager once all peers are connected)
+    pub fn set_sender_id(&self, sender_id: SenderId) {
+        if let Ok(mut id) = self.computed_sender_id.lock() {
+            *id = Some(sender_id);
+        }
+    }
+
+    /// Gets the computed sender_id if set
+    pub fn get_computed_sender_id(&self) -> Option<SenderId> {
+        self.computed_sender_id.lock().ok().and_then(|id| *id)
     }
 
     /// Updates connection state
@@ -417,6 +465,16 @@ impl PeerConnection for QuicPeerConnection {
     fn get_connection_role(&self) -> ClientType {
         self.connection_role
     }
+
+    fn sender_id(&self) -> Option<SenderId> {
+        self.get_computed_sender_id()
+    }
+
+    fn set_sender_id(&self, sender_id: SenderId) {
+        if let Ok(mut id) = self.computed_sender_id.lock() {
+            *id = Some(sender_id);
+        }
+    }
 }
 
 // ============================================================================
@@ -429,10 +487,11 @@ pub struct LoopbackPeerConnection {
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     state: Arc<Mutex<ConnectionState>>,
     connection_role: ClientType,
+    local_sender_id: Arc<std::sync::Mutex<Option<SenderId>>>,
 }
 
 impl LoopbackPeerConnection {
-    pub fn new(remote_addr: SocketAddr) -> Self {
+    pub fn new(remote_addr: SocketAddr, sender_id: Option<SenderId>) -> Self {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
         Self {
             remote_addr,
@@ -440,6 +499,7 @@ impl LoopbackPeerConnection {
             rx: Arc::new(Mutex::new(rx)),
             state: Arc::new(Mutex::new(ConnectionState::Connected)),
             connection_role: ClientType::Server,
+            local_sender_id: Arc::new(std::sync::Mutex::new(sender_id)),
         }
     }
 
@@ -564,44 +624,85 @@ impl PeerConnection for LoopbackPeerConnection {
     fn get_connection_role(&self) -> ClientType {
         self.connection_role
     }
-}
 
-// ============================================================================
-// HANDSHAKE HELPERS
-// ============================================================================
+    fn sender_id(&self) -> Option<SenderId> {
+        self.local_sender_id.lock().ok().and_then(|id| *id)
+    }
 
-/// Sends a handshake envelope over a stream
-async fn send_handshake(
-    send: &mut quinn::SendStream,
-    role: &str,
-    id: usize,
-) -> Result<(), ConnectionError> {
-    let envelope = NetEnvelope::Handshake {
-        role: role.to_string(),
-        id,
-    };
-    let bytes = envelope.serialize();
-    send_framed_message(send, &bytes).await
-}
-
-/// Receives a handshake envelope from a stream
-async fn recv_handshake(
-    recv: &mut quinn::RecvStream,
-) -> Result<Option<(String, usize)>, ConnectionError> {
-    let bytes = recv_framed_message(recv).await?;
-
-    match NetEnvelope::try_deserialize(&bytes) {
-        Ok(NetEnvelope::Handshake { role, id }) => Ok(Some((role, id))),
-        Ok(_) => Ok(None), // Not a handshake envelope
-        Err(_) => Ok(None), // Not an envelope, legacy path
+    fn set_sender_id(&self, sender_id: SenderId) {
+        if let Ok(mut id) = self.local_sender_id.lock() {
+            *id = Some(sender_id);
+        }
     }
 }
 
-fn client_type_from_role(role: &str) -> ClientType {
-    if role.eq_ignore_ascii_case("CLIENT") {
-        ClientType::Client
-    } else {
-        ClientType::Server
+// ============================================================================
+// STREAM SYNCHRONIZATION
+// ============================================================================
+
+/// Sync byte sent by the initiator to establish the bidirectional stream
+const STREAM_SYNC_BYTE: u8 = 0xFF;
+
+/// Sends a sync byte to establish the stream (called by connection initiator)
+async fn send_stream_sync(send: &mut quinn::SendStream) -> Result<(), ConnectionError> {
+    send.write_all(&[STREAM_SYNC_BYTE])
+        .await
+        .map_err(|e| ConnectionError::SendFailed(format!("Failed to send sync: {}", e)))
+}
+
+/// Receives the sync byte to acknowledge stream establishment (called by connection acceptor)
+async fn recv_stream_sync(recv: &mut quinn::RecvStream) -> Result<(), ConnectionError> {
+    let mut buf = [0u8; 1];
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| match e {
+            quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
+            quinn::ReadExactError::ReadError(re) => {
+                ConnectionError::ReceiveFailed(format!("Failed to receive sync: {}", re))
+            }
+        })?;
+
+    if buf[0] != STREAM_SYNC_BYTE {
+        return Err(ConnectionError::FramingError(
+            format!("Invalid sync byte: expected {:#x}, got {:#x}", STREAM_SYNC_BYTE, buf[0])
+        ));
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// ALPN HELPERS
+// ============================================================================
+
+/// Extracts the negotiated ALPN protocol from a QUIC connection and returns the ClientType
+fn extract_alpn_role(connection: &Connection) -> Result<ClientType, String> {
+    let handshake_data = connection
+        .handshake_data()
+        .ok_or_else(|| "No handshake data available".to_string())?;
+
+    let handshake = handshake_data
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .map_err(|_| "Failed to downcast handshake data to rustls type".to_string())?;
+
+    match handshake.protocol.as_ref().map(|v| v.as_slice()) {
+        Some(proto) if proto == ALPN_CLIENT_PROTOCOL => {
+            trace!("ALPN negotiated: client-protocol");
+            Ok(ClientType::Client)
+        }
+        Some(proto) if proto == ALPN_SERVER_PROTOCOL => {
+            trace!("ALPN negotiated: server-protocol");
+            Ok(ClientType::Server)
+        }
+        Some(proto) => {
+            let proto_str = String::from_utf8_lossy(proto);
+            warn!("Unknown ALPN protocol: {}", proto_str);
+            Err(format!("Unknown ALPN protocol: {}", proto_str))
+        }
+        None => {
+            warn!("No ALPN protocol negotiated");
+            Err("No ALPN protocol negotiated".to_string())
+        }
     }
 }
 
@@ -627,8 +728,8 @@ impl QuicNode {
         Self { uuid, address }
     }
 
-    pub fn from_party_id(id: PartyId, address: SocketAddr) -> Self {
-        let uuid = Uuid::from_u128(id as u128);
+    pub fn from_party_id(id: SenderId, address: SocketAddr) -> Self {
+        let uuid = Uuid::from_u128(id.raw() as u128);
         Self { uuid, address }
     }
 
@@ -642,8 +743,8 @@ impl QuicNode {
 }
 
 impl Node for QuicNode {
-    fn id(&self) -> PartyId {
-        self.uuid.as_u128() as PartyId
+    fn id(&self) -> SenderId {
+        SenderId::new(self.uuid.as_u128() as usize)
     }
 
     fn scalar_id<F: Field>(&self) -> F {
@@ -715,12 +816,12 @@ impl QuicNetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicMessage {
-    sender_id: PartyId,
+    sender_id: SenderId,
     content: Vec<u8>,
 }
 
 impl QuicMessage {
-    pub fn new(sender_id: PartyId, content: Vec<u8>) -> Self {
+    pub fn new(sender_id: SenderId, content: Vec<u8>) -> Self {
         Self { sender_id, content }
     }
 
@@ -730,7 +831,7 @@ impl QuicMessage {
 }
 
 impl Message for QuicMessage {
-    fn sender_id(&self) -> PartyId {
+    fn sender_id(&self) -> SenderId {
         self.sender_id
     }
 
@@ -749,20 +850,26 @@ pub struct QuicNetworkManager {
     nodes: Vec<QuicNode>,
     node_id: PartyId,
     network_config: QuicNetworkConfig,
-    /// Replaced Mutex<HashMap> with DashMap for better concurrent access
-    connections: Arc<DashMap<PartyId, Arc<dyn PeerConnection>>>,
-    /// Replaced Mutex<HashMap> with DashMap for client connections
+    /// Server-role connections (peer-to-peer MPC party connections)
+    server_connections: Arc<DashMap<PartyId, Arc<dyn PeerConnection>>>,
+    /// Client-role connections (external clients connected to this server)
     client_connections: Arc<DashMap<ClientId, Arc<dyn PeerConnection>>>,
     /// Replaced Mutex<HashSet> with DashSet for client IDs
     client_ids: Arc<DashSet<ClientId>>,
-
-    // NAT Traversal State
-    /// STUN client for reflexive address discovery
-    stun_client: Option<Arc<crate::transports::stun::StunClient>>,
+    /// Persistent certificate for this node (generated once)
+    /// Stored as DER-encoded certificate and private key
+    local_cert_der: Option<Vec<u8>>,
+    local_key_der: Option<Vec<u8>>,
+    /// This node's public key (derived from local_certificate)
+    local_public_key: Option<NodePublicKey>,
+    /// Connected peers' public keys (for sender_id computation)
+    peer_public_keys: Arc<DashMap<PartyId, NodePublicKey>>,
+    /// STUN client for NAT traversal
+    stun_client: Option<Arc<StunClient>>,
     /// Cached local ICE candidates
-    local_candidates: Arc<Mutex<Option<crate::transports::ice::LocalCandidates>>>,
-    /// Active ICE agents for pending P2P negotiations
-    pending_ice_agents: Arc<DashMap<PartyId, Arc<Mutex<crate::transports::ice_agent::IceAgent>>>>,
+    local_candidates: Arc<Mutex<Option<LocalCandidates>>>,
+    /// Pending ICE agents for hole punching
+    pending_ice_agents: Arc<DashMap<PartyId, IceAgent>>,
 }
 
 impl Default for QuicNetworkManager {
@@ -773,15 +880,19 @@ impl Default for QuicNetworkManager {
 
 impl QuicNetworkManager {
     pub fn new() -> Self {
-        let node_id = Uuid::new_v4().as_u128() as PartyId;
+        let node_id = SenderId::new(Uuid::new_v4().as_u128() as usize);
         Self {
             endpoint: None,
             nodes: Vec::new(),
             node_id,
             network_config: QuicNetworkConfig::default(),
-            connections: Arc::new(DashMap::new()),
+            server_connections: Arc::new(DashMap::new()),
             client_connections: Arc::new(DashMap::new()),
             client_ids: Arc::new(DashSet::new()),
+            local_cert_der: None,
+            local_key_der: None,
+            local_public_key: None,
+            peer_public_keys: Arc::new(DashMap::new()),
             stun_client: None,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -809,11 +920,15 @@ impl QuicNetworkManager {
         Self {
             endpoint: None,
             nodes: Vec::new(),
-            node_id: Uuid::new_v4().as_u128() as PartyId,
+            node_id: SenderId::new(Uuid::new_v4().as_u128() as usize),
             network_config: config,
-            connections: Arc::new(DashMap::new()),
+            server_connections: Arc::new(DashMap::new()),
             client_connections: Arc::new(DashMap::new()),
             client_ids: Arc::new(DashSet::new()),
+            local_cert_der: None,
+            local_key_der: None,
+            local_public_key: None,
+            peer_public_keys: Arc::new(DashMap::new()),
             stun_client,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -835,33 +950,46 @@ impl QuicNetworkManager {
 
     /// Ensures loopback connection exists for self-delivery
     pub async fn ensure_loopback_installed(&self) {
-        if !self.connections.contains_key(&self.node_id) {
+        if !self.server_connections.contains_key(&self.node_id) {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            self.connections.insert(
+            self.server_connections.insert(
                 self.node_id,
-                Arc::new(LoopbackPeerConnection::new(addr)) as Arc<dyn PeerConnection>
+                Arc::new(LoopbackPeerConnection::new(addr, Some(self.local_derived_id()))) as Arc<dyn PeerConnection>
             );
         }
     }
 
-    /// Gets a connection by party ID (for actor model usage)
+    /// Gets a server connection by party ID
     pub async fn get_connection(&self, party_id: PartyId) -> Option<Arc<dyn PeerConnection>> {
-        self.connections.get(&party_id).map(|entry| Arc::clone(entry.value()))
+        self.server_connections.get(&party_id).map(|entry| Arc::clone(entry.value()))
     }
 
-    /// Gets all party connections (for actor model usage)
-    pub async fn get_all_connections(&self) -> Vec<(PartyId, Arc<dyn PeerConnection>)> {
-        self.connections
+    /// Gets all server connections (peer-to-peer MPC party connections)
+    pub fn get_all_server_connections(&self) -> Vec<(PartyId, Arc<dyn PeerConnection>)> {
+        self.server_connections
             .iter()
             .map(|entry| (*entry.key(), Arc::clone(entry.value())))
             .collect()
     }
 
-    /// Removes dead connections from the connection map
+    /// Gets all client connections (external clients connected to this server)
+    pub fn get_all_client_connections(&self) -> Vec<(ClientId, Arc<dyn PeerConnection>)> {
+        self.client_connections
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect()
+    }
+
+    /// Gets a specific client connection by ID
+    pub fn get_client_connection(&self, client_id: ClientId) -> Option<Arc<dyn PeerConnection>> {
+        self.client_connections.get(&client_id).map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Removes dead connections from both server and client connection maps
     pub async fn cleanup_dead_connections(&self) {
         let mut to_remove = Vec::new();
 
-        for entry in self.connections.iter() {
+        for entry in self.server_connections.iter() {
             let party_id = *entry.key();
             let conn = entry.value();
             if !conn.is_connected().await {
@@ -870,13 +998,28 @@ impl QuicNetworkManager {
         }
 
         for party_id in to_remove {
-            self.connections.remove(&party_id);
+            self.server_connections.remove(&party_id);
+        }
+
+        let mut clients_to_remove = Vec::new();
+
+        for entry in self.client_connections.iter() {
+            let client_id = *entry.key();
+            let conn = entry.value();
+            if !conn.is_connected().await {
+                clients_to_remove.push(client_id);
+            }
+        }
+
+        for client_id in clients_to_remove {
+            self.client_connections.remove(&client_id);
+            self.client_ids.remove(&client_id);
         }
     }
 
     /// Checks connection health for a specific party
     pub async fn is_party_connected(&self, party_id: PartyId) -> bool {
-        if let Some(conn_ref) = self.connections.get(&party_id) {
+        if let Some(conn_ref) = self.server_connections.get(&party_id) {
             conn_ref.value().is_connected().await
         } else {
             false
@@ -884,13 +1027,43 @@ impl QuicNetworkManager {
     }
 
     /// Creates insecure client config (for development only)
-    fn create_insecure_client_config() -> Result<ClientConfig, String> {
-        let mut crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
-            .with_no_client_auth();
+    /// The role parameter determines which ALPN protocol to advertise:
+    /// - ClientType::Client -> ALPN_CLIENT_PROTOCOL
+    /// - ClientType::Server -> ALPN_SERVER_PROTOCOL
+    ///
+    /// If cert_der and key_der are provided, the client will present a certificate
+    /// during TLS handshake (mutual TLS).
+    fn create_insecure_client_config(
+        role: ClientType,
+        cert_der: Option<&[u8]>,
+        key_der: Option<&[u8]>,
+    ) -> Result<ClientConfig, String> {
+        let mut crypto = match (cert_der, key_der) {
+            (Some(cert), Some(key)) => {
+                // Mutual TLS: client presents certificate
+                let cert_chain = vec![CertificateDer::from(cert.to_vec())];
+                let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec()));
 
-        crypto.alpn_protocols = vec![b"quic-example".to_vec()];
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .map_err(|e| format!("Failed to configure client certificate: {}", e))?
+            }
+            _ => {
+                // No client certificate
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
+                    .with_no_client_auth()
+            }
+        };
+
+        // Set ALPN based on role
+        crypto.alpn_protocols = match role {
+            ClientType::Client => vec![ALPN_CLIENT_PROTOCOL.to_vec()],
+            ClientType::Server => vec![ALPN_SERVER_PROTOCOL.to_vec()],
+        };
 
         let mut config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
@@ -908,22 +1081,27 @@ impl QuicNetworkManager {
         Ok(config)
     }
 
-    /// Creates self-signed server config (for development only)
-    fn create_self_signed_server_config() -> Result<ServerConfig, String> {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .map_err(|e| format!("Failed to generate certificate: {}", e))?;
-
-        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    /// Creates self-signed server config using provided DER-encoded certificate and key.
+    /// Accepts both ALPN_SERVER_PROTOCOL and ALPN_CLIENT_PROTOCOL for incoming connections.
+    /// Requests (but doesn't require) client certificates for mutual TLS.
+    fn create_self_signed_server_config(cert_der_bytes: &[u8], key_der_bytes: &[u8]) -> Result<ServerConfig, String> {
+        let cert_der = CertificateDer::from(cert_der_bytes.to_vec());
         let key_der = PrivateKeyDer::Pkcs8(
-            PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+            PrivatePkcs8KeyDer::from(key_der_bytes.to_vec())
         );
 
+        // Use custom client cert verifier that accepts all client certificates
+        // This enables mutual TLS where clients can optionally present certificates
         let mut server_crypto = rustls::ServerConfig::builder()
-            .with_no_client_auth()
+            .with_client_cert_verifier(SkipClientVerification::new())
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| format!("Failed to create server crypto config: {}", e))?;
 
-        server_crypto.alpn_protocols = vec![b"quic-example".to_vec()];
+        // Accept both ALPN protocols for incoming connections
+        server_crypto.alpn_protocols = vec![
+            ALPN_SERVER_PROTOCOL.to_vec(),
+            ALPN_CLIENT_PROTOCOL.to_vec(),
+        ];
 
         let mut server_config = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
@@ -938,10 +1116,18 @@ impl QuicNetworkManager {
         Ok(server_config)
     }
 
-    /// Ensures endpoint is initialized with client config
-    async fn ensure_client_endpoint(&mut self) -> Result<(), String> {
+    /// Ensures endpoint is initialized with client config for the specified role.
+    /// Also ensures a local certificate exists for mutual TLS.
+    async fn ensure_client_endpoint(&mut self, role: ClientType) -> Result<(), String> {
+        // Ensure we have a local certificate for mTLS
+        self.ensure_local_certificate()?;
+
         if self.endpoint.is_none() {
-            let client_config = Self::create_insecure_client_config()?;
+            let client_config = Self::create_insecure_client_config(
+                role,
+                self.local_cert_der.as_deref(),
+                self.local_key_der.as_deref(),
+            )?;
             let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
                 .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
             endpoint.set_default_client_config(client_config);
@@ -950,16 +1136,231 @@ impl QuicNetworkManager {
         Ok(())
     }
 
-    /// Connects and sends a CLIENT handshake
-    /// Returns Arc<dyn PeerConnection> for actor model compatibility
-    /// Connects and sends a CLIENT handshake
-    /// Returns Arc<dyn PeerConnection> for actor model compatibility
+    // ============================================================================
+    // CERTIFICATE AND PUBLIC KEY MANAGEMENT
+    // ============================================================================
+
+    /// Ensures a local certificate is generated and stored as DER bytes.
+    fn ensure_local_certificate(&mut self) -> Result<(), String> {
+        if self.local_cert_der.is_none() {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+                .map_err(|e| format!("Failed to generate certificate: {}", e))?;
+
+            // Store DER-encoded certificate and key
+            let cert_der = cert.cert.der().to_vec();
+            let key_der = cert.signing_key.serialize_der();
+
+            // Extract and store public key
+            let public_key = Self::extract_public_key_from_cert(&cert_der)?;
+            self.local_public_key = Some(public_key);
+
+            self.local_cert_der = Some(cert_der);
+            self.local_key_der = Some(key_der);
+            trace!("Generated and stored local certificate");
+        }
+        Ok(())
+    }
+
+    /// Extracts the SubjectPublicKeyInfo (SPKI) from a DER-encoded X.509 certificate
+    fn extract_public_key_from_cert(cert_der: &[u8]) -> Result<NodePublicKey, String> {
+        let (_, cert) = X509Certificate::from_der(cert_der)
+            .map_err(|e| format!("Failed to parse X.509 certificate: {:?}", e))?;
+
+        // Get the SubjectPublicKeyInfo in DER format
+        let spki = cert.public_key();
+        let spki_der = spki.raw.to_vec();
+
+        Ok(NodePublicKey(spki_der))
+    }
+
+    /// Extracts the peer's public key from a QUIC connection's TLS certificate chain
+    fn extract_peer_public_key(connection: &Connection) -> Result<NodePublicKey, String> {
+        let peer_identity = connection
+            .peer_identity()
+            .ok_or_else(|| "No peer identity available".to_string())?;
+
+        let certs = peer_identity
+            .downcast::<Vec<CertificateDer<'static>>>()
+            .map_err(|_| "Failed to downcast peer identity to certificate chain".to_string())?;
+
+        if certs.is_empty() {
+            return Err("Peer certificate chain is empty".to_string());
+        }
+
+        // Extract public key from the first (end-entity) certificate
+        Self::extract_public_key_from_cert(&certs[0])
+    }
+
+    // ============================================================================
+    // SENDER_ID COMPUTATION
+    // ============================================================================
+
+    /// Returns a sorted list of all public keys (local + peers).
+    /// The position in this list corresponds to the sender_id (0..N-1).
+    pub fn get_sorted_public_keys(&self) -> Vec<NodePublicKey> {
+        let mut all_keys: Vec<NodePublicKey> = Vec::new();
+
+        // Add local public key
+        if let Some(ref local_pk) = self.local_public_key {
+            all_keys.push(local_pk.clone());
+        }
+
+        // Add peer public keys
+        for entry in self.peer_public_keys.iter() {
+            all_keys.push(entry.value().clone());
+        }
+
+        // Sort lexicographically by DER bytes
+        all_keys.sort_by(|a, b| a.0.cmp(&b.0));
+        all_keys
+    }
+
+    /// Gets the public key for a given sender_id (0..N-1).
+    /// Returns None if sender_id is out of range.
+    pub fn get_public_key_for_sender_id(&self, sender_id: SenderId) -> Option<NodePublicKey> {
+        let sorted_keys = self.get_sorted_public_keys();
+        sorted_keys.get(sender_id.raw()).cloned()
+    }
+
+    /// Gets the sender_id (0..N-1) for a given public key.
+    /// Returns None if the public key is not known.
+    pub fn get_sender_id_for_public_key(&self, pk: &NodePublicKey) -> Option<SenderId> {
+        let sorted_keys = self.get_sorted_public_keys();
+        sorted_keys.iter().position(|k| k == pk).map(|pos| SenderId::new(pos))
+    }
+
+    /// Gets the connection for a given sender_id (0..N-1).
+    /// For MPC protocols, use this instead of direct connection lookup.
+    pub fn get_connection_by_sender_id(&self, sender_id: SenderId) -> Option<Arc<dyn PeerConnection>> {
+        let pk = self.get_public_key_for_sender_id(sender_id)?;
+
+        // Check if this is our own public key (loopback)
+        if Some(&pk) == self.local_public_key.as_ref() {
+            return self.server_connections.get(&self.node_id).map(|r| r.value().clone());
+        }
+
+        // Find the connection for this peer's public key
+        let derived_id = pk.derive_id();
+        self.server_connections.get(&derived_id).map(|r| r.value().clone())
+    }
+
+    /// Computes the sender_id by sorting all public keys (local + peers) lexicographically
+    /// and returning this node's position in the sorted list.
+    /// Returns None if local_public_key is not set.
+    pub fn compute_sender_id(&self) -> Option<SenderId> {
+        let local_pk = self.local_public_key.as_ref()?;
+        self.get_sender_id_for_public_key(local_pk)
+    }
+
+    /// Returns the computed sender_id, falling back to node_id if not computable
+    pub fn sender_id(&self) -> SenderId {
+        self.compute_sender_id().unwrap_or(self.node_id)
+    }
+
+    /// Checks if we have public keys from all expected parties
+    pub fn is_fully_connected(&self, expected_count: usize) -> bool {
+        // We need (expected_count - 1) peers since we don't count ourselves
+        self.peer_public_keys.len() >= expected_count.saturating_sub(1)
+            && self.local_public_key.is_some()
+    }
+
+    /// Returns the finalized sender_id only if fully connected to all expected parties
+    pub fn finalized_sender_id(&self, expected_count: usize) -> Option<SenderId> {
+        if self.is_fully_connected(expected_count) {
+            self.compute_sender_id()
+        } else {
+            None
+        }
+    }
+
+    /// Assigns sender_ids to all connections based on the sorted public key list.
+    /// Call this once all peers are connected to finalize sender_ids.
+    /// Returns the number of connections that were assigned sender_ids.
+    pub fn assign_sender_ids(&self) -> usize {
+        let sorted_keys = self.get_sorted_public_keys();
+        let mut assigned = 0;
+
+        // Assign sender_ids to server connections (except loopback)
+        for entry in self.server_connections.iter() {
+            let derived_id = *entry.key();
+            let conn = entry.value();
+
+            // Skip loopback - handle separately
+            if derived_id == self.node_id {
+                continue;
+            }
+
+            // Look up public key by derived_id
+            if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
+                let peer_pk = pk_entry.value();
+                if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
+                    conn.set_sender_id(SenderId::new(pos));
+                    assigned += 1;
+                }
+            }
+        }
+
+        // Assign sender_ids to client connections
+        for entry in self.client_connections.iter() {
+            let derived_id = *entry.key();
+            let conn = entry.value();
+
+            // Look up public key by derived_id
+            if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
+                let peer_pk = pk_entry.value();
+                if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
+                    conn.set_sender_id(SenderId::new(pos));
+                    assigned += 1;
+                }
+            }
+        }
+
+        // Assign sender_id to loopback connection
+        if let Some(local_pk) = &self.local_public_key {
+            if let Some(pos) = sorted_keys.iter().position(|k| k == local_pk) {
+                if let Some(loopback) = self.server_connections.get(&self.node_id) {
+                    loopback.set_sender_id(SenderId::new(pos));
+                    assigned += 1;
+                }
+            }
+        }
+
+        assigned
+    }
+
+    /// Returns the number of parties (local + peers)
+    pub fn party_count(&self) -> usize {
+        let local_count = if self.local_public_key.is_some() { 1 } else { 0 };
+        local_count + self.peer_public_keys.len()
+    }
+
+    /// Returns a reference to this node's public key
+    pub fn get_public_key(&self) -> Option<&NodePublicKey> {
+        self.local_public_key.as_ref()
+    }
+
+    /// Returns the node_id (legacy ID, used as fallback)
+    pub fn get_node_id(&self) -> SenderId {
+        self.node_id
+    }
+
+    /// Returns the ID derived from this node's public key.
+    /// Falls back to node_id if no certificate has been generated yet.
+    pub fn local_derived_id(&self) -> SenderId {
+        self.local_public_key
+            .as_ref()
+            .map(|pk| pk.derive_id())
+            .unwrap_or(self.node_id)
+    }
+
+    /// Connects as a CLIENT to a server (role identified via ALPN).
+    /// The server's ID is derived from its public key.
+    /// Returns Arc<dyn PeerConnection> for actor model compatibility.
     pub async fn connect_as_client(
         &mut self,
         address: SocketAddr,
-        client_id: ClientId,
     ) -> Result<Arc<dyn PeerConnection>, String> {
-        self.ensure_client_endpoint().await?;
+        self.ensure_client_endpoint(ClientType::Client).await?;
         self.ensure_loopback_installed().await;
 
         let endpoint = self.endpoint.as_ref().unwrap();
@@ -969,42 +1370,40 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-        // Open persistent stream and send handshake
-        let (mut send, mut recv) = connection.open_bi().await
+        // Verify ALPN negotiation resulted in client-protocol
+        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
+            warn!("ALPN extraction failed: {}, defaulting to Server", e);
+            ClientType::Server
+        });
+
+        // Extract peer's public key from TLS certificate
+        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+
+        // Open persistent stream and send sync byte to establish it
+        let (mut send, recv) = connection.open_bi().await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-        send_handshake(&mut send, "CLIENT", client_id).await
-            .map_err(|e| format!("Failed to send handshake: {}", e))?;
+        send_stream_sync(&mut send).await
+            .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
-        // Receive server's handshake response to get its PartyId
-        let server_handshake = recv_handshake(&mut recv).await
-            .map_err(|e| format!("Failed to receive server handshake: {}", e))?;
-
-        let mut connection_role = ClientType::Server;
-        // Determine the correct party_id to use
-        let party_id = if let Some((role, id)) = server_handshake {
-            connection_role = client_type_from_role(&role);
-            if role.eq_ignore_ascii_case("SERVER") {
-                // Server told us its PartyId - use it!
-                info!("Client {} connected to server with PartyId {}", client_id, id);
-
-                // Ensure node exists with this party_id
-                // if !self.nodes.iter().any(|n| n.id() == id) {
-                let node = QuicNode::from_party_id(id, address);
-                self.nodes.push(node);
-                // }
-
-                id
-            } else {
-                // Unexpected role, fallback to address-based lookup
-                warn!("Unexpected handshake role from server: {}", role);
-                self.fallback_node_lookup(address)
-            }
+        // Derive server's ID from its public key
+        let server_id = if let Some(ref pk) = peer_public_key {
+            pk.derive_id()
         } else {
-            // No handshake received, fallback to address-based lookup
-            warn!("No handshake received from server at {}", address);
+            warn!("Could not extract server public key from {}, using address-based ID", address);
             self.fallback_node_lookup(address)
         };
+
+        // Store peer's public key if available
+        if let Some(ref pk) = peer_public_key {
+            self.peer_public_keys.insert(server_id, pk.clone());
+            trace!("Stored public key for server {}", server_id);
+        }
+
+        // Ensure node exists
+        if !self.nodes.iter().any(|n| n.id() == server_id) {
+            self.nodes.push(QuicNode::from_party_id(server_id, address));
+        }
 
         // Create Arc-wrapped connection
         let conn = Arc::new(QuicPeerConnection::new(
@@ -1012,11 +1411,17 @@ impl QuicNetworkManager {
             send,
             recv,
             connection_role,
+            peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
-        // Store connection with the correct party_id
-        self.connections.insert(party_id, Arc::clone(&conn));
-        info!("Client {} stored connection to server PartyId {} at {}", client_id, party_id, address);
+        // Store connection with the server's derived ID
+        self.server_connections.insert(server_id, Arc::clone(&conn));
+
+        // Log our own derived client ID for debugging
+        let client_id = self.local_public_key.as_ref()
+            .map(|pk| pk.derive_id())
+            .unwrap_or(self.node_id);
+        info!("Client {} connected to server {} at {}", client_id, server_id, address);
 
         Ok(conn)
     }
@@ -1035,14 +1440,14 @@ impl QuicNetworkManager {
             })
     }
 
-    /// Connects and sends a SERVER handshake
-    /// Returns Arc<dyn PeerConnection> for actor model compatibility
+    /// Connects as a SERVER to another server (role identified via ALPN).
+    /// The peer's ID is derived from its public key.
+    /// Returns Arc<dyn PeerConnection> for actor model compatibility.
     pub async fn connect_as_server(
         &mut self,
         address: SocketAddr,
-        party_id: PartyId,
     ) -> Result<Arc<dyn PeerConnection>, String> {
-        self.ensure_client_endpoint().await?;
+        self.ensure_client_endpoint(ClientType::Server).await?;
         self.ensure_loopback_installed().await;
 
         let endpoint = self.endpoint.as_ref().unwrap();
@@ -1052,33 +1457,40 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-        // Open persistent stream and send handshake
-        let (mut send, mut recv) = connection.open_bi().await
+        // Verify ALPN negotiation - we expect the peer to see server-protocol
+        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
+            warn!("ALPN extraction failed: {}, defaulting to Server", e);
+            ClientType::Server
+        });
+
+        // Extract peer's public key from TLS certificate
+        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+
+        // Open persistent stream and send sync byte to establish it
+        let (mut send, recv) = connection.open_bi().await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-        send_handshake(&mut send, "SERVER", party_id).await
-            .map_err(|e| format!("Failed to send handshake: {}", e))?;
+        send_stream_sync(&mut send).await
+            .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
-        let server_handshake = recv_handshake(&mut recv).await
-            .map_err(|e| format!("Failed to receive server handshake response: {}", e))?;
-
-        let mut connection_role = ClientType::Server;
-        // Find or create node and store connection
-        let node_id = if let Some((role, id)) = server_handshake {
-            connection_role = client_type_from_role(&role);
-            if role.eq_ignore_ascii_case("SERVER") {
-                if !self.nodes.iter().any(|n| n.id() == id) {
-                    self.nodes.push(QuicNode::from_party_id(id, address));
-                }
-                id
-            } else {
-                warn!("Unexpected handshake role '{}' from server at {}", role, address);
-                self.fallback_node_lookup(address)
-            }
+        // Derive peer's ID from its public key
+        let peer_id = if let Some(ref pk) = peer_public_key {
+            pk.derive_id()
         } else {
-            warn!("No handshake received from server at {}", address);
+            warn!("Could not extract peer public key from {}, using address-based ID", address);
             self.fallback_node_lookup(address)
         };
+
+        // Store peer's public key if available
+        if let Some(ref pk) = peer_public_key {
+            self.peer_public_keys.insert(peer_id, pk.clone());
+            trace!("Stored public key for peer {}", peer_id);
+        }
+
+        // Ensure node exists
+        if !self.nodes.iter().any(|n| n.id() == peer_id) {
+            self.nodes.push(QuicNode::from_party_id(peer_id, address));
+        }
 
         // Create Arc-wrapped connection
         let conn = Arc::new(QuicPeerConnection::new(
@@ -1086,9 +1498,16 @@ impl QuicNetworkManager {
             send,
             recv,
             connection_role,
+            peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
-        self.connections.insert(node_id, Arc::clone(&conn));
+        self.server_connections.insert(peer_id, Arc::clone(&conn));
+
+        // Log our own derived ID for debugging
+        let our_id = self.local_public_key.as_ref()
+            .map(|pk| pk.derive_id())
+            .unwrap_or(self.node_id);
+        info!("Server {} connected to peer {} at {}", our_id, peer_id, address);
 
         Ok(conn)
     }
@@ -1103,7 +1522,7 @@ impl QuicNetworkManager {
     }
 
     /// Returns the local party ID
-    pub fn party_id(&self) -> PartyId {
+    pub fn party_id(&self) -> SenderId {
         self.node_id
     }
 
@@ -1376,30 +1795,15 @@ impl QuicNetworkManager {
             .set_remote_candidates(target_party_id, remote_ufrag, remote_pwd, remote_candidates)
             .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
 
-        // Store agent for potential later use
-        self.pending_ice_agents.insert(
-            target_party_id,
-            Arc::new(Mutex::new(ice_agent)),
-        );
-
         // 5. Ensure endpoint exists
-        self.ensure_client_endpoint().await?;
+        self.ensure_client_endpoint(ClientType::Server).await?;
         let endpoint = self.endpoint.as_ref().unwrap();
 
-        // 6. Get the agent back and run connectivity checks
-        let agent_arc = self
-            .pending_ice_agents
-            .get(&target_party_id)
-            .map(|e| Arc::clone(e.value()))
-            .ok_or("ICE agent not found")?;
-
-        let nominated_pair = {
-            let mut agent = agent_arc.lock().await;
-            agent
-                .run_connectivity_checks(endpoint)
-                .await
-                .map_err(|e| format!("ICE connectivity checks failed: {}", e))?
-        };
+        // 6. Run connectivity checks
+        let nominated_pair = ice_agent
+            .run_connectivity_checks(endpoint)
+            .await
+            .map_err(|e| format!("ICE connectivity checks failed: {}", e))?;
 
         info!(
             "ICE completed: {} -> {} (RTT: {:?}ms)",
@@ -1408,6 +1812,9 @@ impl QuicNetworkManager {
             nominated_pair.rtt_ms
         );
 
+        // Store agent for potential later use
+        self.pending_ice_agents.insert(target_party_id, ice_agent);
+
         // 7. Establish QUIC connection on the successful pair
         let connection = endpoint
             .connect(nominated_pair.remote.address, "localhost")
@@ -1415,35 +1822,34 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-        // Open stream and perform handshake
-        let (mut send, mut recv) = connection
+        // Get connection role from ALPN negotiation
+        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
+            warn!("ALPN extraction failed: {}, defaulting to Server", e);
+            ClientType::Server
+        });
+
+        // Extract peer's public key from TLS certificate
+        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+
+        // Open stream and sync
+        let (mut send, recv) = connection
             .open_bi()
             .await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-        send_handshake(&mut send, "SERVER", self.node_id)
-            .await
-            .map_err(|e| format!("Failed to send handshake: {}", e))?;
-
-        let handshake = recv_handshake(&mut recv)
-            .await
-            .map_err(|e| format!("Failed to receive handshake: {}", e))?;
-
-        let connection_role = if let Some((role, _)) = handshake {
-            client_type_from_role(&role)
-        } else {
-            ClientType::Server
-        };
+        send_stream_sync(&mut send).await
+            .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
         let conn = Arc::new(QuicPeerConnection::new(
             connection,
             send,
             recv,
             connection_role,
+            peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
         // Store connection
-        self.connections.insert(target_party_id, Arc::clone(&conn));
+        self.server_connections.insert(target_party_id, Arc::clone(&conn));
 
         // Cleanup ICE agent
         self.pending_ice_agents.remove(&target_party_id);
@@ -1520,7 +1926,7 @@ impl QuicNetworkManager {
             .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
 
         // 4. Run connectivity checks
-        self.ensure_client_endpoint().await?;
+        self.ensure_client_endpoint(ClientType::Server).await?;
         let endpoint = self.endpoint.as_ref().unwrap();
 
         let nominated_pair = ice_agent
@@ -1544,28 +1950,29 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
-        let (mut send, mut recv) = connection
+        // Get connection role from ALPN negotiation
+        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
+            warn!("ALPN extraction failed: {}, defaulting to Server", e);
+            ClientType::Server
+        });
+
+        // Extract peer's public key from TLS certificate
+        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+
+        let (send, recv) = connection
             .accept_bi()
             .await
             .map_err(|e| format!("Failed to accept stream: {}", e))?;
-
-        // Read and respond to handshake
-        let _handshake = recv_handshake(&mut recv)
-            .await
-            .map_err(|e| format!("Failed to read handshake: {}", e))?;
-
-        send_handshake(&mut send, "SERVER", self.node_id)
-            .await
-            .map_err(|e| format!("Failed to send handshake: {}", e))?;
 
         let conn = Arc::new(QuicPeerConnection::new(
             connection,
             send,
             recv,
-            ClientType::Server,
+            connection_role,
+            peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
-        self.connections.insert(from_party_id, Arc::clone(&conn));
+        self.server_connections.insert(from_party_id, Arc::clone(&conn));
 
         Ok(conn)
     }
@@ -1588,7 +1995,7 @@ impl QuicNetworkManager {
 
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
-                self.connect_as_server(addr, self.node_id),
+                self.connect_as_server(addr),
             )
             .await;
 
@@ -1683,7 +2090,7 @@ impl NetworkManager for QuicNetworkManager {
         address: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
         Box::pin(async move {
-            self.connect_as_server(address, self.node_id).await
+            self.connect_as_server(address).await
         })
     }
 
@@ -1702,81 +2109,78 @@ impl NetworkManager for QuicNetworkManager {
 
             let remote_addr = connection.remote_address();
 
-            // Accept persistent stream and read handshake
-            let (mut send, mut recv) = connection.accept_bi().await
+            // Extract role from ALPN protocol negotiation
+            let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
+                warn!("ALPN extraction failed during accept: {}, defaulting to Server", e);
+                ClientType::Server
+            });
+
+            // Extract peer's public key from TLS certificate (mTLS)
+            let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+
+            // Accept persistent stream and receive sync byte
+            let (send, mut recv) = connection.accept_bi().await
                 .map_err(|e| format!("Failed to accept stream: {}", e))?;
 
-            let parsed_role = recv_handshake(&mut recv).await
-                .map_err(|e| format!("Failed to read handshake: {}", e))?;
+            recv_stream_sync(&mut recv).await
+                .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
-            match parsed_role {
-                Some((role, id)) if role.eq_ignore_ascii_case("CLIENT") => {
-                    // Send our party_id back to the client so it knows who we are
-                    send_handshake(&mut send, "SERVER", self.node_id).await
-                        .map_err(|e| format!("Failed to send handshake response: {}", e))?;
+            // Derive peer ID from public key, or fallback to address-based lookup
+            let peer_id = if let Some(ref pk) = peer_public_key {
+                pk.derive_id()
+            } else {
+                warn!("No peer public key available from {}, using address-based ID", remote_addr);
+                // Fallback: use address-based lookup
+                self.nodes.iter()
+                    .find(|n| n.address() == remote_addr)
+                    .map(|n| n.id())
+                    .unwrap_or_else(|| {
+                        let node = QuicNode::new_with_random_id(remote_addr);
+                        let id = node.id();
+                        self.nodes.push(node);
+                        id
+                    })
+            };
 
-                    // Create Arc-wrapped connection AFTER sending handshake
-                    let conn = Arc::new(QuicPeerConnection::new(
-                        connection.clone(),
-                        send,
-                        recv,
-                        ClientType::Client,
-                    )) as Arc<dyn PeerConnection>;
+            // Create Arc-wrapped connection
+            let conn = Arc::new(QuicPeerConnection::new(
+                connection.clone(),
+                send,
+                recv,
+                connection_role,
+                peer_public_key.clone(),
+            )) as Arc<dyn PeerConnection>;
+
+            match connection_role {
+                ClientType::Client => {
+                    // Client connection identified via ALPN
+                    info!("Accepted client connection from {} with derived ID {}", remote_addr, peer_id);
 
                     // Store as client connection
-                    self.client_connections.insert(id, Arc::clone(&conn));
-                    self.client_ids.insert(id);
-
-                    Ok(conn)
+                    self.client_connections.insert(peer_id, Arc::clone(&conn));
+                    self.client_ids.insert(peer_id);
                 }
-                Some((role, id)) if role.eq_ignore_ascii_case("SERVER") => {
-                    // Server-to-server connection: send handshake response
-                    send_handshake(&mut send, "SERVER", self.node_id).await
-                        .map_err(|e| format!("Failed to send handshake response: {}", e))?;
+                ClientType::Server => {
+                    // Server-to-server connection identified via ALPN
+                    info!("Accepted server connection from {} with derived ID {}", remote_addr, peer_id);
 
-                    // Create Arc-wrapped connection
-                    let conn = Arc::new(QuicPeerConnection::new(
-                        connection.clone(),
-                        send,
-                        recv,
-                        ClientType::Server,
-                    )) as Arc<dyn PeerConnection>;
+                    // Store peer's public key if available
+                    if let Some(pk) = peer_public_key {
+                        self.peer_public_keys.insert(peer_id, pk);
+                        trace!("Stored public key for peer {}", peer_id);
+                    }
 
                     // Ensure node exists
-                    if !self.nodes.iter().any(|n| n.id() == id) {
-                        self.nodes.push(QuicNode::from_party_id(id, remote_addr));
+                    if !self.nodes.iter().any(|n| n.id() == peer_id) {
+                        self.nodes.push(QuicNode::from_party_id(peer_id, remote_addr));
                     }
 
                     // Store connection
-                    self.connections.insert(id, Arc::clone(&conn));
-
-                    Ok(conn)
-                }
-                _ => {
-                    // Fallback: address-based mapping
-                    // Create Arc-wrapped connection
-                    let conn = Arc::new(QuicPeerConnection::new(
-                        connection.clone(),
-                        send,
-                        recv,
-                        ClientType::Server,
-                    )) as Arc<dyn PeerConnection>;
-
-                    let node_id = self.nodes.iter()
-                        .find(|n| n.address() == remote_addr)
-                        .map(|n| n.id())
-                        .unwrap_or_else(|| {
-                            let node = QuicNode::new_with_random_id(remote_addr);
-                            let id = node.id();
-                            self.nodes.push(node);
-                            id
-                        });
-
-                    self.connections.insert(node_id, Arc::clone(&conn));
-
-                    Ok(conn)
+                    self.server_connections.insert(peer_id, Arc::clone(&conn));
                 }
             }
+
+            Ok(conn)
         })
     }
 
@@ -1785,11 +2189,21 @@ impl NetworkManager for QuicNetworkManager {
         bind_address: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            let server_config = Self::create_self_signed_server_config()?;
+            // Ensure we have a local certificate
+            self.ensure_local_certificate()?;
+            let cert_der = self.local_cert_der.as_ref().unwrap();
+            let key_der = self.local_key_der.as_ref().unwrap();
+
+            let server_config = Self::create_self_signed_server_config(cert_der, key_der)?;
             let mut endpoint = Endpoint::server(server_config, bind_address)
                 .map_err(|e| format!("Failed to create server endpoint: {}", e))?;
 
-            let client_config = Self::create_insecure_client_config()?;
+            // Default client config for outgoing connections uses Server role with mTLS
+            let client_config = Self::create_insecure_client_config(
+                ClientType::Server,
+                Some(cert_der),
+                Some(key_der),
+            )?;
             endpoint.set_default_client_config(client_config);
 
             self.endpoint = Some(endpoint);
@@ -1809,72 +2223,64 @@ impl Network for QuicNetworkManager {
     type NetworkConfig = QuicNetworkConfig;
 
     async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
-        if let Some(connection_ref) = self.connections.get(&recipient) {
-            let connection = connection_ref.value();
+        // Use sender_id-based lookup for MPC protocols (recipient is a sender_id 0..N-1)
+        let connection = self.get_connection_by_sender_id(recipient)
+            .ok_or(NetworkError::PartyNotFound(recipient))?;
 
-            // Check if connection is still alive
-            if !connection.is_connected().await {
-                debug!("Connection to recipient {} is dead, removing from map", recipient);
-                drop(connection_ref);
+        // Check if connection is still alive
+        if !connection.is_connected().await {
+            debug!("Connection to recipient {} is dead", recipient);
+            self.cleanup_dead_connections().await;
+            return Err(NetworkError::PartyNotFound(recipient));
+        }
+
+        match connection.send(message).await {
+            Ok(_) => {
+                debug!("Successfully sent message to recipient {}", recipient);
+                Ok(message.len())
+            }
+            Err(e) => {
+                debug!("Failed to send message to recipient {}: {}", recipient, e);
                 self.cleanup_dead_connections().await;
-                return Err(NetworkError::PartyNotFound(recipient));
+                Err(NetworkError::SendError)
             }
-
-            match connection.send(message).await {
-                Ok(_) => {
-                    debug!("Successfully sent message to recipient {}", recipient);
-                    Ok(message.len())
-                }
-                Err(e) => {
-                    debug!("Failed to send message to recipient {}: {}", recipient, e);
-                    // Connection might be dead, mark for cleanup
-                    drop(connection_ref);
-                    self.cleanup_dead_connections().await;
-                    Err(NetworkError::SendError)
-                }
-            }
-        } else {
-            Err(NetworkError::PartyNotFound(recipient))
         }
     }
 
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
         let mut total_bytes = 0usize;
-        let mut included_self = false;
+        let party_count = self.party_count();
 
-        for node in &self.nodes {
-            if let Some(connection_ref) = self.connections.get(&node.id()) {
-                let connection = connection_ref.value();
-
+        // Broadcast to all parties using sender_id (0..N-1)
+        for sender_id_raw in 0..party_count {
+            let sender_id = SenderId::new(sender_id_raw);
+            if let Some(connection) = self.get_connection_by_sender_id(sender_id) {
                 // Check connection health before sending
                 if !connection.is_connected().await {
-                    debug!("Skipping broadcast to node {}: connection is dead", node.id());
+                    debug!("Skipping broadcast to sender_id {}: connection is dead", sender_id);
                     continue;
                 }
 
                 match connection.send(message).await {
                     Ok(_) => {
-                        debug!("Successfully broadcasted message to node {}", node.id());
+                        debug!("Successfully broadcasted message to sender_id {}", sender_id);
                         total_bytes += message.len();
-                        if node.id() == self.node_id {
-                            included_self = true;
-                        }
                     }
                     Err(e) => {
-                        debug!("Failed to broadcast message to node {}: {}", node.id(), e);
+                        debug!("Failed to broadcast message to sender_id {}: {}", sender_id, e);
                     }
                 }
             } else {
-                debug!("Warning: No connection to node {}, skipping broadcast", node.id());
+                debug!("Warning: No connection for sender_id {}, skipping broadcast", sender_id);
             }
         }
 
-        // Ensure self-delivery via loopback
-        if !included_self {
-            if let Some(connection_ref) = self.connections.get(&self.node_id) {
+        // If no parties found, try legacy loopback as fallback
+        if party_count == 0 {
+            if let Some(connection_ref) = self.server_connections.get(&self.node_id) {
                 let connection = connection_ref.value();
                 if connection.is_connected().await && connection.send(message).await.is_ok() {
-                    debug!("Successfully broadcasted message to self (loopback)");
+                    debug!("Successfully broadcasted message to self (loopback fallback)");
                     total_bytes += message.len();
                 }
             }
@@ -1935,9 +2341,77 @@ impl Network for QuicNetworkManager {
 }
 
 // ============================================================================
-// CERTIFICATE VERIFIER (Development Only)
+// CERTIFICATE VERIFIERS (Development Only)
 // ============================================================================
 
+/// Client certificate verifier that accepts all client certificates without verification.
+/// DEVELOPMENT ONLY - do not use in production.
+#[derive(Debug)]
+struct SkipClientVerification;
+
+impl SkipClientVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for SkipClientVerification {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        // Accept all client certificates without verification
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        // Client certificates are optional - clients without certs can still connect
+        false
+    }
+}
+
+/// Server certificate verifier that accepts all server certificates without verification.
+/// DEVELOPMENT ONLY - do not use in production.
 #[derive(Debug)]
 struct SkipServerVerification;
 
@@ -1991,5 +2465,796 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transports::net_envelope::NetEnvelope;
+
+    // Helper function to ensure crypto provider is installed
+    fn ensure_crypto_provider() {
+        // Install the default crypto provider (ring) if not already installed
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    // ========================================================================
+    // ALPN Constants Tests
+    // ========================================================================
+
+    #[test]
+    fn test_alpn_constants_are_distinct() {
+        assert_ne!(ALPN_CLIENT_PROTOCOL, ALPN_SERVER_PROTOCOL);
+        assert_eq!(ALPN_CLIENT_PROTOCOL, b"client-protocol");
+        assert_eq!(ALPN_SERVER_PROTOCOL, b"server-protocol");
+    }
+
+    // ========================================================================
+    // Certificate and Public Key Tests
+    // ========================================================================
+
+    #[test]
+    fn test_certificate_generation_and_public_key_extraction() {
+        // Generate a self-signed certificate
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("Failed to generate certificate");
+
+        let cert_der = cert.cert.der().to_vec();
+
+        // Extract public key
+        let public_key = QuicNetworkManager::extract_public_key_from_cert(&cert_der)
+            .expect("Failed to extract public key");
+
+        // Public key should not be empty
+        assert!(!public_key.0.is_empty());
+
+        // Public key should be valid DER-encoded SPKI (starts with SEQUENCE tag 0x30)
+        assert_eq!(public_key.0[0], 0x30, "Public key should start with SEQUENCE tag");
+    }
+
+    #[test]
+    fn test_different_certificates_have_different_public_keys() {
+        let cert1 = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("Failed to generate certificate 1");
+        let cert2 = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("Failed to generate certificate 2");
+
+        let pk1 = QuicNetworkManager::extract_public_key_from_cert(cert1.cert.der())
+            .expect("Failed to extract pk1");
+        let pk2 = QuicNetworkManager::extract_public_key_from_cert(cert2.cert.der())
+            .expect("Failed to extract pk2");
+
+        // Different certificates should have different public keys
+        assert_ne!(pk1, pk2);
+    }
+
+    #[test]
+    fn test_same_certificate_same_public_key() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("Failed to generate certificate");
+
+        let pk1 = QuicNetworkManager::extract_public_key_from_cert(cert.cert.der())
+            .expect("Failed to extract pk1");
+        let pk2 = QuicNetworkManager::extract_public_key_from_cert(cert.cert.der())
+            .expect("Failed to extract pk2");
+
+        // Same certificate should yield same public key
+        assert_eq!(pk1, pk2);
+    }
+
+    #[test]
+    fn test_ensure_local_certificate() {
+        let mut manager = QuicNetworkManager::new();
+
+        // Initially no certificate
+        assert!(manager.local_cert_der.is_none());
+        assert!(manager.local_key_der.is_none());
+        assert!(manager.local_public_key.is_none());
+
+        // Ensure certificate is created
+        manager.ensure_local_certificate().expect("Failed to ensure certificate");
+
+        // Now should have certificate
+        assert!(manager.local_cert_der.is_some());
+        assert!(manager.local_key_der.is_some());
+        assert!(manager.local_public_key.is_some());
+
+        // Store references for comparison
+        let cert_der = manager.local_cert_der.clone();
+        let public_key = manager.local_public_key.clone();
+
+        // Calling again should not change the certificate
+        manager.ensure_local_certificate().expect("Failed on second call");
+
+        assert_eq!(manager.local_cert_der, cert_der);
+        assert_eq!(manager.local_public_key, public_key);
+    }
+
+    // ========================================================================
+    // NodePublicKey Tests
+    // ========================================================================
+
+    #[test]
+    fn test_node_public_key_ordering() {
+        let pk1 = NodePublicKey(vec![0x00, 0x01, 0x02]);
+        let pk2 = NodePublicKey(vec![0x00, 0x01, 0x03]);
+        let pk3 = NodePublicKey(vec![0x00, 0x02, 0x01]);
+
+        // Test ordering
+        assert!(pk1 < pk2);
+        assert!(pk2 < pk3);
+        assert!(pk1 < pk3);
+    }
+
+    #[test]
+    fn test_node_public_key_equality() {
+        let pk1 = NodePublicKey(vec![0x00, 0x01, 0x02]);
+        let pk2 = NodePublicKey(vec![0x00, 0x01, 0x02]);
+        let pk3 = NodePublicKey(vec![0x00, 0x01, 0x03]);
+
+        assert_eq!(pk1, pk2);
+        assert_ne!(pk1, pk3);
+    }
+
+    #[test]
+    fn test_node_public_key_clone() {
+        let pk1 = NodePublicKey(vec![0x00, 0x01, 0x02]);
+        let pk2 = pk1.clone();
+
+        assert_eq!(pk1, pk2);
+    }
+
+    // ========================================================================
+    // sender_id Computation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_compute_sender_id_no_local_key() {
+        let manager = QuicNetworkManager::new();
+
+        // Without local public key, compute_sender_id should return None
+        assert!(manager.compute_sender_id().is_none());
+    }
+
+    #[test]
+    fn test_compute_sender_id_single_node() {
+        let mut manager = QuicNetworkManager::new();
+        manager.ensure_local_certificate().expect("Failed to ensure certificate");
+
+        // With only local node, sender_id should be 0
+        let sender_id = manager.compute_sender_id();
+        assert_eq!(sender_id, Some(SenderId::new(0)));
+    }
+
+    #[test]
+    fn test_compute_sender_id_multiple_nodes() {
+        let mut manager = QuicNetworkManager::new();
+        manager.ensure_local_certificate().expect("Failed to ensure certificate");
+
+        let local_pk = manager.local_public_key.clone().unwrap();
+
+        // Add peer public keys that are lexicographically before and after local
+        let pk_before = NodePublicKey(vec![0x00]); // Likely before any real key
+        let pk_after = NodePublicKey(vec![0xFF; 1000]); // Likely after any real key
+
+        manager.peer_public_keys.insert(SenderId::new(1), pk_before);
+        manager.peer_public_keys.insert(SenderId::new(2), pk_after);
+
+        // Compute sender_id
+        let sender_id = manager.compute_sender_id().expect("Should compute sender_id");
+
+        // Local key should be in the middle (position 1)
+        // Since pk_before < local_pk < pk_after when sorted
+        assert_eq!(sender_id, SenderId::new(1));
+    }
+
+    #[test]
+    fn test_compute_sender_id_deterministic_ordering() {
+        // Create three managers and ensure they compute consistent sender_ids
+        let mut manager1 = QuicNetworkManager::new();
+        let mut manager2 = QuicNetworkManager::new();
+        let mut manager3 = QuicNetworkManager::new();
+
+        manager1.ensure_local_certificate().unwrap();
+        manager2.ensure_local_certificate().unwrap();
+        manager3.ensure_local_certificate().unwrap();
+
+        let pk1 = manager1.local_public_key.clone().unwrap();
+        let pk2 = manager2.local_public_key.clone().unwrap();
+        let pk3 = manager3.local_public_key.clone().unwrap();
+
+        // Simulate full connectivity - each manager knows about others
+        manager1.peer_public_keys.insert(SenderId::new(2), pk2.clone());
+        manager1.peer_public_keys.insert(SenderId::new(3), pk3.clone());
+
+        manager2.peer_public_keys.insert(SenderId::new(1), pk1.clone());
+        manager2.peer_public_keys.insert(SenderId::new(3), pk3.clone());
+
+        manager3.peer_public_keys.insert(SenderId::new(1), pk1.clone());
+        manager3.peer_public_keys.insert(SenderId::new(2), pk2.clone());
+
+        // Compute sender_ids
+        let id1 = manager1.compute_sender_id().unwrap();
+        let id2 = manager2.compute_sender_id().unwrap();
+        let id3 = manager3.compute_sender_id().unwrap();
+
+        // All sender_ids should be distinct and in range [0, 2]
+        let mut ids = vec![id1, id2, id3];
+        ids.sort();
+        assert_eq!(ids, vec![SenderId::new(0), SenderId::new(1), SenderId::new(2)]);
+    }
+
+    #[test]
+    fn test_sender_id_fallback() {
+        let manager = QuicNetworkManager::new();
+        let node_id = manager.node_id;
+
+        // Without local certificate, sender_id() should fallback to node_id
+        assert_eq!(manager.sender_id(), node_id);
+    }
+
+    #[test]
+    fn test_is_fully_connected() {
+        let mut manager = QuicNetworkManager::new();
+
+        // Not fully connected without local key
+        assert!(!manager.is_fully_connected(3));
+
+        manager.ensure_local_certificate().unwrap();
+
+        // With local key only, need 0 peers for count=1
+        assert!(manager.is_fully_connected(1));
+
+        // For count=3, need 2 peers
+        assert!(!manager.is_fully_connected(3));
+
+        manager.peer_public_keys.insert(SenderId::new(1), NodePublicKey(vec![0x01]));
+        assert!(!manager.is_fully_connected(3)); // Still need 1 more
+
+        manager.peer_public_keys.insert(SenderId::new(2), NodePublicKey(vec![0x02]));
+        assert!(manager.is_fully_connected(3)); // Now fully connected
+    }
+
+    #[test]
+    fn test_finalized_sender_id() {
+        let mut manager = QuicNetworkManager::new();
+        manager.ensure_local_certificate().unwrap();
+
+        // Not fully connected yet
+        assert!(manager.finalized_sender_id(3).is_none());
+
+        manager.peer_public_keys.insert(SenderId::new(1), NodePublicKey(vec![0x01]));
+        manager.peer_public_keys.insert(SenderId::new(2), NodePublicKey(vec![0x02]));
+
+        // Now fully connected
+        let finalized = manager.finalized_sender_id(3);
+        assert!(finalized.is_some());
+    }
+
+    // ========================================================================
+    // Client Config Tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_client_config_for_client_role() {
+        ensure_crypto_provider();
+        let config = QuicNetworkManager::create_insecure_client_config(ClientType::Client, None, None);
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_create_client_config_for_server_role() {
+        ensure_crypto_provider();
+        let config = QuicNetworkManager::create_insecure_client_config(ClientType::Server, None, None);
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_create_client_config_with_certificate() {
+        ensure_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("Failed to generate certificate");
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let config = QuicNetworkManager::create_insecure_client_config(
+            ClientType::Client,
+            Some(&cert_der),
+            Some(&key_der),
+        );
+        assert!(config.is_ok());
+    }
+
+    // ========================================================================
+    // Server Config Tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_server_config() {
+        ensure_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("Failed to generate certificate");
+
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let config = QuicNetworkManager::create_self_signed_server_config(&cert_der, &key_der);
+        assert!(config.is_ok());
+    }
+
+    // ========================================================================
+    // NetEnvelope Tests
+    // ========================================================================
+
+    #[test]
+    fn test_net_envelope_handshake_serialization() {
+        let envelope = NetEnvelope::Handshake { id: 42 };
+        let bytes = envelope.serialize();
+
+        let deserialized = NetEnvelope::try_deserialize(&bytes)
+            .expect("Failed to deserialize");
+
+        match deserialized {
+            NetEnvelope::Handshake { id } => assert_eq!(id, 42),
+            _ => panic!("Expected Handshake variant"),
+        }
+    }
+
+    #[test]
+    fn test_net_envelope_honeybadger_serialization() {
+        let data = vec![1, 2, 3, 4, 5];
+        let envelope = NetEnvelope::HoneyBadger(data.clone());
+        let bytes = envelope.serialize();
+
+        let deserialized = NetEnvelope::try_deserialize(&bytes)
+            .expect("Failed to deserialize");
+
+        match deserialized {
+            NetEnvelope::HoneyBadger(d) => assert_eq!(d, data),
+            _ => panic!("Expected HoneyBadger variant"),
+        }
+    }
+
+    // ========================================================================
+    // QuicNetworkManager Integration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_manager_initialization() {
+        let manager = QuicNetworkManager::new();
+
+        assert!(manager.endpoint.is_none());
+        assert!(manager.nodes.is_empty());
+        assert!(manager.server_connections.is_empty());
+        assert!(manager.client_connections.is_empty());
+        assert!(manager.client_ids.is_empty());
+        assert!(manager.local_cert_der.is_none());
+        assert!(manager.local_key_der.is_none());
+        assert!(manager.local_public_key.is_none());
+        assert!(manager.peer_public_keys.is_empty());
+    }
+
+    #[test]
+    fn test_manager_with_node_id() {
+        let custom_id = SenderId::new(12345);
+        let manager = QuicNetworkManager::with_node_id(custom_id);
+
+        assert_eq!(manager.node_id, custom_id);
+        assert_eq!(manager.get_node_id(), custom_id);
+    }
+
+    #[test]
+    fn test_get_public_key() {
+        let mut manager = QuicNetworkManager::new();
+
+        // Initially no public key
+        assert!(manager.get_public_key().is_none());
+
+        manager.ensure_local_certificate().unwrap();
+
+        // Now should have public key
+        assert!(manager.get_public_key().is_some());
+    }
+
+    // ========================================================================
+    // Async Integration Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_listen_creates_endpoint_and_certificate() {
+        ensure_crypto_provider();
+        let mut manager = QuicNetworkManager::new();
+
+        // Listen on a random port
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        manager.listen(addr).await.expect("Failed to listen");
+
+        // Should have endpoint now
+        assert!(manager.endpoint.is_some());
+
+        // Should have certificate
+        assert!(manager.local_cert_der.is_some());
+        assert!(manager.local_key_der.is_some());
+        assert!(manager.local_public_key.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_loopback_installed_after_listen() {
+        ensure_crypto_provider();
+        let mut manager = QuicNetworkManager::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        manager.listen(addr).await.expect("Failed to listen");
+
+        // Loopback should be installed
+        assert!(manager.server_connections.contains_key(&manager.node_id));
+    }
+
+    #[tokio::test]
+    async fn test_server_to_server_connection() {
+        ensure_crypto_provider();
+        // Create two managers
+        let mut server1 = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut server2 = QuicNetworkManager::with_node_id(SenderId::new(2));
+
+        // Start listening on server1
+        let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        server1.listen(addr1).await.expect("Failed to start server1");
+
+        // Get actual bound address
+        let bound_addr = server1.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        // Server2 connects to server1 as a server (ID is derived from public key)
+        let conn_task = tokio::spawn(async move {
+            let result = server2.connect_as_server(bound_addr).await;
+            (server2, result)
+        });
+
+        // Server1 accepts the connection
+        let accept_result = server1.accept().await;
+
+        // Wait for connection task
+        let (server2, connect_result) = conn_task.await.unwrap();
+
+        // Both should succeed
+        assert!(accept_result.is_ok(), "Accept failed: {:?}", accept_result.err());
+        assert!(connect_result.is_ok(), "Connect failed: {:?}", connect_result.err());
+
+        // Check that connections were stored with derived IDs
+        // Server1 should have a connection to server2 (by server2's derived ID)
+        let server2_derived_id = server2.local_derived_id();
+        assert!(server1.server_connections.contains_key(&server2_derived_id),
+            "server1 should have connection to server2 with derived ID {}", server2_derived_id);
+    }
+
+    #[tokio::test]
+    async fn test_client_to_server_connection() {
+        ensure_crypto_provider();
+        // Create server and client managers
+        let mut server = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut client = QuicNetworkManager::with_node_id(SenderId::new(100));
+
+        // Start listening on server
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        server.listen(addr).await.expect("Failed to start server");
+
+        let bound_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        // Client connects to server (ID is derived from public key)
+        let conn_task = tokio::spawn(async move {
+            let result = client.connect_as_client(bound_addr).await;
+            (client, result)
+        });
+
+        // Server accepts the connection
+        let accept_result = server.accept().await;
+
+        // Wait for connection task
+        let (client, connect_result) = conn_task.await.unwrap();
+
+        // Both should succeed
+        assert!(accept_result.is_ok(), "Accept failed: {:?}", accept_result.err());
+        assert!(connect_result.is_ok(), "Connect failed: {:?}", connect_result.err());
+
+        // Check that server stored client connection with derived ID
+        let client_derived_id = client.local_derived_id();
+        assert!(server.client_connections.contains_key(&client_derived_id),
+            "server should have client connection with derived ID {}", client_derived_id);
+        assert!(server.client_ids.contains(&client_derived_id));
+    }
+
+    #[tokio::test]
+    async fn test_connection_role_from_alpn() {
+        ensure_crypto_provider();
+        let mut server = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut client = QuicNetworkManager::with_node_id(SenderId::new(100));
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        server.listen(addr).await.expect("Failed to start server");
+
+        let bound_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let conn_task = tokio::spawn(async move {
+            client.connect_as_client(bound_addr).await
+        });
+
+        let accept_result = server.accept().await.expect("Accept failed");
+        let _connect_result = conn_task.await.unwrap().expect("Connect failed");
+
+        // Server should see the connection as coming from a Client
+        assert_eq!(accept_result.get_connection_role(), ClientType::Client);
+    }
+
+    #[tokio::test]
+    async fn test_public_keys_exchanged_on_server_connection() {
+        ensure_crypto_provider();
+        let mut server1 = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut server2 = QuicNetworkManager::with_node_id(SenderId::new(2));
+
+        // Both servers need to have their certificates generated
+        let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        server1.listen(addr1).await.expect("Failed to start server1");
+        server2.listen(addr2).await.expect("Failed to start server2");
+
+        let bound_addr = server1.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let conn_task = tokio::spawn(async move {
+            server2.connect_as_server(bound_addr).await.expect("Connect failed");
+            server2
+        });
+
+        let _accept_result = server1.accept().await.expect("Accept failed");
+        let server2 = conn_task.await.unwrap();
+
+        // Both servers should have their own local public keys
+        assert!(server1.local_public_key.is_some());
+        assert!(server2.local_public_key.is_some());
+
+        // With mTLS, server1 should have server2's public key stored
+        let server2_derived_id = server2.local_derived_id();
+        assert!(server1.peer_public_keys.contains_key(&server2_derived_id),
+            "server1 should have server2's public key stored");
+    }
+
+    #[tokio::test]
+    async fn test_send_receive_after_connection() {
+        ensure_crypto_provider();
+        let mut server = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut client = QuicNetworkManager::with_node_id(SenderId::new(100));
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        server.listen(addr).await.expect("Failed to start server");
+
+        let bound_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let conn_task = tokio::spawn(async move {
+            let conn = client.connect_as_client(bound_addr).await.expect("Connect failed");
+            (client, conn)
+        });
+
+        let server_conn = server.accept().await.expect("Accept failed");
+        let (_client, client_conn) = conn_task.await.unwrap();
+
+        // Test sending from client to server
+        let test_data = b"Hello, server!";
+        client_conn.send(test_data).await.expect("Send failed");
+
+        let received = server_conn.receive().await.expect("Receive failed");
+        assert_eq!(received, test_data);
+
+        // Test sending from server to client
+        let response_data = b"Hello, client!";
+        server_conn.send(response_data).await.expect("Send response failed");
+
+        let received_response = client_conn.receive().await.expect("Receive response failed");
+        assert_eq!(received_response, response_data);
+    }
+
+    #[tokio::test]
+    async fn test_local_derived_id() {
+        ensure_crypto_provider();
+        let mut manager = QuicNetworkManager::new();
+
+        // Before certificate generation, local_derived_id should return node_id
+        let initial_id = manager.local_derived_id();
+        assert_eq!(initial_id, manager.node_id);
+
+        // After certificate generation
+        manager.ensure_local_certificate().unwrap();
+
+        // Now local_derived_id should return derived ID from public key
+        let derived_id = manager.local_derived_id();
+        let expected_id = manager.local_public_key.as_ref().unwrap().derive_id();
+        assert_eq!(derived_id, expected_id);
+    }
+
+    #[test]
+    fn test_node_public_key_derive_id() {
+        let pk1 = NodePublicKey(vec![0x00, 0x01, 0x02]);
+        let pk2 = NodePublicKey(vec![0x00, 0x01, 0x02]);
+        let pk3 = NodePublicKey(vec![0x00, 0x01, 0x03]);
+
+        // Same public key should derive same ID
+        assert_eq!(pk1.derive_id(), pk2.derive_id());
+
+        // Different public keys should derive different IDs
+        assert_ne!(pk1.derive_id(), pk3.derive_id());
+    }
+
+    #[test]
+    fn test_node_public_key_derive_id_deterministic() {
+        let pk = NodePublicKey(vec![0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
+
+        // Multiple calls should return the same ID
+        let id1 = pk.derive_id();
+        let id2 = pk.derive_id();
+        let id3 = pk.derive_id();
+
+        assert_eq!(id1, id2);
+        assert_eq!(id2, id3);
+    }
+
+    #[test]
+    fn test_get_sorted_public_keys() {
+        ensure_crypto_provider();
+        let mut manager = QuicNetworkManager::new();
+        manager.ensure_local_certificate().unwrap();
+
+        // Create some peer public keys (manually sorted in reverse to test sorting)
+        let pk_c = NodePublicKey(vec![0x03, 0x01, 0x02]);
+        let pk_b = NodePublicKey(vec![0x02, 0x01, 0x02]);
+        let pk_a = NodePublicKey(vec![0x01, 0x01, 0x02]);
+
+        manager.peer_public_keys.insert(pk_c.derive_id(), pk_c.clone());
+        manager.peer_public_keys.insert(pk_b.derive_id(), pk_b.clone());
+        manager.peer_public_keys.insert(pk_a.derive_id(), pk_a.clone());
+
+        let sorted = manager.get_sorted_public_keys();
+
+        // Should have 4 keys (local + 3 peers)
+        assert_eq!(sorted.len(), 4);
+
+        // Keys should be sorted lexicographically
+        for i in 1..sorted.len() {
+            assert!(sorted[i - 1].0 < sorted[i].0, "Keys should be sorted");
+        }
+    }
+
+    #[test]
+    fn test_get_public_key_for_sender_id() {
+        ensure_crypto_provider();
+        let mut manager = QuicNetworkManager::new();
+        manager.ensure_local_certificate().unwrap();
+
+        // Add a peer with a known public key
+        let peer_pk = NodePublicKey(vec![0xFF, 0xFF, 0xFF]); // Will sort after local key
+        manager.peer_public_keys.insert(peer_pk.derive_id(), peer_pk.clone());
+
+        // Get the sorted keys to determine expected order
+        let sorted = manager.get_sorted_public_keys();
+        assert_eq!(sorted.len(), 2);
+
+        // sender_id 0 should be the first in sorted order
+        let pk0 = manager.get_public_key_for_sender_id(SenderId::new(0)).unwrap();
+        assert_eq!(pk0, sorted[0]);
+
+        // sender_id 1 should be the second in sorted order
+        let pk1 = manager.get_public_key_for_sender_id(SenderId::new(1)).unwrap();
+        assert_eq!(pk1, sorted[1]);
+
+        // sender_id 2 should be None (out of range)
+        assert!(manager.get_public_key_for_sender_id(SenderId::new(2)).is_none());
+    }
+
+    #[test]
+    fn test_get_sender_id_for_public_key() {
+        ensure_crypto_provider();
+        let mut manager = QuicNetworkManager::new();
+        manager.ensure_local_certificate().unwrap();
+
+        let local_pk = manager.local_public_key.clone().unwrap();
+
+        // Add peers with known public keys
+        let peer_pk1 = NodePublicKey(vec![0x00, 0x00, 0x01]);
+        let peer_pk2 = NodePublicKey(vec![0xFF, 0xFF, 0xFF]);
+        manager.peer_public_keys.insert(peer_pk1.derive_id(), peer_pk1.clone());
+        manager.peer_public_keys.insert(peer_pk2.derive_id(), peer_pk2.clone());
+
+        // Get sorted keys
+        let sorted = manager.get_sorted_public_keys();
+        assert_eq!(sorted.len(), 3);
+
+        // Each key should map to its position in the sorted list
+        for (expected_id, pk) in sorted.iter().enumerate() {
+            let actual_id = manager.get_sender_id_for_public_key(pk).unwrap();
+            assert_eq!(actual_id, SenderId::new(expected_id), "sender_id should match position in sorted list");
+        }
+
+        // Unknown public key should return None
+        let unknown_pk = NodePublicKey(vec![0xAA, 0xBB, 0xCC]);
+        assert!(manager.get_sender_id_for_public_key(&unknown_pk).is_none());
+    }
+
+    #[test]
+    fn test_party_count() {
+        ensure_crypto_provider();
+        let mut manager = QuicNetworkManager::new();
+
+        // Initially no parties (no certificate)
+        assert_eq!(manager.party_count(), 0);
+
+        // After generating certificate, we have 1 party (self)
+        manager.ensure_local_certificate().unwrap();
+        assert_eq!(manager.party_count(), 1);
+
+        // Add peers
+        let pk1 = NodePublicKey(vec![0x01]);
+        let pk2 = NodePublicKey(vec![0x02]);
+        manager.peer_public_keys.insert(pk1.derive_id(), pk1);
+        assert_eq!(manager.party_count(), 2);
+
+        manager.peer_public_keys.insert(pk2.derive_id(), pk2);
+        assert_eq!(manager.party_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_sender_ids_are_sequential_0_to_n() {
+        ensure_crypto_provider();
+
+        // Create two servers
+        let mut server1 = QuicNetworkManager::with_node_id(SenderId::new(1));
+        let mut server2 = QuicNetworkManager::with_node_id(SenderId::new(2));
+
+        // Start listening (generates certificates)
+        let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        server1.listen(addr1).await.expect("Failed to start server1");
+        server2.listen(addr2).await.expect("Failed to start server2");
+
+        let bound_addr = server1.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        // Connect server2 to server1
+        let conn_task = tokio::spawn(async move {
+            server2.connect_as_server(bound_addr).await.expect("Connect failed");
+            server2
+        });
+
+        let _accept = server1.accept().await.expect("Accept failed");
+        let server2 = conn_task.await.unwrap();
+
+        // Both should now have 2 parties
+        assert_eq!(server1.party_count(), 2);
+        assert_eq!(server2.party_count(), 2);
+
+        // Sender IDs should be 0 and 1
+        let server1_sender_id = server1.compute_sender_id().unwrap();
+        let server2_sender_id = server2.compute_sender_id().unwrap();
+
+        // One should be 0, the other should be 1
+        assert!(server1_sender_id == SenderId::new(0) || server1_sender_id == SenderId::new(1));
+        assert!(server2_sender_id == SenderId::new(0) || server2_sender_id == SenderId::new(1));
+        assert_ne!(server1_sender_id, server2_sender_id, "Sender IDs should be different");
+
+        // Verify the IDs are consistent across both servers
+        // Both servers should agree on who is 0 and who is 1
+        let server1_pk = server1.local_public_key.clone().unwrap();
+        let server2_pk = server2.local_public_key.clone().unwrap();
+
+        // From server1's perspective
+        let s1_id_for_s1 = server1.get_sender_id_for_public_key(&server1_pk).unwrap();
+        let s1_id_for_s2 = server1.get_sender_id_for_public_key(&server2_pk).unwrap();
+
+        // From server2's perspective
+        let s2_id_for_s1 = server2.get_sender_id_for_public_key(&server1_pk).unwrap();
+        let s2_id_for_s2 = server2.get_sender_id_for_public_key(&server2_pk).unwrap();
+
+        // Both should agree on sender IDs
+        assert_eq!(s1_id_for_s1, s2_id_for_s1, "Both servers should agree on server1's sender_id");
+        assert_eq!(s1_id_for_s2, s2_id_for_s2, "Both servers should agree on server2's sender_id");
     }
 }

@@ -7,10 +7,9 @@ use crate::transports::ice::IceCandidate;
 /// the consumer must treat the bytes as a raw HoneyBadger WrappedMessage payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetEnvelope {
-    /// Binary encoded handshake used for future extensibility. Current QUIC impl
-    /// still uses a text-line handshake on the first stream, but we support this
-    /// for forward-compatibility.
-    Handshake { role: String, id: usize },
+    /// Binary encoded handshake for PartyId/ClientId exchange.
+    /// Role identification is now done via ALPN protocol negotiation.
+    Handshake { id: usize },
     /// Raw HoneyBadger message bytes (bincode of WrappedMessage from mpc crate).
     HoneyBadger(Vec<u8>),
 

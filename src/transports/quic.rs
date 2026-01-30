@@ -120,6 +120,8 @@ pub trait PeerConnection: Send + Sync {
 
     /// Returns how the remote peer identified itself in the handshake
     fn get_connection_role(&self) -> ClientType;
+
+    fn get_connection(&self) -> Connection;
 }
 
 impl Debug for dyn PeerConnection {
@@ -417,6 +419,10 @@ impl PeerConnection for QuicPeerConnection {
     fn get_connection_role(&self) -> ClientType {
         self.connection_role
     }
+
+    fn get_connection(&self) -> Connection {
+        self.connection.clone()
+    }
 }
 
 // ============================================================================
@@ -563,6 +569,10 @@ impl PeerConnection for LoopbackPeerConnection {
 
     fn get_connection_role(&self) -> ClientType {
         self.connection_role
+    }
+
+    fn get_connection(&self) -> Connection {
+        panic!("LoopbackPeerConnection does not have an underlying QUIC Connection");
     }
 }
 
@@ -847,6 +857,14 @@ impl QuicNetworkManager {
     /// Gets a connection by party ID (for actor model usage)
     pub async fn get_connection(&self, party_id: PartyId) -> Option<Arc<dyn PeerConnection>> {
         self.connections.get(&party_id).map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Gets all client connections (for actor model usage)
+    pub async fn get_all_client_connections(&self) -> Vec<(ClientId, Arc<dyn PeerConnection>)> {
+        self.client_connections
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect()
     }
 
     /// Gets all party connections (for actor model usage)

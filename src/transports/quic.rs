@@ -1252,88 +1252,6 @@ impl QuicNetworkManager {
         self.get_sender_id_for_public_key(local_pk)
     }
 
-    /// Returns the computed sender_id, falling back to node_id if not computable
-    pub fn sender_id(&self) -> PartyId {
-        self.compute_sender_id().unwrap_or(self.node_id)
-    }
-
-    /// Checks if we have public keys from all expected parties
-    pub fn is_fully_connected(&self, expected_count: usize) -> bool {
-        // We need (expected_count - 1) peers since we don't count ourselves
-        self.peer_public_keys.len() >= expected_count.saturating_sub(1)
-            && self.local_public_key.is_some()
-    }
-
-    /// Returns the finalized sender_id only if fully connected to all expected parties
-    pub fn finalized_sender_id(&self, expected_count: usize) -> Option<PartyId> {
-        if self.is_fully_connected(expected_count) {
-            self.compute_sender_id()
-        } else {
-            None
-        }
-    }
-
-    /// Assigns sender_ids to all connections based on the sorted public key list.
-    /// Call this once all peers are connected to finalize sender_ids.
-    /// Returns the number of connections that were assigned sender_ids.
-    pub fn assign_sender_ids(&self) -> usize {
-        let sorted_keys = self.get_sorted_public_keys();
-        let mut assigned = 0;
-
-        // Assign sender_ids to server connections (except loopback)
-        for entry in self.server_connections.iter() {
-            let derived_id = *entry.key();
-            let conn = entry.value();
-
-            // Skip loopback - handle separately
-            if derived_id == self.node_id {
-                continue;
-            }
-
-            // Look up public key by derived_id
-            if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
-                let peer_pk = pk_entry.value();
-                if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
-                    conn.set_sender_id(pos);
-                    assigned += 1;
-                }
-            }
-        }
-
-        // Assign sender_ids to client connections
-        for entry in self.client_connections.iter() {
-            let derived_id = *entry.key();
-            let conn = entry.value();
-
-            // Look up public key by derived_id
-            if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
-                let peer_pk = pk_entry.value();
-                if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
-                    conn.set_sender_id(pos);
-                    assigned += 1;
-                }
-            }
-        }
-
-        // Assign sender_id to loopback connection
-        if let Some(local_pk) = &self.local_public_key {
-            if let Some(pos) = sorted_keys.iter().position(|k| k == local_pk) {
-                if let Some(loopback) = self.server_connections.get(&self.node_id) {
-                    loopback.set_sender_id(pos);
-                    assigned += 1;
-                }
-            }
-        }
-
-        assigned
-    }
-
-    /// Returns the number of parties (local + peers)
-    pub fn party_count(&self) -> usize {
-        let local_count = if self.local_public_key.is_some() { 1 } else { 0 };
-        local_count + self.peer_public_keys.len()
-    }
-
     /// Returns a reference to this node's public key
     pub fn get_public_key(&self) -> Option<&NodePublicKey> {
         self.local_public_key.as_ref()
@@ -2337,6 +2255,73 @@ impl Network for QuicNetworkManager {
     fn is_client_connected(&self, client: ClientId) -> bool {
         self.client_ids.contains(&client)
     }
+
+    fn sender_id(&self) -> PartyId {
+        self.compute_sender_id().unwrap_or(self.node_id)
+    }
+
+    fn assign_sender_ids(&self) -> usize {
+        let sorted_keys = self.get_sorted_public_keys();
+        let mut assigned = 0;
+
+        // Assign sender_ids to server connections (except loopback)
+        for entry in self.server_connections.iter() {
+            let derived_id = *entry.key();
+            let conn = entry.value();
+
+            // Skip loopback - handle separately
+            if derived_id == self.node_id {
+                continue;
+            }
+
+            // Look up public key by derived_id
+            if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
+                let peer_pk = pk_entry.value();
+                if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
+                    conn.set_sender_id(pos);
+                    assigned += 1;
+                }
+            }
+        }
+
+        // Assign sender_ids to client connections
+        for entry in self.client_connections.iter() {
+            let derived_id = *entry.key();
+            let conn = entry.value();
+
+            // Look up public key by derived_id
+            if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
+                let peer_pk = pk_entry.value();
+                if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
+                    conn.set_sender_id(pos);
+                    assigned += 1;
+                }
+            }
+        }
+
+        // Assign sender_id to loopback connection
+        if let Some(local_pk) = &self.local_public_key {
+            if let Some(pos) = sorted_keys.iter().position(|k| k == local_pk) {
+                if let Some(loopback) = self.server_connections.get(&self.node_id) {
+                    loopback.set_sender_id(pos);
+                    assigned += 1;
+                }
+            }
+        }
+
+        assigned
+    }
+
+    fn party_count(&self) -> usize {
+        let local_count = if self.local_public_key.is_some() { 1 } else { 0 };
+        local_count + self.peer_public_keys.len()
+    }
+
+    fn is_fully_connected(&self, expected_count: usize) -> bool {
+        // We need (expected_count - 1) peers since we don't count ourselves
+        self.peer_public_keys.len() >= expected_count.saturating_sub(1)
+            && self.local_public_key.is_some()
+    }
 }
 
 // ============================================================================
@@ -2717,22 +2702,6 @@ mod tests {
 
         manager.peer_public_keys.insert(2, NodePublicKey(vec![0x02]));
         assert!(manager.is_fully_connected(3)); // Now fully connected
-    }
-
-    #[test]
-    fn test_finalized_sender_id() {
-        let mut manager = QuicNetworkManager::new();
-        manager.ensure_local_certificate().unwrap();
-
-        // Not fully connected yet
-        assert!(manager.finalized_sender_id(3).is_none());
-
-        manager.peer_public_keys.insert(1, NodePublicKey(vec![0x01]));
-        manager.peer_public_keys.insert(2, NodePublicKey(vec![0x02]));
-
-        // Now fully connected
-        let finalized = manager.finalized_sender_id(3);
-        assert!(finalized.is_some());
     }
 
     // ========================================================================

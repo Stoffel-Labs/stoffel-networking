@@ -32,7 +32,7 @@ use tokio::task::AbortHandle;
 
 use rustls::crypto::CryptoProvider;
 
-use crate::network_utils::{Network, Node, SenderId};
+use crate::network_utils::{Network, Node, PartyId};
 use crate::transports::quic::{
     ConnectionState, QuicNetworkManager, QuicNode, PeerConnection,
 };
@@ -306,7 +306,7 @@ pub extern "C" fn stoffelnet_node_new(
         }
     };
 
-    let node = QuicNode::from_party_id(SenderId::new(party_id as usize), socket_addr);
+    let node = QuicNode::from_party_id(party_id as PartyId, socket_addr);
     Box::into_raw(Box::new(NodeHandle { node })) as StoffelNodeHandle
 }
 
@@ -424,7 +424,7 @@ pub extern "C" fn stoffelnet_node_party_id(node: StoffelNodeHandle) -> u64 {
     }
 
     let handle = unsafe { &*(node as *const NodeHandle) };
-    handle.node.id().raw() as u64
+    handle.node.id() as u64
 }
 
 // ============================================================================
@@ -484,7 +484,7 @@ pub extern "C" fn stoffelnet_manager_new(
     };
 
     // Create the network manager with the specified party ID
-    let mut manager = QuicNetworkManager::with_node_id(SenderId::new(party_id as usize));
+    let mut manager = QuicNetworkManager::with_node_id(party_id as PartyId);
 
     // Start listening on the bind address
     let result = runtime_handle.block_on(async {
@@ -588,7 +588,7 @@ pub extern "C" fn stoffelnet_manager_add_node(
 
     handle.runtime.block_on(async {
         let mut manager = handle.manager.lock().await;
-        manager.add_node_with_party_id(SenderId::new(party_id as usize), socket_addr);
+        manager.add_node_with_party_id(party_id as PartyId, socket_addr);
     });
 
     STOFFELNET_OK
@@ -627,7 +627,7 @@ pub extern "C" fn stoffelnet_manager_connect_to_party(
         let node_addr = manager
             .parties()
             .iter()
-            .find(|n| n.id() == SenderId::new(party_id as usize))
+            .find(|n| n.id() == party_id as PartyId)
             .map(|n| n.address());
 
         match node_addr {
@@ -689,7 +689,7 @@ pub extern "C" fn stoffelnet_manager_connect_to_party_async(
             let node_addr = manager
                 .parties()
                 .iter()
-                .find(|n| n.id() == SenderId::new(party_id as usize))
+                .find(|n| n.id() == party_id as PartyId)
                 .map(|n| n.address());
 
             match node_addr {
@@ -802,7 +802,7 @@ pub extern "C" fn stoffelnet_manager_get_connection(
 
     let conn = handle.runtime.block_on(async {
         let manager = handle.manager.lock().await;
-        manager.get_connection(SenderId::new(party_id as usize)).await
+        manager.get_connection(party_id as PartyId).await
     });
 
     match conn {
@@ -844,7 +844,7 @@ pub extern "C" fn stoffelnet_manager_is_party_connected(
 
     let is_connected = handle.runtime.block_on(async {
         let manager = handle.manager.lock().await;
-        manager.is_party_connected(SenderId::new(party_id as usize)).await
+        manager.is_party_connected(party_id as PartyId).await
     });
 
     if is_connected { 1 } else { 0 }

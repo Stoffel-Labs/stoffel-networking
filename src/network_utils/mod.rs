@@ -101,24 +101,13 @@ pub trait Network {
     /// Checks whether a client is connected.
     fn is_client_connected(&self, client: ClientId) -> bool;
 
-    // --- sender_id management ---
+    // --- party identification ---
 
-    /// Returns this node's sender_id based on the sorted public key list.
-    /// The sender_id is the position (0..N-1) in the lexicographically sorted
-    /// list of all participant public keys.
-    fn sender_id(&self) -> PartyId;
-
-    /// Assigns sender_ids to all connections based on the sorted public key list.
-    /// Call this once all peers are connected to finalize sender_ids.
-    /// Returns the number of connections that were assigned sender_ids.
-    fn assign_sender_ids(&self) -> usize;
+    /// Returns this node's party ID (0..N-1).
+    fn local_party_id(&self) -> PartyId;
 
     /// Returns the number of parties in the network (including self).
     fn party_count(&self) -> usize;
-
-    /// Checks if we have all expected parties connected.
-    /// Returns true if we have (expected_count - 1) peers plus our own local key.
-    fn is_fully_connected(&self, expected_count: usize) -> bool;
 }
 
 /// Participant of an MPC protocol.

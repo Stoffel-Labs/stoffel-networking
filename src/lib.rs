@@ -83,6 +83,12 @@ pub trait PeerConnection: Send + Sync {
     /// which can be useful for logging, debugging, or identity verification.
     fn remote_address(&self) -> SocketAddr;
 
+    /// Returns the party ID of the remote peer
+    ///
+    /// The party ID identifies which party (0..N-1) this connection leads to.
+    /// Returns None if the party ID has not been assigned yet.
+    fn remote_party_id(&self) -> Option<usize>;
+
     /// Closes the connection
     ///
     /// This method gracefully terminates the connection with the peer.

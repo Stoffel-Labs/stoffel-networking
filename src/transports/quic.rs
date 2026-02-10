@@ -16,6 +16,7 @@ use std::sync::Arc;
 use dashmap::{DashMap, DashSet};
 use crate::network_utils::{ClientId, ClientType, Message, Network, NetworkError, Node, PartyId};
 use tokio::sync::{Mutex, mpsc};
+use tokio::time::timeout;
 use ark_ff::Field;
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -976,8 +977,12 @@ impl QuicNetworkManager {
         send_handshake(&mut send, "CLIENT", client_id).await
             .map_err(|e| format!("Failed to send handshake: {}", e))?;
 
-        // Receive server's handshake response to get its PartyId
-        let server_handshake = recv_handshake(&mut recv).await
+        // Receive server's handshake response to get its PartyId (with 30s timeout)
+        let server_handshake = timeout(
+            Duration::from_secs(30),
+            recv_handshake(&mut recv)
+        ).await
+            .map_err(|_| "Handshake response timeout after 30s".to_string())?
             .map_err(|e| format!("Failed to receive server handshake: {}", e))?;
 
         let mut connection_role = ClientType::Server;
@@ -1059,7 +1064,12 @@ impl QuicNetworkManager {
         send_handshake(&mut send, "SERVER", party_id).await
             .map_err(|e| format!("Failed to send handshake: {}", e))?;
 
-        let server_handshake = recv_handshake(&mut recv).await
+        // Wrap handshake receive with 30s timeout to prevent indefinite hangs
+        let server_handshake = timeout(
+            Duration::from_secs(30),
+            recv_handshake(&mut recv)
+        ).await
+            .map_err(|_| "Handshake response timeout after 30s".to_string())?
             .map_err(|e| format!("Failed to receive server handshake response: {}", e))?;
 
         let mut connection_role = ClientType::Server;
@@ -1425,8 +1435,11 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to send handshake: {}", e))?;
 
-        let handshake = recv_handshake(&mut recv)
-            .await
+        let handshake = timeout(
+            Duration::from_secs(30),
+            recv_handshake(&mut recv)
+        ).await
+            .map_err(|_| "Handshake timeout after 30s".to_string())?
             .map_err(|e| format!("Failed to receive handshake: {}", e))?;
 
         let connection_role = if let Some((role, _)) = handshake {
@@ -1549,9 +1562,12 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to accept stream: {}", e))?;
 
-        // Read and respond to handshake
-        let _handshake = recv_handshake(&mut recv)
-            .await
+        // Read and respond to handshake (with 30s timeout)
+        let _handshake = timeout(
+            Duration::from_secs(30),
+            recv_handshake(&mut recv)
+        ).await
+            .map_err(|_| "Handshake timeout after 30s".to_string())?
             .map_err(|e| format!("Failed to read handshake: {}", e))?;
 
         send_handshake(&mut send, "SERVER", self.node_id)
@@ -1706,7 +1722,11 @@ impl NetworkManager for QuicNetworkManager {
             let (mut send, mut recv) = connection.accept_bi().await
                 .map_err(|e| format!("Failed to accept stream: {}", e))?;
 
-            let parsed_role = recv_handshake(&mut recv).await
+            let parsed_role = timeout(
+                Duration::from_secs(30),
+                recv_handshake(&mut recv)
+            ).await
+                .map_err(|_| "Handshake timeout after 30s".to_string())?
                 .map_err(|e| format!("Failed to read handshake: {}", e))?;
 
             match parsed_role {

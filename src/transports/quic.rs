@@ -3231,4 +3231,247 @@ mod tests {
         assert_eq!(s1_id_for_s1, s2_id_for_s1, "Both servers should agree on server1's sender_id");
         assert_eq!(s1_id_for_s2, s2_id_for_s2, "Both servers should agree on server2's sender_id");
     }
+
+    // ========================================================================
+    // Happy Path Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_loopback_send_receive() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+
+        conn.send(b"hello").await.expect("Send failed");
+        let received = conn.receive().await.expect("Receive failed");
+        assert_eq!(received, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_loopback_multiple_messages() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+
+        conn.send(b"first").await.expect("Send first failed");
+        conn.send(b"second").await.expect("Send second failed");
+        conn.send(b"third").await.expect("Send third failed");
+
+        let r1 = conn.receive().await.expect("Receive first failed");
+        let r2 = conn.receive().await.expect("Receive second failed");
+        let r3 = conn.receive().await.expect("Receive third failed");
+
+        assert_eq!(r1, b"first");
+        assert_eq!(r2, b"second");
+        assert_eq!(r3, b"third");
+    }
+
+    #[test]
+    fn test_framing_round_trip() {
+        let original = b"round trip data";
+        let framed = LoopbackPeerConnection::frame_message(original);
+        let unframed = LoopbackPeerConnection::unframe_message(framed)
+            .expect("Unframe failed");
+        assert_eq!(unframed, original);
+    }
+
+    #[test]
+    fn test_loopback_remote_address() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+        assert_eq!(conn.remote_address(), addr);
+    }
+
+    #[test]
+    fn test_loopback_connection_role() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+        assert_eq!(conn.get_connection_role(), ClientType::Server);
+    }
+
+    #[test]
+    fn test_loopback_party_id() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, Some(42));
+        assert_eq!(conn.remote_party_id(), Some(42));
+    }
+
+    #[test]
+    fn test_loopback_set_party_id() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+        assert_eq!(conn.remote_party_id(), None);
+
+        conn.set_remote_party_id(99);
+        assert_eq!(conn.remote_party_id(), Some(99));
+    }
+
+    // ========================================================================
+    // Semi-Honest Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_loopback_send_empty_message() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+
+        conn.send(&[]).await.expect("Send empty failed");
+        let received = conn.receive().await.expect("Receive empty failed");
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_loopback_send_after_close() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+
+        conn.close().await.expect("Close failed");
+        let result = conn.send(b"should fail").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_loopback_state_after_close() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+
+        assert_eq!(conn.state().await, ConnectionState::Connected);
+        assert!(conn.is_connected().await);
+
+        conn.close().await.expect("Close failed");
+        assert_eq!(conn.state().await, ConnectionState::Closed);
+        assert!(!conn.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn test_loopback_receive_after_close() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = LoopbackPeerConnection::new(addr, None);
+
+        conn.close().await.expect("Close failed");
+        let result = conn.receive().await;
+        assert!(result.is_err(), "receive after close should fail");
+    }
+
+    // ========================================================================
+    // Malicious / Framing Error Tests
+    // ========================================================================
+
+    #[test]
+    fn test_unframe_message_too_short() {
+        let result = LoopbackPeerConnection::unframe_message(vec![0, 0]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConnectionError::FramingError(_) => {} // expected
+            other => panic!("Expected FramingError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unframe_message_wrong_length() {
+        // Header says length is 10, but only 5 bytes of data follow
+        let mut data = Vec::new();
+        data.extend_from_slice(&10u32.to_be_bytes());
+        data.extend_from_slice(&[1, 2, 3, 4, 5]);
+
+        let result = LoopbackPeerConnection::unframe_message(data);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConnectionError::FramingError(_) => {} // expected
+            other => panic!("Expected FramingError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unframe_message_empty() {
+        let result = LoopbackPeerConnection::unframe_message(vec![]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConnectionError::FramingError(_) => {} // expected
+            other => panic!("Expected FramingError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_framing_empty_data() {
+        let framed = LoopbackPeerConnection::frame_message(&[]);
+        assert_eq!(framed, vec![0, 0, 0, 0]);
+
+        let unframed = LoopbackPeerConnection::unframe_message(framed)
+            .expect("Unframe empty failed");
+        assert!(unframed.is_empty());
+    }
+
+    // ========================================================================
+    // Concurrency Tests
+    // ========================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_sends() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        let conn = Arc::new(LoopbackPeerConnection::new(addr, None));
+
+        // Spawn senders and a receiver concurrently to exercise actual contention
+        let conn_recv = conn.clone();
+        let receiver = tokio::spawn(async move {
+            let mut received_values = Vec::new();
+            for _ in 0..10 {
+                let data = conn_recv.receive().await.expect("Concurrent receive failed");
+                assert_eq!(data.len(), 1);
+                received_values.push(data[0]);
+            }
+            received_values
+        });
+
+        let mut send_handles = Vec::new();
+        for i in 0u8..10 {
+            let conn_clone = conn.clone();
+            let handle = tokio::spawn(async move {
+                conn_clone.send(&[i]).await.expect("Concurrent send failed");
+            });
+            send_handles.push(handle);
+        }
+
+        for handle in send_handles {
+            handle.await.expect("Task panicked");
+        }
+
+        let mut received_values = receiver.await.expect("Receiver panicked");
+        received_values.sort();
+        assert_eq!(received_values, (0u8..10).collect::<Vec<_>>());
+    }
+
+    // ========================================================================
+    // Connection Error Display Tests
+    // ========================================================================
+
+    #[test]
+    fn test_connection_error_display_contains_inner_message() {
+        // Verify Display output includes the inner message for each variant
+        let display_lost = format!("{}", ConnectionError::ConnectionLost("peer gone".to_string()));
+        assert!(display_lost.contains("peer gone"), "ConnectionLost should contain inner msg, got: {}", display_lost);
+
+        let display_send = format!("{}", ConnectionError::SendFailed("write err".to_string()));
+        assert!(display_send.contains("write err"), "SendFailed should contain inner msg, got: {}", display_send);
+
+        let display_recv = format!("{}", ConnectionError::ReceiveFailed("read err".to_string()));
+        assert!(display_recv.contains("read err"), "ReceiveFailed should contain inner msg, got: {}", display_recv);
+
+        let display_frame = format!("{}", ConnectionError::FramingError("bad frame".to_string()));
+        assert!(display_frame.contains("bad frame"), "FramingError should contain inner msg, got: {}", display_frame);
+
+        let display_init = format!("{}", ConnectionError::InitializationFailed("init err".to_string()));
+        assert!(display_init.contains("init err"), "InitializationFailed should contain inner msg, got: {}", display_init);
+
+        let display_state = format!("{}", ConnectionError::InvalidState(ConnectionState::Disconnected));
+        assert!(!display_state.is_empty(), "InvalidState should produce non-empty display");
+
+        let display_closed = format!("{}", ConnectionError::StreamClosed);
+        assert!(!display_closed.is_empty(), "StreamClosed should produce non-empty display");
+    }
+
+    #[test]
+    fn test_connection_error_to_string() {
+        let error = ConnectionError::SendFailed("test".to_string());
+        let s: String = error.into();
+        assert!(s.contains("test"), "From<ConnectionError> for String should contain inner msg");
+    }
 }

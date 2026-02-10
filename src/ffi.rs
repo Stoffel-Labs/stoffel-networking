@@ -1371,4 +1371,184 @@ mod tests {
         stoffelnet_node_destroy(std::ptr::null_mut()); // Should not crash
         stoffelnet_connection_destroy(std::ptr::null_mut()); // Should not crash
     }
+
+    // ========================================================================
+    // Null pointer safety tests
+    // ========================================================================
+
+    #[test]
+    fn test_send_null_conn() {
+        // null conn is the first guard; should return ERR_NULL_POINTER
+        let result = stoffelnet_connection_send(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(result, STOFFELNET_ERR_NULL_POINTER);
+
+        let error = stoffelnet_last_error();
+        assert!(!error.is_null());
+        let error_str = unsafe { CStr::from_ptr(error) }.to_str().unwrap();
+        assert!(
+            error_str.contains("Null connection handle"),
+            "Expected 'Null connection handle', got: {}",
+            error_str
+        );
+        stoffelnet_clear_error();
+    }
+
+    #[test]
+    fn test_receive_null_conn() {
+        // null conn is the first guard; should return ERR_NULL_POINTER
+        let mut out_data: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let result = stoffelnet_connection_receive(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut out_data as *mut *mut u8,
+            &mut out_len as *mut usize,
+        );
+        assert_eq!(result, STOFFELNET_ERR_NULL_POINTER);
+
+        let error = stoffelnet_last_error();
+        assert!(!error.is_null());
+        let error_str = unsafe { CStr::from_ptr(error) }.to_str().unwrap();
+        assert!(
+            error_str.contains("Null connection handle"),
+            "Expected 'Null connection handle', got: {}",
+            error_str
+        );
+        stoffelnet_clear_error();
+    }
+
+    #[test]
+    fn test_manager_new_null_runtime() {
+        let addr = CString::new("127.0.0.1:9000").unwrap();
+        let manager = stoffelnet_manager_new(std::ptr::null_mut(), addr.as_ptr(), 1);
+        assert!(manager.is_null());
+
+        let error = stoffelnet_last_error();
+        assert!(!error.is_null());
+        let error_str = unsafe { CStr::from_ptr(error) }.to_str().unwrap();
+        assert!(
+            error_str.contains("Null runtime handle"),
+            "Expected error to contain 'Null runtime handle', got: {}",
+            error_str
+        );
+        stoffelnet_clear_error();
+    }
+
+    #[test]
+    fn test_manager_new_null_address() {
+        let runtime = stoffelnet_runtime_new();
+        assert!(!runtime.is_null());
+
+        let manager = stoffelnet_manager_new(runtime, std::ptr::null(), 1);
+        assert!(manager.is_null());
+
+        let error = stoffelnet_last_error();
+        assert!(!error.is_null());
+        let error_str = unsafe { CStr::from_ptr(error) }.to_str().unwrap();
+        assert!(
+            error_str.contains("Null bind address"),
+            "Expected error to contain 'Null bind address', got: {}",
+            error_str
+        );
+
+        stoffelnet_clear_error();
+        stoffelnet_runtime_destroy(runtime);
+    }
+
+    // ========================================================================
+    // Invalid input tests
+    // ========================================================================
+
+    #[test]
+    fn test_node_new_null_address() {
+        let node = stoffelnet_node_new(std::ptr::null(), 1);
+        assert!(node.is_null());
+    }
+
+    #[test]
+    fn test_node_new_invalid_address() {
+        let addr = CString::new("not-a-valid-address").unwrap();
+        let node = stoffelnet_node_new(addr.as_ptr(), 1);
+        assert!(node.is_null());
+
+        let error = stoffelnet_last_error();
+        assert!(!error.is_null());
+        let error_str = unsafe { CStr::from_ptr(error) }.to_str().unwrap();
+        assert!(
+            error_str.contains("Invalid address"),
+            "Expected error to contain 'Invalid address', got: {}",
+            error_str
+        );
+        stoffelnet_clear_error();
+    }
+
+    #[test]
+    fn test_node_address_null_handle() {
+        let address = stoffelnet_node_address(std::ptr::null_mut());
+        assert!(address.is_null());
+    }
+
+    #[test]
+    fn test_node_party_id_null_handle() {
+        let party_id = stoffelnet_node_party_id(std::ptr::null_mut());
+        assert_eq!(party_id, 0);
+    }
+
+    // ========================================================================
+    // Memory safety tests
+    // ========================================================================
+
+    #[test]
+    fn test_free_bytes_null() {
+        // Should not crash when given null pointer and zero length
+        stoffelnet_free_bytes(std::ptr::null_mut(), 0);
+    }
+
+    #[test]
+    fn test_free_string_null() {
+        // Should not crash when given null pointer
+        stoffelnet_free_string(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn test_error_persistence() {
+        // Set an initial error
+        set_last_error("first");
+        let error = stoffelnet_last_error();
+        assert!(!error.is_null());
+        let error_str = unsafe { CStr::from_ptr(error) }.to_str().unwrap();
+        assert_eq!(error_str, "first");
+
+        // Call a function that sets a different error (null node handle)
+        let _ = stoffelnet_node_party_id(std::ptr::null_mut());
+
+        // Verify the error was overwritten
+        let error = stoffelnet_last_error();
+        assert!(!error.is_null());
+        let error_str = unsafe { CStr::from_ptr(error) }.to_str().unwrap();
+        assert_eq!(error_str, "Null node handle");
+
+        stoffelnet_clear_error();
+    }
+
+    #[test]
+    fn test_multiple_runtime_lifecycle() {
+        // Create 3 runtimes and destroy all 3 without crashing
+        let rt1 = stoffelnet_runtime_new();
+        let rt2 = stoffelnet_runtime_new();
+        let rt3 = stoffelnet_runtime_new();
+
+        assert!(!rt1.is_null());
+        assert!(!rt2.is_null());
+        assert!(!rt3.is_null());
+
+        stoffelnet_runtime_destroy(rt1);
+        stoffelnet_runtime_destroy(rt2);
+        stoffelnet_runtime_destroy(rt3);
+    }
 }

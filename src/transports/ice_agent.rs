@@ -1247,6 +1247,126 @@ mod tests {
         assert_eq!(config.probe_count, 5);
         assert_eq!(config.connection_timeout, Duration::from_millis(2000));
     }
+
+    // --- State machine violation tests ---
+
+    #[test]
+    fn test_nominated_pair_returns_none_for_non_completed_states() {
+        // Test multiple states: a freshly created agent (New) should
+        // return None from nominated_pair() regardless of constructor.
+        let config = IceAgentConfig::default();
+
+        let agent_new = IceAgent::new(config.clone(), 1).expect("config should be valid");
+        assert_eq!(agent_new.state(), IceState::New);
+        assert!(agent_new.nominated_pair().is_none());
+
+        let agent_unchecked = IceAgent::new_unchecked(config, 99);
+        assert!(agent_unchecked.nominated_pair().is_none());
+    }
+
+    // --- Transaction ID edge case tests ---
+
+    #[test]
+    fn test_party_id_from_transaction_zero() {
+        // A transaction ID of 0 has upper 32 bits = 0, so party ID should be 0
+        assert_eq!(IceAgent::party_id_from_transaction(0), 0);
+    }
+
+    #[test]
+    fn test_party_id_from_transaction_max() {
+        // u64::MAX has all bits set; upper 32 bits = 0xFFFFFFFF
+        let result = IceAgent::party_id_from_transaction(u64::MAX);
+        assert_eq!(result, 0xFFFFFFFF_usize);
+    }
+
+    // --- Invalid config tests ---
+
+    #[test]
+    fn test_config_zero_probe_interval() {
+        let config = IceAgentConfig::default().with_probe_interval(Duration::ZERO);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidProbeInterval)
+        ));
+    }
+
+    #[test]
+    fn test_config_zero_check_pace() {
+        let config = IceAgentConfig::default().with_check_pace(Duration::ZERO);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidCheckPace)
+        ));
+    }
+
+    #[test]
+    fn test_config_overall_timeout_equals_check_timeout() {
+        // overall_timeout must be strictly greater than check_timeout;
+        // setting them equal should fail validation.
+        let config = IceAgentConfig::default()
+            .with_check_timeout(Duration::from_millis(500))
+            .with_overall_timeout(Duration::from_millis(500));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidOverallTimeout)
+        ));
+    }
+
+    #[test]
+    fn test_new_with_invalid_config_returns_err() {
+        // IceAgent::new validates the config; a zero check_timeout should cause an error.
+        let config = IceAgentConfig::default().with_check_timeout(Duration::ZERO);
+        let result = IceAgent::new(config, 1);
+        let err = result.err().expect("Expected Err, got Ok");
+        assert!(
+            matches!(err, IceError::ConfigError(ConfigError::InvalidCheckTimeout)),
+            "Expected IceError::ConfigError(InvalidCheckTimeout), got: {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_new_unchecked_with_invalid_config_succeeds() {
+        // IceAgent::new_unchecked skips validation, so even an invalid config succeeds.
+        let config = IceAgentConfig::default().with_check_timeout(Duration::ZERO);
+        let agent = IceAgent::new_unchecked(config, 1);
+        // The agent should be created successfully in the New state
+        assert_eq!(agent.state(), IceState::New);
+    }
+
+    // --- Display and error formatting tests ---
+
+    #[test]
+    fn test_config_error_display_has_distinct_messages() {
+        let variants: Vec<ConfigError> = vec![
+            ConfigError::InvalidCheckTimeout,
+            ConfigError::InvalidCheckRetries,
+            ConfigError::InvalidProbeCount,
+            ConfigError::InvalidOverallTimeout,
+            ConfigError::InvalidProbeInterval,
+            ConfigError::InvalidCheckPace,
+        ];
+
+        let displays: Vec<String> = variants.iter().map(|v| format!("{}", v)).collect();
+
+        // All display strings must be non-empty and distinct
+        for (i, display) in displays.iter().enumerate() {
+            assert!(
+                !display.is_empty(),
+                "ConfigError::{:?} should produce a non-empty display string",
+                variants[i]
+            );
+        }
+        for i in 0..displays.len() {
+            for j in (i + 1)..displays.len() {
+                assert_ne!(
+                    displays[i], displays[j],
+                    "ConfigError::{:?} and {:?} should have distinct display messages",
+                    variants[i], variants[j]
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -536,4 +536,336 @@ mod tests {
         // Different addresses - symmetric NAT
         assert!(detect_symmetric_nat(&[result1, result3]));
     }
+
+    // ==================== Helper functions ====================
+
+    fn build_test_response(transaction_id: &[u8; 12], attrs: &[u8]) -> Vec<u8> {
+        let mut msg = vec![0u8; 20 + attrs.len()];
+        BigEndian::write_u16(&mut msg[0..2], STUN_BINDING_RESPONSE);
+        BigEndian::write_u16(&mut msg[2..4], attrs.len() as u16);
+        BigEndian::write_u32(&mut msg[4..8], STUN_MAGIC_COOKIE);
+        msg[8..20].copy_from_slice(transaction_id);
+        msg[20..].copy_from_slice(attrs);
+        msg
+    }
+
+    fn build_attr(attr_type: u16, data: &[u8]) -> Vec<u8> {
+        let mut attr = vec![0u8; 4 + data.len()];
+        BigEndian::write_u16(&mut attr[0..2], attr_type);
+        BigEndian::write_u16(&mut attr[2..4], data.len() as u16);
+        attr[4..].copy_from_slice(data);
+        // Pad to 4-byte boundary if needed
+        while attr.len() % 4 != 0 {
+            attr.push(0);
+        }
+        attr
+    }
+
+    // ==================== Happy path tests ====================
+
+    #[test]
+    fn test_parse_xor_mapped_address_ipv6() {
+        let transaction_id: [u8; 12] = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let magic_cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+
+        // Target: IPv6 address 2001:db8::1, port 9876
+        let expected_ip = std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
+        let expected_port: u16 = 9876;
+        let ip_bytes = expected_ip.octets();
+
+        // XOR the port with high 16 bits of magic cookie
+        let xor_port = expected_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+
+        // XOR the address: first 4 bytes with magic cookie, next 12 with transaction_id
+        let mut xor_addr = [0u8; 16];
+        xor_addr.copy_from_slice(&ip_bytes);
+        for i in 0..4 {
+            xor_addr[i] ^= magic_cookie[i];
+        }
+        for i in 0..12 {
+            xor_addr[4 + i] ^= transaction_id[i];
+        }
+
+        // Build attribute data: 1 byte reserved, 1 byte family, 2 bytes port, 16 bytes addr = 20 bytes
+        let mut data = vec![0u8; 20];
+        data[1] = 0x02; // IPv6
+        BigEndian::write_u16(&mut data[2..4], xor_port);
+        data[4..20].copy_from_slice(&xor_addr);
+
+        let result = StunClient::parse_xor_mapped_address(&data, &magic_cookie, &transaction_id);
+        assert!(result.is_some(), "Expected Some for valid IPv6 XOR-MAPPED-ADDRESS");
+
+        let addr = result.unwrap();
+        assert_eq!(addr.port(), expected_port);
+        assert_eq!(addr.ip(), std::net::IpAddr::V6(expected_ip));
+    }
+
+    #[test]
+    fn test_parse_mapped_address_ipv4() {
+        // MAPPED-ADDRESS for 10.0.0.1:8080
+        let mut data = vec![0u8; 8];
+        data[1] = 0x01; // IPv4 family
+        BigEndian::write_u16(&mut data[2..4], 8080);
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 1);
+        BigEndian::write_u32(&mut data[4..8], u32::from(ip));
+
+        let result = StunClient::parse_mapped_address(&data);
+        assert!(result.is_some(), "Expected Some for valid IPv4 MAPPED-ADDRESS");
+
+        let addr = result.unwrap();
+        assert_eq!(addr.port(), 8080);
+        assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_parse_mapped_address_ipv6() {
+        // MAPPED-ADDRESS for [fe80::1]:4433
+        let expected_ip = std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let expected_port: u16 = 4433;
+
+        let mut data = vec![0u8; 20];
+        data[1] = 0x02; // IPv6 family
+        BigEndian::write_u16(&mut data[2..4], expected_port);
+        data[4..20].copy_from_slice(&expected_ip.octets());
+
+        let result = StunClient::parse_mapped_address(&data);
+        assert!(result.is_some(), "Expected Some for valid IPv6 MAPPED-ADDRESS");
+
+        let addr = result.unwrap();
+        assert_eq!(addr.port(), expected_port);
+        assert_eq!(addr.ip(), std::net::IpAddr::V6(expected_ip));
+    }
+
+    #[test]
+    fn test_xor_mapped_preferred_over_mapped() {
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+        // Build MAPPED-ADDRESS attribute with IP 10.0.0.1:1111
+        let mut mapped_data = vec![0u8; 8];
+        mapped_data[1] = 0x01; // IPv4
+        BigEndian::write_u16(&mut mapped_data[2..4], 1111);
+        BigEndian::write_u32(&mut mapped_data[4..8], u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        let mapped_attr = build_attr(ATTR_MAPPED_ADDRESS, &mapped_data);
+
+        // Build XOR-MAPPED-ADDRESS attribute with IP 192.168.1.1:2222
+        let xor_port: u16 = 2222 ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        let xor_addr: u32 = u32::from(std::net::Ipv4Addr::new(192, 168, 1, 1)) ^ STUN_MAGIC_COOKIE;
+        let mut xor_data = vec![0u8; 8];
+        xor_data[1] = 0x01; // IPv4
+        BigEndian::write_u16(&mut xor_data[2..4], xor_port);
+        BigEndian::write_u32(&mut xor_data[4..8], xor_addr);
+        let xor_attr = build_attr(ATTR_XOR_MAPPED_ADDRESS, &xor_data);
+
+        // Combine: MAPPED-ADDRESS first, then XOR-MAPPED-ADDRESS
+        let mut attrs = Vec::new();
+        attrs.extend_from_slice(&mapped_attr);
+        attrs.extend_from_slice(&xor_attr);
+
+        let response = build_test_response(&transaction_id, &attrs);
+        let result = StunClient::parse_binding_response(&response, &transaction_id);
+        assert!(result.is_ok(), "Expected Ok for valid response with both attributes");
+
+        let addr = result.unwrap();
+        // XOR-MAPPED-ADDRESS should be preferred
+        assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(addr.port(), 2222);
+    }
+
+    // ==================== Semi-honest (invalid but not malicious) tests ====================
+
+    #[test]
+    fn test_response_too_short() {
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // Less than 20 bytes (STUN_HEADER_SIZE)
+        let short_data = vec![0u8; 10];
+
+        let result = StunClient::parse_binding_response(&short_data, &transaction_id);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StunError::InvalidResponse(msg) => {
+                assert!(msg.contains("too short"), "Expected 'too short' in error message, got: {}", msg);
+            }
+            other => panic!("Expected InvalidResponse, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_wrong_message_type() {
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // Build a response with wrong message type (use BINDING_REQUEST instead of RESPONSE)
+        let mut msg = vec![0u8; 20];
+        BigEndian::write_u16(&mut msg[0..2], STUN_BINDING_REQUEST); // Wrong type
+        BigEndian::write_u16(&mut msg[2..4], 0);
+        BigEndian::write_u32(&mut msg[4..8], STUN_MAGIC_COOKIE);
+        msg[8..20].copy_from_slice(&transaction_id);
+
+        let result = StunClient::parse_binding_response(&msg, &transaction_id);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StunError::InvalidResponse(msg) => {
+                assert!(msg.contains("message type"), "Expected 'message type' in error, got: {}", msg);
+            }
+            other => panic!("Expected InvalidResponse, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_message_length_mismatch() {
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // Build response header claiming 100 bytes of attributes, but only 20 bytes total (no attrs)
+        let mut msg = vec![0u8; 20];
+        BigEndian::write_u16(&mut msg[0..2], STUN_BINDING_RESPONSE);
+        BigEndian::write_u16(&mut msg[2..4], 100); // Claims 100 bytes of attributes
+        BigEndian::write_u32(&mut msg[4..8], STUN_MAGIC_COOKIE);
+        msg[8..20].copy_from_slice(&transaction_id);
+
+        let result = StunClient::parse_binding_response(&msg, &transaction_id);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StunError::InvalidResponse(msg) => {
+                assert!(msg.contains("length mismatch"), "Expected 'length mismatch' in error, got: {}", msg);
+            }
+            other => panic!("Expected InvalidResponse, got: {:?}", other),
+        }
+    }
+
+    // ==================== Malicious tests ====================
+
+    #[test]
+    fn test_wrong_magic_cookie() {
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut msg = vec![0u8; 20];
+        BigEndian::write_u16(&mut msg[0..2], STUN_BINDING_RESPONSE);
+        BigEndian::write_u16(&mut msg[2..4], 0);
+        BigEndian::write_u32(&mut msg[4..8], 0xDEADBEEF); // Wrong magic cookie
+        msg[8..20].copy_from_slice(&transaction_id);
+
+        let result = StunClient::parse_binding_response(&msg, &transaction_id);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StunError::InvalidResponse(msg) => {
+                assert!(msg.contains("magic cookie"), "Expected 'magic cookie' in error, got: {}", msg);
+            }
+            other => panic!("Expected InvalidResponse, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_transaction_id_mismatch() {
+        let expected_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let wrong_id: [u8; 12] = [99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89, 88];
+
+        // Build response with wrong transaction ID
+        let response = build_test_response(&wrong_id, &[]);
+
+        let result = StunClient::parse_binding_response(&response, &expected_id);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StunError::InvalidResponse(msg) => {
+                assert!(msg.contains("Transaction ID mismatch"), "Expected 'Transaction ID mismatch' in error, got: {}", msg);
+            }
+            other => panic!("Expected InvalidResponse, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_mapped_address_in_response() {
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // Valid header with no attributes at all
+        let response = build_test_response(&transaction_id, &[]);
+
+        let result = StunClient::parse_binding_response(&response, &transaction_id);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StunError::InvalidResponse(msg) => {
+                assert!(msg.contains("No mapped address"), "Expected 'No mapped address' in error, got: {}", msg);
+            }
+            other => panic!("Expected InvalidResponse, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unknown_address_family() {
+        let magic_cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+        let transaction_id: [u8; 12] = [0; 12];
+
+        // Build XOR-MAPPED-ADDRESS with unknown family 0x03
+        let mut data = vec![0u8; 8];
+        data[1] = 0x03; // Unknown family
+        BigEndian::write_u16(&mut data[2..4], 1234);
+        BigEndian::write_u32(&mut data[4..8], 0x12345678);
+
+        let result = StunClient::parse_xor_mapped_address(&data, &magic_cookie, &transaction_id);
+        assert!(result.is_none(), "Expected None for unknown address family 0x03");
+    }
+
+    #[test]
+    fn test_truncated_attribute_too_short_for_header() {
+        let magic_cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+        let transaction_id: [u8; 12] = [0; 12];
+
+        // Only 6 bytes — less than the minimum 8 required.
+        // The initial length guard (data.len() < 8) rejects this before
+        // the family byte is even examined.
+        let mut data = vec![0u8; 6];
+        data[1] = 0x01; // IPv4 family (irrelevant — rejected by length)
+
+        let result = StunClient::parse_xor_mapped_address(&data, &magic_cookie, &transaction_id);
+        assert!(result.is_none(), "Expected None for attribute shorter than 8 bytes");
+    }
+
+    #[test]
+    fn test_truncated_ipv6_attribute() {
+        let magic_cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+        let transaction_id: [u8; 12] = [0; 12];
+
+        // 12 bytes with IPv6 family - less than the 20 required for IPv6
+        let mut data = vec![0u8; 12];
+        data[1] = 0x02; // IPv6 family
+        BigEndian::write_u16(&mut data[2..4], 5555);
+
+        let result = StunClient::parse_xor_mapped_address(&data, &magic_cookie, &transaction_id);
+        assert!(result.is_none(), "Expected None for truncated IPv6 attribute (< 20 bytes)");
+    }
+
+    // ==================== Edge case tests ====================
+
+    #[test]
+    fn test_no_servers_configured() {
+        let client = StunClient::new(vec![]);
+        assert!(!client.has_servers(), "Expected has_servers() to return false for empty server list");
+    }
+
+    #[test]
+    fn test_single_result_not_symmetric_nat() {
+        let result = StunBindingResult {
+            reflexive_address: "203.0.113.1:12345".parse().unwrap(),
+            server_address: "8.8.8.8:3478".parse().unwrap(),
+            rtt: Duration::from_millis(50),
+        };
+
+        assert!(
+            !detect_symmetric_nat(&[result]),
+            "Expected false for single STUN result (need at least 2 to detect symmetric NAT)"
+        );
+    }
+
+    #[test]
+    fn test_empty_results_not_symmetric_nat() {
+        assert!(
+            !detect_symmetric_nat(&[]),
+            "Expected false for empty STUN results"
+        );
+    }
+
+    #[test]
+    fn test_transaction_id_uniqueness() {
+        let id1 = StunClient::generate_transaction_id();
+        let id2 = StunClient::generate_transaction_id();
+
+        assert_ne!(
+            id1, id2,
+            "Two consecutive transaction IDs should be different (with overwhelming probability)"
+        );
+    }
 }

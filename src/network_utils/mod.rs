@@ -117,3 +117,80 @@ pub trait Node: Send + Sync {
     /// Returns the ID of this node as a field element for protocol specific usage.
     fn scalar_id<F: Field>(&self) -> F;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_node_public_key_derive_id_consistency() {
+        let key = NodePublicKey(vec![1, 2, 3, 4, 5]);
+        let id_first = key.derive_id();
+        let id_second = key.derive_id();
+        assert_eq!(id_first, id_second, "derive_id must return the same value for the same key bytes");
+    }
+
+    #[test]
+    fn test_node_public_key_derive_id_different() {
+        let key_a = NodePublicKey(vec![1, 2, 3]);
+        let key_b = NodePublicKey(vec![4, 5, 6]);
+        assert_ne!(
+            key_a.derive_id(),
+            key_b.derive_id(),
+            "derive_id should return different values for different key bytes"
+        );
+    }
+
+    #[test]
+    fn test_network_error_display_non_empty() {
+        let variants: Vec<NetworkError> = vec![
+            NetworkError::SendError,
+            NetworkError::Timeout,
+            NetworkError::PartyNotFound(42),
+            NetworkError::ClientNotFound(99),
+        ];
+
+        for error in &variants {
+            let display = format!("{}", error);
+            assert!(
+                !display.is_empty(),
+                "Display output for {:?} must not be empty",
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn test_client_type_variants_distinct() {
+        let server = ClientType::Server;
+        let client = ClientType::Client;
+
+        assert!(
+            matches!(server, ClientType::Server),
+            "server variant should match ClientType::Server"
+        );
+        assert!(
+            !matches!(server, ClientType::Client),
+            "server variant should not match ClientType::Client"
+        );
+        assert!(
+            matches!(client, ClientType::Client),
+            "client variant should match ClientType::Client"
+        );
+        assert!(
+            !matches!(client, ClientType::Server),
+            "client variant should not match ClientType::Server"
+        );
+    }
+
+    #[test]
+    fn test_node_public_key_derive_id_empty() {
+        let key = NodePublicKey(vec![]);
+        let id_first = key.derive_id();
+        let id_second = key.derive_id();
+        assert_eq!(
+            id_first, id_second,
+            "derive_id on empty bytes must be deterministic"
+        );
+    }
+}

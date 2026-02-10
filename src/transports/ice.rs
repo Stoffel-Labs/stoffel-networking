@@ -430,4 +430,259 @@ mod tests {
         assert!(candidates.pwd.len() >= 22);
         assert!(candidates.is_empty());
     }
+
+    // ---- Happy path tests ----
+
+    #[test]
+    fn test_priority_with_max_local_preference() {
+        let priority = IceCandidate::calculate_priority(CandidateType::Host, 65535, 1);
+        let expected = (126u32 << 24) + (65535u32 << 8) + 255;
+        assert_eq!(priority, expected);
+    }
+
+    #[test]
+    fn test_pair_formation_multiple_candidates_mixed_types() {
+        // Use mixed candidate types so pairs have genuinely different priorities
+        let local_host = IceCandidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 5000),
+            1,
+        );
+        let stun_server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 3478);
+        let local_srflx = IceCandidate::server_reflexive(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 5001),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 5000),
+            stun_server,
+            1,
+        );
+        let remote1 = IceCandidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 6000),
+            1,
+        );
+        let remote2 = IceCandidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 6001),
+            1,
+        );
+
+        let locals = vec![local_host, local_srflx];
+        let remotes = vec![remote1, remote2];
+
+        let pairs = CandidatePair::form_pairs(&locals, &remotes, true);
+
+        assert_eq!(pairs.len(), 4);
+        // With mixed types, priorities should differ — verify strictly descending
+        for window in pairs.windows(2) {
+            assert!(window[0].priority >= window[1].priority);
+        }
+        // Host-host pairs should have higher priority than srflx-host pairs
+        assert!(pairs[0].priority > pairs[pairs.len() - 1].priority);
+    }
+
+    #[test]
+    fn test_peer_reflexive_candidate_construction() {
+        let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 12345);
+        let base = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5000);
+
+        let candidate = IceCandidate::peer_reflexive(reflexive, base, 1);
+
+        assert_eq!(candidate.candidate_type, CandidateType::PeerReflexive);
+        assert_eq!(candidate.address, reflexive);
+        assert_eq!(candidate.related_address, Some(base));
+        assert!(candidate.stun_server.is_none());
+    }
+
+    #[test]
+    fn test_best_candidate_returns_highest_priority() {
+        let mut lc = LocalCandidates::new();
+
+        let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5000);
+        lc.add_host(host_addr);
+
+        let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 12345);
+        let base = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5000);
+        let stun = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 3478);
+        lc.add_server_reflexive(reflexive, base, stun);
+
+        let best = lc.best_candidate().expect("should have a best candidate");
+        assert_eq!(best.candidate_type, CandidateType::Host);
+    }
+
+    // ---- Semi-honest tests ----
+
+    #[test]
+    fn test_component_id_clamped_at_256() {
+        let priority_large = IceCandidate::calculate_priority(CandidateType::Host, 65535, 1000);
+        let priority_256 = IceCandidate::calculate_priority(CandidateType::Host, 65535, 256);
+        assert_eq!(priority_large, priority_256);
+    }
+
+    #[test]
+    fn test_pair_priority_tiebreaker_symmetry() {
+        let p1 = CandidatePair::calculate_pair_priority(100, 50);
+        let p2 = CandidatePair::calculate_pair_priority(50, 100);
+        assert_ne!(p1, p2);
+
+        // The difference should be exactly the tie-breaker bit (1)
+        // p1 has tie_breaker=1 (100 > 50), p2 has tie_breaker=0 (50 < 100)
+        assert_eq!(p1 - p2, 1);
+    }
+
+    #[test]
+    fn test_empty_candidates_produce_zero_pairs() {
+        let local = vec![IceCandidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5000),
+            1,
+        )];
+        let empty: Vec<IceCandidate> = vec![];
+
+        let pairs1 = CandidatePair::form_pairs(&empty, &local, true);
+        assert_eq!(pairs1.len(), 0);
+
+        let pairs2 = CandidatePair::form_pairs(&local, &empty, true);
+        assert_eq!(pairs2.len(), 0);
+
+        let pairs3 = CandidatePair::form_pairs(&empty, &empty, true);
+        assert_eq!(pairs3.len(), 0);
+    }
+
+    #[test]
+    fn test_best_candidate_on_empty_returns_none() {
+        let lc = LocalCandidates::new();
+        assert!(lc.best_candidate().is_none());
+    }
+
+    // ---- Malicious/adversarial tests ----
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "overflow")]
+    fn test_pair_priority_with_max_u32_overflows_in_debug() {
+        // u32::MAX inputs cause arithmetic overflow in the RFC 8445 formula.
+        // In debug mode this panics. In release mode overflow wraps silently.
+        // Note: u32::MAX is not a realistic priority (max from calculate_priority is ~2.13B).
+        let _ = CandidatePair::calculate_pair_priority(u32::MAX, u32::MAX);
+    }
+
+    #[test]
+    fn test_pair_priority_with_realistic_max_inputs() {
+        // The maximum realistic priority from calculate_priority is (126 << 24) + (65535 << 8) + 255 = 2130706175.
+        // Verify the pair priority formula works without overflow for realistic maximums.
+        let max_real_priority = (126u32 << 24) + (65535u32 << 8) + 255;
+        let priority = CandidatePair::calculate_pair_priority(max_real_priority, max_real_priority);
+        // min=max=max_real_priority, tie_breaker=0
+        let expected = (1u64 << 32) * (max_real_priority as u64) + 2 * (max_real_priority as u64);
+        assert_eq!(priority, expected);
+    }
+
+    #[test]
+    fn test_candidate_flooding_no_panic() {
+        let locals: Vec<IceCandidate> = (0..100)
+            .map(|i| {
+                IceCandidate::host(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)), 5000 + i as u16),
+                    1,
+                )
+            })
+            .collect();
+
+        let remotes: Vec<IceCandidate> = (0..100)
+            .map(|i| {
+                IceCandidate::host(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, (i / 256) as u8, (i % 256) as u8)), 6000 + i as u16),
+                    1,
+                )
+            })
+            .collect();
+
+        let pairs = CandidatePair::form_pairs(&locals, &remotes, true);
+        // 100 * 100 = 10000 pairs (all Host+IPv4 with unique foundations, no dedup)
+        assert_eq!(pairs.len(), 10000);
+        // Verify sort order is maintained
+        for window in pairs.windows(2) {
+            assert!(window[0].priority >= window[1].priority);
+        }
+    }
+
+    #[test]
+    fn test_foundation_uniqueness_different_types() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5000);
+        let stun = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 3478);
+
+        let host = IceCandidate::host(addr, 1);
+        let srflx = IceCandidate::server_reflexive(addr, addr, stun, 1);
+
+        assert_ne!(host.foundation, srflx.foundation);
+    }
+
+    #[test]
+    fn test_ipv4_ipv6_mixing_produces_zero_pairs() {
+        use std::net::Ipv6Addr;
+
+        let local_v4 = vec![IceCandidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5000),
+            1,
+        )];
+
+        let remote_v6 = vec![IceCandidate::host(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6000),
+            1,
+        )];
+
+        let pairs = CandidatePair::form_pairs(&local_v4, &remote_v6, true);
+        assert_eq!(pairs.len(), 0);
+    }
+
+    // ---- Additional edge case tests ----
+
+    #[test]
+    fn test_type_preferences_ordered() {
+        assert!(CandidateType::Host.type_preference() > CandidateType::PeerReflexive.type_preference());
+        assert!(CandidateType::PeerReflexive.type_preference() > CandidateType::ServerReflexive.type_preference());
+        assert!(CandidateType::ServerReflexive.type_preference() > CandidateType::Relay.type_preference());
+    }
+
+    #[test]
+    fn test_ipv4_local_preference_higher_than_ipv6() {
+        use std::net::Ipv6Addr;
+
+        let ipv4_candidate = IceCandidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5000),
+            1,
+        );
+        let ipv6_candidate = IceCandidate::host(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5000),
+            1,
+        );
+
+        assert!(ipv4_candidate.priority > ipv6_candidate.priority);
+    }
+
+    #[test]
+    fn test_local_candidates_len_and_is_empty() {
+        let mut lc = LocalCandidates::new();
+        assert!(lc.is_empty());
+        assert_eq!(lc.len(), 0);
+
+        lc.add_host(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5000));
+        lc.add_host(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5001));
+
+        assert!(!lc.is_empty());
+        assert_eq!(lc.len(), 2);
+    }
+
+    #[test]
+    fn test_candidate_pair_initial_state_frozen() {
+        let local = IceCandidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5000),
+            1,
+        );
+        let remote = IceCandidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 6000),
+            1,
+        );
+
+        let pair = CandidatePair::new(local, remote, true);
+
+        assert_eq!(pair.state, CandidatePairState::Frozen);
+        assert!(!pair.nominated);
+    }
 }

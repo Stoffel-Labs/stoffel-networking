@@ -2,6 +2,15 @@
 name = "stoffelnet"
 version = "0.1.0"
 edition = "2021"
+contributors = ["Stoffel Labs Inc"]
+homepage = "stoffelmpc.com"
+repository = "https://github.com/Stoffel-Labs/stoffel-networking.git"
+categories = ["cryptography", "network-programming"]
+keywords = ["api", "protocol", "networking", "client", "server"]
+license = "Apache-2.0"
+readme = "README.md"
+description = "A library that contains networking utilities for the Stoffel stack"
+
 
 [lib]
 crate-type = ["rlib", "cdylib"]

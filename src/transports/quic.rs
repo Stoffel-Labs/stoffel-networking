@@ -5,7 +5,17 @@
 //! This implementation uses persistent bidirectional streams with improved
 //! connection state management and graceful handling of stream/connection closures.
 
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, IdleTimeout};
+use crate::network_utils::{
+    ClientId, ClientType, Message, Network, NetworkError, Node, NodePublicKey, PartyId,
+};
+use crate::transports::ice::LocalCandidates;
+use crate::transports::ice_agent::IceAgent;
+use crate::transports::net_envelope::NetEnvelope;
+use crate::transports::stun::StunClient;
+use ark_ff::Field;
+use async_trait::async_trait;
+use dashmap::{DashMap, DashSet};
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
@@ -13,18 +23,10 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use dashmap::{DashMap, DashSet};
-use crate::network_utils::{ClientId, ClientType, Message, Network, NetworkError, Node, NodePublicKey, PartyId};
-use tokio::sync::{Mutex, mpsc};
-use ark_ff::Field;
-use async_trait::async_trait;
-use uuid::Uuid;
 use std::time::Duration;
-use crate::transports::net_envelope::NetEnvelope;
-use crate::transports::ice::LocalCandidates;
-use crate::transports::ice_agent::IceAgent;
-use crate::transports::stun::StunClient;
-use tracing::{debug, info, warn, trace};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, info, trace, warn};
+use uuid::Uuid;
 use x509_parser::prelude::*;
 
 // ============================================================================
@@ -40,10 +42,14 @@ const ALPN_SERVER_PROTOCOL: &[u8] = b"server-protocol";
 // CONNECTION STATE
 // ============================================================================
 
-/// Represents the current state of a connection
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Represents the current state of a connection.
+///
+/// The state transitions are: `Connected` → `Closing` → `Closed`,
+/// or `Connected` → `Disconnected` (for unexpected disconnections).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
-    /// Connection is active and healthy
+    /// Connection is active and healthy (default state)
+    #[default]
     Connected,
     /// Connection is gracefully closing
     Closing,
@@ -57,8 +63,10 @@ pub enum ConnectionState {
 // CUSTOM ERROR TYPE
 // ============================================================================
 
-/// Error type for connection operations
-#[derive(Debug, Clone)]
+/// Error type for connection operations.
+///
+/// These errors are returned by [`PeerConnection`] methods when operations fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionError {
     /// Stream closed gracefully by peer
     StreamClosed,
@@ -115,9 +123,7 @@ pub trait PeerConnection: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
     /// Receives data from the peer
-    fn receive<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+    fn receive<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
 
     /// Returns the address of the remote peer
     fn remote_address(&self) -> SocketAddr;
@@ -144,7 +150,11 @@ pub trait PeerConnection: Send + Sync {
 
 impl Debug for dyn PeerConnection {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PeerConnection {{ remote_address: {} }}", self.remote_address())
+        write!(
+            f,
+            "PeerConnection {{ remote_address: {} }}",
+            self.remote_address()
+        )
     }
 }
 
@@ -181,83 +191,88 @@ async fn send_framed_message(
     data: &[u8],
 ) -> Result<(), ConnectionError> {
     if data.len() > MAX_MESSAGE_SIZE {
-        return Err(ConnectionError::FramingError(
-            format!("Message size {} exceeds maximum {}", data.len(), MAX_MESSAGE_SIZE)
-        ));
+        return Err(ConnectionError::FramingError(format!(
+            "Message size {} exceeds maximum {}",
+            data.len(),
+            MAX_MESSAGE_SIZE
+        )));
     }
 
     // Write 4-byte length prefix (big-endian)
     let len = data.len() as u32;
-    send.write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| {
-            // Check if this is a connection error
-            if e.to_string().contains("closed") || e.to_string().contains("reset") {
-                ConnectionError::ConnectionLost(format!("Connection lost while writing length: {}", e))
-            } else {
-                ConnectionError::SendFailed(format!("Failed to write length: {}", e))
-            }
-        })?;
+    send.write_all(&len.to_be_bytes()).await.map_err(|e| {
+        // Check if this is a connection error
+        if e.to_string().contains("closed") || e.to_string().contains("reset") {
+            ConnectionError::ConnectionLost(format!("Connection lost while writing length: {}", e))
+        } else {
+            ConnectionError::SendFailed(format!("Failed to write length: {}", e))
+        }
+    })?;
 
     // Write message payload
-    send.write_all(data)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("closed") || e.to_string().contains("reset") {
-                ConnectionError::ConnectionLost(format!("Connection lost while writing payload: {}", e))
-            } else {
-                ConnectionError::SendFailed(format!("Failed to write payload: {}", e))
-            }
-        })?;
+    send.write_all(data).await.map_err(|e| {
+        if e.to_string().contains("closed") || e.to_string().contains("reset") {
+            ConnectionError::ConnectionLost(format!("Connection lost while writing payload: {}", e))
+        } else {
+            ConnectionError::SendFailed(format!("Failed to write payload: {}", e))
+        }
+    })?;
 
     Ok(())
 }
 
 /// Receives a length-prefixed message with better EOF handling
-async fn recv_framed_message(
-    recv: &mut quinn::RecvStream,
-) -> Result<Vec<u8>, ConnectionError> {
+async fn recv_framed_message(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, ConnectionError> {
     // Read 4-byte length prefix
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| match e {
-            quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
-            quinn::ReadExactError::ReadError(re) => {
-                // Check if this is a connection lost scenario
-                let err_str = re.to_string();
-                if err_str.contains("closed") || err_str.contains("reset") || err_str.contains("connection lost") {
-                    ConnectionError::ConnectionLost(format!("Connection lost while reading length: {}", re))
-                } else {
-                    ConnectionError::ReceiveFailed(format!("Failed to read length: {}", re))
-                }
+    recv.read_exact(&mut len_buf).await.map_err(|e| match e {
+        quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
+        quinn::ReadExactError::ReadError(re) => {
+            // Check if this is a connection lost scenario
+            let err_str = re.to_string();
+            if err_str.contains("closed")
+                || err_str.contains("reset")
+                || err_str.contains("connection lost")
+            {
+                ConnectionError::ConnectionLost(format!(
+                    "Connection lost while reading length: {}",
+                    re
+                ))
+            } else {
+                ConnectionError::ReceiveFailed(format!("Failed to read length: {}", re))
             }
-        })?;
+        }
+    })?;
 
     let len = u32::from_be_bytes(len_buf) as usize;
 
     // Validate message size
     if len > MAX_MESSAGE_SIZE {
-        return Err(ConnectionError::FramingError(
-            format!("Message size {} exceeds maximum {}", len, MAX_MESSAGE_SIZE)
-        ));
+        return Err(ConnectionError::FramingError(format!(
+            "Message size {} exceeds maximum {}",
+            len, MAX_MESSAGE_SIZE
+        )));
     }
 
     // Read message payload
     let mut msg = vec![0u8; len];
-    recv.read_exact(&mut msg)
-        .await
-        .map_err(|e| match e {
-            quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
-            quinn::ReadExactError::ReadError(re) => {
-                let err_str = re.to_string();
-                if err_str.contains("closed") || err_str.contains("reset") || err_str.contains("connection lost") {
-                    ConnectionError::ConnectionLost(format!("Connection lost while reading payload: {}", re))
-                } else {
-                    ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re))
-                }
+    recv.read_exact(&mut msg).await.map_err(|e| match e {
+        quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
+        quinn::ReadExactError::ReadError(re) => {
+            let err_str = re.to_string();
+            if err_str.contains("closed")
+                || err_str.contains("reset")
+                || err_str.contains("connection lost")
+            {
+                ConnectionError::ConnectionLost(format!(
+                    "Connection lost while reading payload: {}",
+                    re
+                ))
+            } else {
+                ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re))
             }
-        })?;
+        }
+    })?;
 
     Ok(msg)
 }
@@ -266,6 +281,16 @@ async fn recv_framed_message(
 // QUIC PEER CONNECTION
 // ============================================================================
 
+/// A QUIC-based peer connection with persistent bidirectional streams.
+///
+/// This type implements [`PeerConnection`] using QUIC as the underlying transport.
+/// It uses interior mutability (`Arc<Mutex<>>`) for safe sharing across async tasks.
+///
+/// # Drop Behavior
+///
+/// Dropping a `QuicPeerConnection` will close the underlying QUIC connection
+/// immediately without waiting for graceful shutdown. For graceful closure,
+/// call [`close()`](PeerConnection::close) and await it before dropping.
 #[derive(Clone)]
 pub struct QuicPeerConnection {
     connection: Connection,
@@ -281,6 +306,17 @@ pub struct QuicPeerConnection {
     peer_public_key: Option<NodePublicKey>,
     /// Remote peer's party ID (set by manager after connection)
     remote_party_id: Arc<std::sync::Mutex<Option<PartyId>>>,
+}
+
+impl std::fmt::Debug for QuicPeerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicPeerConnection")
+            .field("remote_addr", &self.remote_addr)
+            .field("connection_role", &self.connection_role)
+            .field("peer_public_key", &self.peer_public_key.is_some())
+            .field("remote_party_id", &self.remote_party_id.lock().ok())
+            .finish_non_exhaustive()
+    }
 }
 
 impl QuicPeerConnection {
@@ -312,12 +348,9 @@ impl QuicPeerConnection {
         peer_public_key: Option<NodePublicKey>,
     ) -> Result<Self, ConnectionError> {
         let remote_addr = connection.remote_address();
-        let (send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| ConnectionError::InitializationFailed(
-                format!("Failed to open stream: {}", e)
-            ))?;
+        let (send, recv) = connection.open_bi().await.map_err(|e| {
+            ConnectionError::InitializationFailed(format!("Failed to open stream: {}", e))
+        })?;
 
         Ok(Self {
             connection,
@@ -400,9 +433,7 @@ impl PeerConnection for QuicPeerConnection {
         })
     }
 
-    fn receive<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+    fn receive<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
         Box::pin(async move {
             // Check state before receiving
             {
@@ -438,7 +469,8 @@ impl PeerConnection for QuicPeerConnection {
     fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             self.update_state(ConnectionState::Closing).await;
-            self.connection.close(0u32.into(), b"Connection closed gracefully");
+            self.connection
+                .close(0u32.into(), b"Connection closed gracefully");
             self.update_state(ConnectionState::Closed).await;
             Ok(())
         })
@@ -480,6 +512,11 @@ impl PeerConnection for QuicPeerConnection {
 // LOOPBACK PEER CONNECTION (for self-delivery)
 // ============================================================================
 
+/// A loopback peer connection for self-delivery.
+///
+/// This type implements [`PeerConnection`] using in-memory channels,
+/// allowing a node to send messages to itself without network I/O.
+/// Used for MPC protocols where a party may need to process its own messages.
 pub struct LoopbackPeerConnection {
     remote_addr: SocketAddr,
     tx: mpsc::Sender<Vec<u8>>,
@@ -487,6 +524,16 @@ pub struct LoopbackPeerConnection {
     state: Arc<Mutex<ConnectionState>>,
     connection_role: ClientType,
     remote_party_id: Arc<std::sync::Mutex<Option<PartyId>>>,
+}
+
+impl std::fmt::Debug for LoopbackPeerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopbackPeerConnection")
+            .field("remote_addr", &self.remote_addr)
+            .field("connection_role", &self.connection_role)
+            .field("remote_party_id", &self.remote_party_id.lock().ok())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LoopbackPeerConnection {
@@ -514,16 +561,20 @@ impl LoopbackPeerConnection {
     /// Helper to unframe a message (for consistency with QUIC)
     fn unframe_message(framed: Vec<u8>) -> Result<Vec<u8>, ConnectionError> {
         if framed.len() < 4 {
-            return Err(ConnectionError::FramingError("Message too short".to_string()));
+            return Err(ConnectionError::FramingError(
+                "Message too short".to_string(),
+            ));
         }
 
         let len_bytes: [u8; 4] = framed[0..4].try_into().unwrap();
         let len = u32::from_be_bytes(len_bytes) as usize;
 
         if framed.len() != 4 + len {
-            return Err(ConnectionError::FramingError(
-                format!("Length mismatch: expected {}, got {}", len, framed.len() - 4)
-            ));
+            return Err(ConnectionError::FramingError(format!(
+                "Length mismatch: expected {}, got {}",
+                len,
+                framed.len() - 4
+            )));
         }
 
         Ok(framed[4..].to_vec())
@@ -551,40 +602,36 @@ impl PeerConnection for LoopbackPeerConnection {
             }
 
             let framed = Self::frame_message(data);
-            self.tx
-                .send(framed)
-                .await
-                .map_err(|e| {
-                    // Channel closed - update state
-                    tokio::spawn({
-                        let state = self.state.clone();
-                        async move {
-                            let mut s = state.lock().await;
-                            *s = ConnectionState::Closed;
-                        }
-                    });
-                    format!("Loopback send failed: {}", e)
-                })
+            self.tx.send(framed).await.map_err(|e| {
+                // Channel closed - update state
+                tokio::spawn({
+                    let state = self.state.clone();
+                    async move {
+                        let mut s = state.lock().await;
+                        *s = ConnectionState::Closed;
+                    }
+                });
+                format!("Loopback send failed: {}", e)
+            })
         })
     }
 
-    fn receive<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+    fn receive<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
         Box::pin(async move {
             // Check state
             {
                 let state = self.state.lock().await;
                 if *state == ConnectionState::Closed || *state == ConnectionState::Disconnected {
-                    return Err(format!("Cannot receive: loopback connection is {:?}", *state));
+                    return Err(format!(
+                        "Cannot receive: loopback connection is {:?}",
+                        *state
+                    ));
                 }
             }
 
             let mut rx = self.rx.lock().await;
             match rx.recv().await {
-                Some(framed) => {
-                    Self::unframe_message(framed).map_err(|e| e.to_string())
-                }
+                Some(framed) => Self::unframe_message(framed).map_err(|e| e.to_string()),
                 None => {
                     self.update_state(ConnectionState::Closed).await;
                     Err("Loopback connection closed".to_string())
@@ -652,19 +699,18 @@ async fn send_stream_sync(send: &mut quinn::SendStream) -> Result<(), Connection
 /// Receives the sync byte to acknowledge stream establishment (called by connection acceptor)
 async fn recv_stream_sync(recv: &mut quinn::RecvStream) -> Result<(), ConnectionError> {
     let mut buf = [0u8; 1];
-    recv.read_exact(&mut buf)
-        .await
-        .map_err(|e| match e {
-            quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
-            quinn::ReadExactError::ReadError(re) => {
-                ConnectionError::ReceiveFailed(format!("Failed to receive sync: {}", re))
-            }
-        })?;
+    recv.read_exact(&mut buf).await.map_err(|e| match e {
+        quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
+        quinn::ReadExactError::ReadError(re) => {
+            ConnectionError::ReceiveFailed(format!("Failed to receive sync: {}", re))
+        }
+    })?;
 
     if buf[0] != STREAM_SYNC_BYTE {
-        return Err(ConnectionError::FramingError(
-            format!("Invalid sync byte: expected {:#x}, got {:#x}", STREAM_SYNC_BYTE, buf[0])
-        ));
+        return Err(ConnectionError::FramingError(format!(
+            "Invalid sync byte: expected {:#x}, got {:#x}",
+            STREAM_SYNC_BYTE, buf[0]
+        )));
     }
 
     Ok(())
@@ -709,7 +755,11 @@ fn extract_alpn_role(connection: &Connection) -> Result<ClientType, String> {
 // QUIC NODE
 // ============================================================================
 
-#[derive(Debug, Clone)]
+/// A network node identified by UUID and socket address.
+///
+/// `QuicNode` represents a participant in the MPC network. Each node has a
+/// unique UUID and a network address where it can be reached.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QuicNode {
     uuid: Uuid,
     address: SocketAddr,
@@ -755,10 +805,16 @@ impl Node for QuicNode {
 // NETWORK CONFIG AND MESSAGE
 // ============================================================================
 
-#[derive(Debug, Clone)]
+/// Configuration for the QUIC network manager.
+///
+/// Controls connection timeouts, TLS settings, and NAT traversal options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuicNetworkConfig {
+    /// Connection timeout in milliseconds
     pub timeout_ms: u64,
+    /// Maximum connection retry attempts
     pub max_retries: u32,
+    /// Enable TLS encryption (should be true for production)
     pub use_tls: bool,
 
     // NAT Traversal Configuration
@@ -791,7 +847,53 @@ impl Default for QuicNetworkConfig {
     }
 }
 
+/// Configuration validation errors for [`QuicNetworkConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuicConfigError {
+    /// Timeout must be positive
+    InvalidTimeout,
+    /// ICE configuration is invalid
+    InvalidIceConfig(crate::transports::ice_agent::ConfigError),
+}
+
+impl std::fmt::Display for QuicConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTimeout => write!(f, "Timeout must be positive"),
+            Self::InvalidIceConfig(err) => write!(f, "Invalid ICE configuration: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for QuicConfigError {}
+
+impl From<crate::transports::ice_agent::ConfigError> for QuicConfigError {
+    fn from(err: crate::transports::ice_agent::ConfigError) -> Self {
+        QuicConfigError::InvalidIceConfig(err)
+    }
+}
+
 impl QuicNetworkConfig {
+    /// Validates the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `timeout_ms` is zero
+    /// - The embedded `ice_config` fails validation
+    ///
+    /// # Note
+    ///
+    /// If `enable_nat_traversal` is true but `stun_servers` is empty, the configuration
+    /// is still valid, but NAT traversal will not discover reflexive addresses.
+    pub fn validate(&self) -> Result<(), QuicConfigError> {
+        if self.timeout_ms == 0 {
+            return Err(QuicConfigError::InvalidTimeout);
+        }
+        self.ice_config.validate()?;
+        Ok(())
+    }
+
     /// Creates a config with NAT traversal enabled
     pub fn with_nat_traversal() -> Self {
         Self {
@@ -843,6 +945,36 @@ impl Message for QuicMessage {
 // QUIC NETWORK MANAGER (Actor-Compatible)
 // ============================================================================
 
+/// QUIC-based network manager for MPC peer-to-peer communication.
+///
+/// `QuicNetworkManager` is the primary entry point for establishing and managing
+/// network connections in stoffelnet. It implements both [`NetworkManager`] and
+/// [`Network`] traits, providing both low-level connection management and
+/// high-level MPC-oriented messaging.
+///
+/// # Features
+///
+/// - Manages both peer-to-peer (server) and client connections
+/// - Supports NAT traversal via ICE/STUN when configured
+/// - Automatically generates and manages TLS certificates
+/// - Thread-safe with `Arc<DashMap<>>` for concurrent access
+///
+/// # Example
+///
+/// ```no_run
+/// use stoffelnet::transports::quic::{QuicNetworkManager, QuicNetworkConfig};
+///
+/// // Create with default configuration
+/// let manager = QuicNetworkManager::new();
+///
+/// // Or with custom configuration
+/// let config = QuicNetworkConfig {
+///     timeout_ms: 5000,
+///     max_retries: 5,
+///     ..Default::default()
+/// };
+/// let manager = QuicNetworkManager::with_config(config);
+/// ```
 #[derive(Clone)]
 pub struct QuicNetworkManager {
     endpoint: Option<Endpoint>,
@@ -869,6 +1001,23 @@ pub struct QuicNetworkManager {
     local_candidates: Arc<Mutex<Option<LocalCandidates>>>,
     /// Pending ICE agents for hole punching
     pending_ice_agents: Arc<DashMap<PartyId, IceAgent>>,
+}
+
+impl std::fmt::Debug for QuicNetworkManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicNetworkManager")
+            .field("node_id", &self.node_id)
+            .field("endpoint_bound", &self.endpoint.is_some())
+            .field("nodes_count", &self.nodes.len())
+            .field("server_connections_count", &self.server_connections.len())
+            .field("client_connections_count", &self.client_connections.len())
+            .field("has_local_cert", &self.local_cert_der.is_some())
+            .field(
+                "nat_traversal_enabled",
+                &self.network_config.enable_nat_traversal,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for QuicNetworkManager {
@@ -904,14 +1053,45 @@ impl QuicNetworkManager {
         manager
     }
 
+    /// Creates a network manager with the given configuration.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if the configuration is invalid (e.g., zero timeout,
+    /// NAT traversal enabled without STUN servers). Use [`try_with_config`](Self::try_with_config)
+    /// for fallible construction.
     pub fn with_config(config: QuicNetworkConfig) -> Self {
+        debug_assert!(
+            config.validate().is_ok(),
+            "Invalid QuicNetworkConfig: {:?}",
+            config.validate().unwrap_err()
+        );
+
+        Self::create_from_config(config)
+    }
+
+    /// Creates a network manager with the given configuration, validating it first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid. See [`QuicNetworkConfig::validate`]
+    /// for details on validation rules.
+    pub fn try_with_config(config: QuicNetworkConfig) -> Result<Self, QuicConfigError> {
+        config.validate()?;
+        Ok(Self::create_from_config(config))
+    }
+
+    /// Internal constructor used by both `with_config` and `try_with_config`.
+    fn create_from_config(config: QuicNetworkConfig) -> Self {
         let stun_client = if config.enable_nat_traversal {
             let stun_servers = config
                 .stun_servers
                 .iter()
                 .map(|addr| crate::transports::stun::StunServerConfig::new(*addr))
                 .collect();
-            Some(Arc::new(crate::transports::stun::StunClient::new(stun_servers)))
+            Some(Arc::new(crate::transports::stun::StunClient::new(
+                stun_servers,
+            )))
         } else {
             None
         };
@@ -953,14 +1133,19 @@ impl QuicNetworkManager {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             self.server_connections.insert(
                 self.node_id,
-                Arc::new(LoopbackPeerConnection::new(addr, Some(self.local_derived_id()))) as Arc<dyn PeerConnection>
+                Arc::new(LoopbackPeerConnection::new(
+                    addr,
+                    Some(self.local_derived_id()),
+                )) as Arc<dyn PeerConnection>,
             );
         }
     }
 
     /// Gets a server connection by party ID
     pub async fn get_connection(&self, party_id: PartyId) -> Option<Arc<dyn PeerConnection>> {
-        self.server_connections.get(&party_id).map(|entry| Arc::clone(entry.value()))
+        self.server_connections
+            .get(&party_id)
+            .map(|entry| Arc::clone(entry.value()))
     }
 
     /// Gets all server connections (peer-to-peer MPC party connections)
@@ -981,7 +1166,9 @@ impl QuicNetworkManager {
 
     /// Gets a specific client connection by ID
     pub fn get_client_connection(&self, client_id: ClientId) -> Option<Arc<dyn PeerConnection>> {
-        self.client_connections.get(&client_id).map(|entry| Arc::clone(entry.value()))
+        self.client_connections
+            .get(&client_id)
+            .map(|entry| Arc::clone(entry.value()))
     }
 
     /// Removes dead connections from both server and client connection maps
@@ -1083,11 +1270,12 @@ impl QuicNetworkManager {
     /// Creates self-signed server config using provided DER-encoded certificate and key.
     /// Accepts both ALPN_SERVER_PROTOCOL and ALPN_CLIENT_PROTOCOL for incoming connections.
     /// Requests (but doesn't require) client certificates for mutual TLS.
-    fn create_self_signed_server_config(cert_der_bytes: &[u8], key_der_bytes: &[u8]) -> Result<ServerConfig, String> {
+    fn create_self_signed_server_config(
+        cert_der_bytes: &[u8],
+        key_der_bytes: &[u8],
+    ) -> Result<ServerConfig, String> {
         let cert_der = CertificateDer::from(cert_der_bytes.to_vec());
-        let key_der = PrivateKeyDer::Pkcs8(
-            PrivatePkcs8KeyDer::from(key_der_bytes.to_vec())
-        );
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der_bytes.to_vec()));
 
         // Use custom client cert verifier that accepts all client certificates
         // This enables mutual TLS where clients can optionally present certificates
@@ -1097,10 +1285,8 @@ impl QuicNetworkManager {
             .map_err(|e| format!("Failed to create server crypto config: {}", e))?;
 
         // Accept both ALPN protocols for incoming connections
-        server_crypto.alpn_protocols = vec![
-            ALPN_SERVER_PROTOCOL.to_vec(),
-            ALPN_CLIENT_PROTOCOL.to_vec(),
-        ];
+        server_crypto.alpn_protocols =
+            vec![ALPN_SERVER_PROTOCOL.to_vec(), ALPN_CLIENT_PROTOCOL.to_vec()];
 
         let mut server_config = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
@@ -1110,7 +1296,8 @@ impl QuicNetworkManager {
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(0u32.into());
         transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-        transport_config.max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(300_000))));
+        transport_config
+            .max_idle_timeout(Some(IdleTimeout::from(quinn::VarInt::from_u32(300_000))));
 
         Ok(server_config)
     }
@@ -1225,7 +1412,10 @@ impl QuicNetworkManager {
     /// Returns None if the public key is not known.
     pub fn get_party_id_for_public_key(&self, pk: &NodePublicKey) -> Option<PartyId> {
         let sorted_keys = self.get_sorted_public_keys();
-        sorted_keys.iter().position(|k| k == pk).map(|pos| pos as PartyId)
+        sorted_keys
+            .iter()
+            .position(|k| k == pk)
+            .map(|pos| pos as PartyId)
     }
 
     /// Gets the connection for a given party_id (0..N-1).
@@ -1235,12 +1425,17 @@ impl QuicNetworkManager {
 
         // Check if this is our own public key (loopback)
         if Some(&pk) == self.local_public_key.as_ref() {
-            return self.server_connections.get(&self.node_id).map(|r| r.value().clone());
+            return self
+                .server_connections
+                .get(&self.node_id)
+                .map(|r| r.value().clone());
         }
 
         // Find the connection for this peer's public key
         let derived_id = pk.derive_id();
-        self.server_connections.get(&derived_id).map(|r| r.value().clone())
+        self.server_connections
+            .get(&derived_id)
+            .map(|r| r.value().clone())
     }
 
     /// Computes the local party ID by sorting all public keys (local + peers) lexicographically
@@ -1358,17 +1553,23 @@ impl QuicNetworkManager {
         let peer_public_key = Self::extract_peer_public_key(&connection).ok();
 
         // Open persistent stream and send sync byte to establish it
-        let (mut send, recv) = connection.open_bi().await
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-        send_stream_sync(&mut send).await
+        send_stream_sync(&mut send)
+            .await
             .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
         // Derive server's ID from its public key
         let server_id = if let Some(ref pk) = peer_public_key {
             pk.derive_id()
         } else {
-            warn!("Could not extract server public key from {}, using address-based ID", address);
+            warn!(
+                "Could not extract server public key from {}, using address-based ID",
+                address
+            );
             self.fallback_node_lookup(address)
         };
 
@@ -1396,21 +1597,30 @@ impl QuicNetworkManager {
         self.server_connections.insert(server_id, Arc::clone(&conn));
 
         // Log our own derived client ID for debugging
-        let client_id = self.local_public_key.as_ref()
+        let client_id = self
+            .local_public_key
+            .as_ref()
             .map(|pk| pk.derive_id())
             .unwrap_or(self.node_id);
-        info!("Client {} connected to server {} at {}", client_id, server_id, address);
+        info!(
+            "Client {} connected to server {} at {}",
+            client_id, server_id, address
+        );
 
         Ok(conn)
     }
 
     /// Fallback method to find or create a node ID when handshake fails
     fn fallback_node_lookup(&mut self, address: SocketAddr) -> PartyId {
-        self.nodes.iter()
+        self.nodes
+            .iter()
             .find(|n| n.address() == address)
             .map(|n| n.id())
             .unwrap_or_else(|| {
-                warn!("Creating random node ID for address {} - this may cause connection issues", address);
+                warn!(
+                    "Creating random node ID for address {} - this may cause connection issues",
+                    address
+                );
                 let node = QuicNode::new_with_random_id(address);
                 let id = node.id();
                 self.nodes.push(node);
@@ -1445,17 +1655,23 @@ impl QuicNetworkManager {
         let peer_public_key = Self::extract_peer_public_key(&connection).ok();
 
         // Open persistent stream and send sync byte to establish it
-        let (mut send, recv) = connection.open_bi().await
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-        send_stream_sync(&mut send).await
+        send_stream_sync(&mut send)
+            .await
             .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
         // Derive peer's ID from its public key
         let peer_id = if let Some(ref pk) = peer_public_key {
             pk.derive_id()
         } else {
-            warn!("Could not extract peer public key from {}, using address-based ID", address);
+            warn!(
+                "Could not extract peer public key from {}, using address-based ID",
+                address
+            );
             self.fallback_node_lookup(address)
         };
 
@@ -1482,10 +1698,15 @@ impl QuicNetworkManager {
         self.server_connections.insert(peer_id, Arc::clone(&conn));
 
         // Log our own derived ID for debugging
-        let our_id = self.local_public_key.as_ref()
+        let our_id = self
+            .local_public_key
+            .as_ref()
             .map(|pk| pk.derive_id())
             .unwrap_or(self.node_id);
-        info!("Server {} connected to peer {} at {}", our_id, peer_id, address);
+        info!(
+            "Server {} connected to peer {} at {}",
+            our_id, peer_id, address
+        );
 
         Ok(conn)
     }
@@ -1513,8 +1734,8 @@ impl QuicNetworkManager {
         // Try to discover the default local IP by "connecting" to a public address
         // (no actual connection is made, just route lookup)
         let targets = [
-            "8.8.8.8:53",     // Google DNS
-            "1.1.1.1:53",     // Cloudflare DNS
+            "8.8.8.8:53", // Google DNS
+            "1.1.1.1:53", // Cloudflare DNS
         ];
 
         for target in targets {
@@ -1536,11 +1757,7 @@ impl QuicNetworkManager {
         // and checking what IPs we can use
         if ips.is_empty() {
             // Try common private network ranges
-            let test_addrs = [
-                "10.0.0.1:1",
-                "192.168.1.1:1",
-                "172.16.0.1:1",
-            ];
+            let test_addrs = ["10.0.0.1:1", "192.168.1.1:1", "172.16.0.1:1"];
 
             for target in test_addrs {
                 if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -1664,9 +1881,7 @@ impl QuicNetworkManager {
     }
 
     /// Creates an ICE candidates message for sending to a peer
-    pub async fn create_ice_candidates_message(
-        &self,
-    ) -> Result<NetEnvelope, String> {
+    pub async fn create_ice_candidates_message(&self) -> Result<NetEnvelope, String> {
         let candidates = self.gather_ice_candidates().await?;
 
         Ok(NetEnvelope::IceCandidates {
@@ -1737,10 +1952,7 @@ impl QuicNetworkManager {
             }
         };
 
-        debug!(
-            "Received {} remote ICE candidates",
-            remote_candidates.len()
-        );
+        debug!("Received {} remote ICE candidates", remote_candidates.len());
 
         // 4. Create and configure ICE agent
         let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
@@ -1785,9 +1997,7 @@ impl QuicNetworkManager {
 
         info!(
             "ICE completed: {} -> {} (RTT: {:?}ms)",
-            nominated_pair.local.address,
-            nominated_pair.remote.address,
-            nominated_pair.rtt_ms
+            nominated_pair.local.address, nominated_pair.remote.address, nominated_pair.rtt_ms
         );
 
         // Store agent for potential later use
@@ -1815,7 +2025,8 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-        send_stream_sync(&mut send).await
+        send_stream_sync(&mut send)
+            .await
             .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
         let conn = Arc::new(QuicPeerConnection::new(
@@ -1827,7 +2038,8 @@ impl QuicNetworkManager {
         )) as Arc<dyn PeerConnection>;
 
         // Store connection
-        self.server_connections.insert(target_party_id, Arc::clone(&conn));
+        self.server_connections
+            .insert(target_party_id, Arc::clone(&conn));
 
         // Cleanup ICE agent
         self.pending_ice_agents.remove(&target_party_id);
@@ -1919,10 +2131,7 @@ impl QuicNetworkManager {
 
         // 5. The controlling agent will establish the final connection
         // We wait to accept it
-        let incoming = endpoint
-            .accept()
-            .await
-            .ok_or("No incoming connection")?;
+        let incoming = endpoint.accept().await.ok_or("No incoming connection")?;
 
         let connection = incoming
             .await
@@ -1950,7 +2159,8 @@ impl QuicNetworkManager {
             peer_public_key,
         )) as Arc<dyn PeerConnection>;
 
-        self.server_connections.insert(from_party_id, Arc::clone(&conn));
+        self.server_connections
+            .insert(from_party_id, Arc::clone(&conn));
 
         Ok(conn)
     }
@@ -1971,11 +2181,8 @@ impl QuicNetworkManager {
         if let Some(addr) = direct_address {
             debug!("Attempting direct connection to {}", addr);
 
-            let result = tokio::time::timeout(
-                Duration::from_secs(3),
-                self.connect_as_server(addr),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), self.connect_as_server(addr)).await;
 
             match result {
                 Ok(Ok(conn)) => {
@@ -2036,13 +2243,7 @@ impl QuicNetworkManager {
             } => {
                 // Peer is initiating P2P connection
                 let conn = self
-                    .handle_p2p_request(
-                        from_party_id,
-                        ufrag,
-                        pwd,
-                        candidates,
-                        signaling_connection,
-                    )
+                    .handle_p2p_request(from_party_id, ufrag, pwd, candidates, signaling_connection)
                     .await?;
                 Ok(Some(conn))
             }
@@ -2067,29 +2268,35 @@ impl NetworkManager for QuicNetworkManager {
         &'a mut self,
         address: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
-        Box::pin(async move {
-            self.connect_as_server(address).await
-        })
+        Box::pin(async move { self.connect_as_server(address).await })
     }
 
     fn accept<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let endpoint = self.endpoint.as_ref()
+            let endpoint = self
+                .endpoint
+                .as_ref()
                 .ok_or_else(|| "Endpoint not initialized. Call listen() first.".to_string())?;
 
-            let incoming = endpoint.accept().await
+            let incoming = endpoint
+                .accept()
+                .await
                 .ok_or_else(|| "No incoming connections".to_string())?;
 
-            let connection = incoming.await
+            let connection = incoming
+                .await
                 .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
             let remote_addr = connection.remote_address();
 
             // Extract role from ALPN protocol negotiation
             let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
-                warn!("ALPN extraction failed during accept: {}, defaulting to Server", e);
+                warn!(
+                    "ALPN extraction failed during accept: {}, defaulting to Server",
+                    e
+                );
                 ClientType::Server
             });
 
@@ -2097,19 +2304,26 @@ impl NetworkManager for QuicNetworkManager {
             let peer_public_key = Self::extract_peer_public_key(&connection).ok();
 
             // Accept persistent stream and receive sync byte
-            let (send, mut recv) = connection.accept_bi().await
+            let (send, mut recv) = connection
+                .accept_bi()
+                .await
                 .map_err(|e| format!("Failed to accept stream: {}", e))?;
 
-            recv_stream_sync(&mut recv).await
+            recv_stream_sync(&mut recv)
+                .await
                 .map_err(|e| format!("Failed to sync stream: {}", e))?;
 
             // Derive peer ID from public key, or fallback to address-based lookup
             let peer_id = if let Some(ref pk) = peer_public_key {
                 pk.derive_id()
             } else {
-                warn!("No peer public key available from {}, using address-based ID", remote_addr);
+                warn!(
+                    "No peer public key available from {}, using address-based ID",
+                    remote_addr
+                );
                 // Fallback: use address-based lookup
-                self.nodes.iter()
+                self.nodes
+                    .iter()
                     .find(|n| n.address() == remote_addr)
                     .map(|n| n.id())
                     .unwrap_or_else(|| {
@@ -2132,7 +2346,10 @@ impl NetworkManager for QuicNetworkManager {
             match connection_role {
                 ClientType::Client => {
                     // Client connection identified via ALPN
-                    info!("Accepted client connection from {} with derived ID {}", remote_addr, peer_id);
+                    info!(
+                        "Accepted client connection from {} with derived ID {}",
+                        remote_addr, peer_id
+                    );
 
                     // Store as client connection
                     self.client_connections.insert(peer_id, Arc::clone(&conn));
@@ -2140,7 +2357,10 @@ impl NetworkManager for QuicNetworkManager {
                 }
                 ClientType::Server => {
                     // Server-to-server connection identified via ALPN
-                    info!("Accepted server connection from {} with derived ID {}", remote_addr, peer_id);
+                    info!(
+                        "Accepted server connection from {} with derived ID {}",
+                        remote_addr, peer_id
+                    );
 
                     // Store peer's public key if available
                     if let Some(pk) = peer_public_key {
@@ -2150,7 +2370,8 @@ impl NetworkManager for QuicNetworkManager {
 
                     // Ensure node exists
                     if !self.nodes.iter().any(|n| n.id() == peer_id) {
-                        self.nodes.push(QuicNode::from_party_id(peer_id, remote_addr));
+                        self.nodes
+                            .push(QuicNode::from_party_id(peer_id, remote_addr));
                     }
 
                     // Store connection
@@ -2202,7 +2423,8 @@ impl Network for QuicNetworkManager {
 
     async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
         // Use party_id-based lookup for MPC protocols (recipient is a party_id 0..N-1)
-        let connection = self.get_connection_by_party_id(recipient)
+        let connection = self
+            .get_connection_by_party_id(recipient)
             .ok_or(NetworkError::PartyNotFound(recipient))?;
 
         // Check if connection is still alive
@@ -2234,7 +2456,10 @@ impl Network for QuicNetworkManager {
             if let Some(connection) = self.get_connection_by_party_id(party_id) {
                 // Check connection health before sending
                 if !connection.is_connected().await {
-                    debug!("Skipping broadcast to party_id {}: connection is dead", party_id);
+                    debug!(
+                        "Skipping broadcast to party_id {}: connection is dead",
+                        party_id
+                    );
                     continue;
                 }
 
@@ -2244,11 +2469,17 @@ impl Network for QuicNetworkManager {
                         total_bytes += message.len();
                     }
                     Err(e) => {
-                        debug!("Failed to broadcast message to party_id {}: {}", party_id, e);
+                        debug!(
+                            "Failed to broadcast message to party_id {}: {}",
+                            party_id, e
+                        );
                     }
                 }
             } else {
-                debug!("Warning: No connection for party_id {}, skipping broadcast", party_id);
+                debug!(
+                    "Warning: No connection for party_id {}, skipping broadcast",
+                    party_id
+                );
             }
         }
 
@@ -2289,7 +2520,11 @@ impl Network for QuicNetworkManager {
         self.nodes.iter_mut().find(|node| node.id() == id)
     }
 
-    async fn send_to_client(&self, client: ClientId, message: &[u8]) -> Result<usize, NetworkError> {
+    async fn send_to_client(
+        &self,
+        client: ClientId,
+        message: &[u8],
+    ) -> Result<usize, NetworkError> {
         if let Some(conn_ref) = self.client_connections.get(&client) {
             let connection = conn_ref.value();
 
@@ -2321,7 +2556,11 @@ impl Network for QuicNetworkManager {
     }
 
     fn party_count(&self) -> usize {
-        let local_count = if self.local_public_key.is_some() { 1 } else { 0 };
+        let local_count = if self.local_public_key.is_some() {
+            1
+        } else {
+            0
+        };
         local_count + self.peer_public_keys.len()
     }
 }
@@ -2500,7 +2739,10 @@ mod tests {
         assert!(!public_key.0.is_empty());
 
         // Public key should be valid DER-encoded SPKI (starts with SEQUENCE tag 0x30)
-        assert_eq!(public_key.0[0], 0x30, "Public key should start with SEQUENCE tag");
+        assert_eq!(
+            public_key.0[0], 0x30,
+            "Public key should start with SEQUENCE tag"
+        );
     }
 
     #[test]
@@ -2543,7 +2785,9 @@ mod tests {
         assert!(manager.local_public_key.is_none());
 
         // Ensure certificate is created
-        manager.ensure_local_certificate().expect("Failed to ensure certificate");
+        manager
+            .ensure_local_certificate()
+            .expect("Failed to ensure certificate");
 
         // Now should have certificate
         assert!(manager.local_cert_der.is_some());
@@ -2555,7 +2799,9 @@ mod tests {
         let public_key = manager.local_public_key.clone();
 
         // Calling again should not change the certificate
-        manager.ensure_local_certificate().expect("Failed on second call");
+        manager
+            .ensure_local_certificate()
+            .expect("Failed on second call");
 
         assert_eq!(manager.local_cert_der, cert_der);
         assert_eq!(manager.local_public_key, public_key);
@@ -2610,7 +2856,9 @@ mod tests {
     #[test]
     fn test_compute_local_party_id_single_node() {
         let mut manager = QuicNetworkManager::new();
-        manager.ensure_local_certificate().expect("Failed to ensure certificate");
+        manager
+            .ensure_local_certificate()
+            .expect("Failed to ensure certificate");
 
         // With only local node, sender_id should be 0
         let sender_id = manager.compute_local_party_id();
@@ -2620,7 +2868,9 @@ mod tests {
     #[test]
     fn test_compute_local_party_id_multiple_nodes() {
         let mut manager = QuicNetworkManager::new();
-        manager.ensure_local_certificate().expect("Failed to ensure certificate");
+        manager
+            .ensure_local_certificate()
+            .expect("Failed to ensure certificate");
 
         let local_pk = manager.local_public_key.clone().unwrap();
 
@@ -2632,7 +2882,9 @@ mod tests {
         manager.peer_public_keys.insert(2, pk_after);
 
         // Compute sender_id
-        let sender_id = manager.compute_local_party_id().expect("Should compute sender_id");
+        let sender_id = manager
+            .compute_local_party_id()
+            .expect("Should compute sender_id");
 
         // Local key should be in the middle (position 1)
         // Since pk_before < local_pk < pk_after when sorted
@@ -2703,10 +2955,14 @@ mod tests {
         // For count=3, need 2 peers
         assert!(!manager.is_fully_connected(3));
 
-        manager.peer_public_keys.insert(1, NodePublicKey(vec![0x01]));
+        manager
+            .peer_public_keys
+            .insert(1, NodePublicKey(vec![0x01]));
         assert!(!manager.is_fully_connected(3)); // Still need 1 more
 
-        manager.peer_public_keys.insert(2, NodePublicKey(vec![0x02]));
+        manager
+            .peer_public_keys
+            .insert(2, NodePublicKey(vec![0x02]));
         assert!(manager.is_fully_connected(3)); // Now fully connected
     }
 
@@ -2717,14 +2973,16 @@ mod tests {
     #[test]
     fn test_create_client_config_for_client_role() {
         ensure_crypto_provider();
-        let config = QuicNetworkManager::create_insecure_client_config(ClientType::Client, None, None);
+        let config =
+            QuicNetworkManager::create_insecure_client_config(ClientType::Client, None, None);
         assert!(config.is_ok());
     }
 
     #[test]
     fn test_create_client_config_for_server_role() {
         ensure_crypto_provider();
-        let config = QuicNetworkManager::create_insecure_client_config(ClientType::Server, None, None);
+        let config =
+            QuicNetworkManager::create_insecure_client_config(ClientType::Server, None, None);
         assert!(config.is_ok());
     }
 
@@ -2770,8 +3028,7 @@ mod tests {
         let envelope = NetEnvelope::Handshake { id: 42 };
         let bytes = envelope.serialize();
 
-        let deserialized = NetEnvelope::try_deserialize(&bytes)
-            .expect("Failed to deserialize");
+        let deserialized = NetEnvelope::try_deserialize(&bytes).expect("Failed to deserialize");
 
         match deserialized {
             NetEnvelope::Handshake { id } => assert_eq!(id, 42),
@@ -2785,8 +3042,7 @@ mod tests {
         let envelope = NetEnvelope::HoneyBadger(data.clone());
         let bytes = envelope.serialize();
 
-        let deserialized = NetEnvelope::try_deserialize(&bytes)
-            .expect("Failed to deserialize");
+        let deserialized = NetEnvelope::try_deserialize(&bytes).expect("Failed to deserialize");
 
         match deserialized {
             NetEnvelope::HoneyBadger(d) => assert_eq!(d, data),
@@ -2877,7 +3133,10 @@ mod tests {
 
         // Start listening on server1
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        server1.listen(addr1).await.expect("Failed to start server1");
+        server1
+            .listen(addr1)
+            .await
+            .expect("Failed to start server1");
 
         // Get actual bound address
         let bound_addr = server1.endpoint.as_ref().unwrap().local_addr().unwrap();
@@ -2895,14 +3154,25 @@ mod tests {
         let (server2, connect_result) = conn_task.await.unwrap();
 
         // Both should succeed
-        assert!(accept_result.is_ok(), "Accept failed: {:?}", accept_result.err());
-        assert!(connect_result.is_ok(), "Connect failed: {:?}", connect_result.err());
+        assert!(
+            accept_result.is_ok(),
+            "Accept failed: {:?}",
+            accept_result.err()
+        );
+        assert!(
+            connect_result.is_ok(),
+            "Connect failed: {:?}",
+            connect_result.err()
+        );
 
         // Check that connections were stored with derived IDs
         // Server1 should have a connection to server2 (by server2's derived ID)
         let server2_derived_id = server2.local_derived_id();
-        assert!(server1.server_connections.contains_key(&server2_derived_id),
-            "server1 should have connection to server2 with derived ID {}", server2_derived_id);
+        assert!(
+            server1.server_connections.contains_key(&server2_derived_id),
+            "server1 should have connection to server2 with derived ID {}",
+            server2_derived_id
+        );
     }
 
     #[tokio::test]
@@ -2931,13 +3201,24 @@ mod tests {
         let (client, connect_result) = conn_task.await.unwrap();
 
         // Both should succeed
-        assert!(accept_result.is_ok(), "Accept failed: {:?}", accept_result.err());
-        assert!(connect_result.is_ok(), "Connect failed: {:?}", connect_result.err());
+        assert!(
+            accept_result.is_ok(),
+            "Accept failed: {:?}",
+            accept_result.err()
+        );
+        assert!(
+            connect_result.is_ok(),
+            "Connect failed: {:?}",
+            connect_result.err()
+        );
 
         // Check that server stored client connection with derived ID
         let client_derived_id = client.local_derived_id();
-        assert!(server.client_connections.contains_key(&client_derived_id),
-            "server should have client connection with derived ID {}", client_derived_id);
+        assert!(
+            server.client_connections.contains_key(&client_derived_id),
+            "server should have client connection with derived ID {}",
+            client_derived_id
+        );
         assert!(server.client_ids.contains(&client_derived_id));
     }
 
@@ -2952,9 +3233,7 @@ mod tests {
 
         let bound_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
 
-        let conn_task = tokio::spawn(async move {
-            client.connect_as_client(bound_addr).await
-        });
+        let conn_task = tokio::spawn(async move { client.connect_as_client(bound_addr).await });
 
         let accept_result = server.accept().await.expect("Accept failed");
         let _connect_result = conn_task.await.unwrap().expect("Connect failed");
@@ -2972,13 +3251,22 @@ mod tests {
         // Both servers need to have their certificates generated
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        server1.listen(addr1).await.expect("Failed to start server1");
-        server2.listen(addr2).await.expect("Failed to start server2");
+        server1
+            .listen(addr1)
+            .await
+            .expect("Failed to start server1");
+        server2
+            .listen(addr2)
+            .await
+            .expect("Failed to start server2");
 
         let bound_addr = server1.endpoint.as_ref().unwrap().local_addr().unwrap();
 
         let conn_task = tokio::spawn(async move {
-            server2.connect_as_server(bound_addr).await.expect("Connect failed");
+            server2
+                .connect_as_server(bound_addr)
+                .await
+                .expect("Connect failed");
             server2
         });
 
@@ -2991,8 +3279,10 @@ mod tests {
 
         // With mTLS, server1 should have server2's public key stored
         let server2_derived_id = server2.local_derived_id();
-        assert!(server1.peer_public_keys.contains_key(&server2_derived_id),
-            "server1 should have server2's public key stored");
+        assert!(
+            server1.peer_public_keys.contains_key(&server2_derived_id),
+            "server1 should have server2's public key stored"
+        );
     }
 
     #[tokio::test]
@@ -3007,7 +3297,10 @@ mod tests {
         let bound_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
 
         let conn_task = tokio::spawn(async move {
-            let conn = client.connect_as_client(bound_addr).await.expect("Connect failed");
+            let conn = client
+                .connect_as_client(bound_addr)
+                .await
+                .expect("Connect failed");
             (client, conn)
         });
 
@@ -3023,9 +3316,15 @@ mod tests {
 
         // Test sending from server to client
         let response_data = b"Hello, client!";
-        server_conn.send(response_data).await.expect("Send response failed");
+        server_conn
+            .send(response_data)
+            .await
+            .expect("Send response failed");
 
-        let received_response = client_conn.receive().await.expect("Receive response failed");
+        let received_response = client_conn
+            .receive()
+            .await
+            .expect("Receive response failed");
         assert_eq!(received_response, response_data);
     }
 
@@ -3062,7 +3361,9 @@ mod tests {
 
     #[test]
     fn test_node_public_key_derive_id_deterministic() {
-        let pk = NodePublicKey(vec![0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
+        let pk = NodePublicKey(vec![
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+        ]);
 
         // Multiple calls should return the same ID
         let id1 = pk.derive_id();
@@ -3084,9 +3385,15 @@ mod tests {
         let pk_b = NodePublicKey(vec![0x02, 0x01, 0x02]);
         let pk_a = NodePublicKey(vec![0x01, 0x01, 0x02]);
 
-        manager.peer_public_keys.insert(pk_c.derive_id(), pk_c.clone());
-        manager.peer_public_keys.insert(pk_b.derive_id(), pk_b.clone());
-        manager.peer_public_keys.insert(pk_a.derive_id(), pk_a.clone());
+        manager
+            .peer_public_keys
+            .insert(pk_c.derive_id(), pk_c.clone());
+        manager
+            .peer_public_keys
+            .insert(pk_b.derive_id(), pk_b.clone());
+        manager
+            .peer_public_keys
+            .insert(pk_a.derive_id(), pk_a.clone());
 
         let sorted = manager.get_sorted_public_keys();
 
@@ -3107,7 +3414,9 @@ mod tests {
 
         // Add a peer with a known public key
         let peer_pk = NodePublicKey(vec![0xFF, 0xFF, 0xFF]); // Will sort after local key
-        manager.peer_public_keys.insert(peer_pk.derive_id(), peer_pk.clone());
+        manager
+            .peer_public_keys
+            .insert(peer_pk.derive_id(), peer_pk.clone());
 
         // Get the sorted keys to determine expected order
         let sorted = manager.get_sorted_public_keys();
@@ -3136,8 +3445,12 @@ mod tests {
         // Add peers with known public keys
         let peer_pk1 = NodePublicKey(vec![0x00, 0x00, 0x01]);
         let peer_pk2 = NodePublicKey(vec![0xFF, 0xFF, 0xFF]);
-        manager.peer_public_keys.insert(peer_pk1.derive_id(), peer_pk1.clone());
-        manager.peer_public_keys.insert(peer_pk2.derive_id(), peer_pk2.clone());
+        manager
+            .peer_public_keys
+            .insert(peer_pk1.derive_id(), peer_pk1.clone());
+        manager
+            .peer_public_keys
+            .insert(peer_pk2.derive_id(), peer_pk2.clone());
 
         // Get sorted keys
         let sorted = manager.get_sorted_public_keys();
@@ -3146,7 +3459,10 @@ mod tests {
         // Each key should map to its position in the sorted list
         for (expected_id, pk) in sorted.iter().enumerate() {
             let actual_id = manager.get_party_id_for_public_key(pk).unwrap();
-            assert_eq!(actual_id, expected_id, "sender_id should match position in sorted list");
+            assert_eq!(
+                actual_id, expected_id,
+                "sender_id should match position in sorted list"
+            );
         }
 
         // Unknown public key should return None
@@ -3187,14 +3503,23 @@ mod tests {
         // Start listening (generates certificates)
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        server1.listen(addr1).await.expect("Failed to start server1");
-        server2.listen(addr2).await.expect("Failed to start server2");
+        server1
+            .listen(addr1)
+            .await
+            .expect("Failed to start server1");
+        server2
+            .listen(addr2)
+            .await
+            .expect("Failed to start server2");
 
         let bound_addr = server1.endpoint.as_ref().unwrap().local_addr().unwrap();
 
         // Connect server2 to server1
         let conn_task = tokio::spawn(async move {
-            server2.connect_as_server(bound_addr).await.expect("Connect failed");
+            server2
+                .connect_as_server(bound_addr)
+                .await
+                .expect("Connect failed");
             server2
         });
 
@@ -3212,7 +3537,10 @@ mod tests {
         // One should be 0, the other should be 1
         assert!(server1_sender_id == 0 || server1_sender_id == 1);
         assert!(server2_sender_id == 0 || server2_sender_id == 1);
-        assert_ne!(server1_sender_id, server2_sender_id, "Sender IDs should be different");
+        assert_ne!(
+            server1_sender_id, server2_sender_id,
+            "Sender IDs should be different"
+        );
 
         // Verify the IDs are consistent across both servers
         // Both servers should agree on who is 0 and who is 1
@@ -3228,8 +3556,14 @@ mod tests {
         let s2_id_for_s2 = server2.get_party_id_for_public_key(&server2_pk).unwrap();
 
         // Both should agree on sender IDs
-        assert_eq!(s1_id_for_s1, s2_id_for_s1, "Both servers should agree on server1's sender_id");
-        assert_eq!(s1_id_for_s2, s2_id_for_s2, "Both servers should agree on server2's sender_id");
+        assert_eq!(
+            s1_id_for_s1, s2_id_for_s1,
+            "Both servers should agree on server1's sender_id"
+        );
+        assert_eq!(
+            s1_id_for_s2, s2_id_for_s2,
+            "Both servers should agree on server2's sender_id"
+        );
     }
 
     // ========================================================================
@@ -3268,8 +3602,7 @@ mod tests {
     fn test_framing_round_trip() {
         let original = b"round trip data";
         let framed = LoopbackPeerConnection::frame_message(original);
-        let unframed = LoopbackPeerConnection::unframe_message(framed)
-            .expect("Unframe failed");
+        let unframed = LoopbackPeerConnection::unframe_message(framed).expect("Unframe failed");
         assert_eq!(unframed, original);
     }
 
@@ -3395,8 +3728,8 @@ mod tests {
         let framed = LoopbackPeerConnection::frame_message(&[]);
         assert_eq!(framed, vec![0, 0, 0, 0]);
 
-        let unframed = LoopbackPeerConnection::unframe_message(framed)
-            .expect("Unframe empty failed");
+        let unframed =
+            LoopbackPeerConnection::unframe_message(framed).expect("Unframe empty failed");
         assert!(unframed.is_empty());
     }
 
@@ -3414,7 +3747,10 @@ mod tests {
         let receiver = tokio::spawn(async move {
             let mut received_values = Vec::new();
             for _ in 0..10 {
-                let data = conn_recv.receive().await.expect("Concurrent receive failed");
+                let data = conn_recv
+                    .receive()
+                    .await
+                    .expect("Concurrent receive failed");
                 assert_eq!(data.len(), 1);
                 received_values.push(data[0]);
             }
@@ -3446,32 +3782,70 @@ mod tests {
     #[test]
     fn test_connection_error_display_contains_inner_message() {
         // Verify Display output includes the inner message for each variant
-        let display_lost = format!("{}", ConnectionError::ConnectionLost("peer gone".to_string()));
-        assert!(display_lost.contains("peer gone"), "ConnectionLost should contain inner msg, got: {}", display_lost);
+        let display_lost = format!(
+            "{}",
+            ConnectionError::ConnectionLost("peer gone".to_string())
+        );
+        assert!(
+            display_lost.contains("peer gone"),
+            "ConnectionLost should contain inner msg, got: {}",
+            display_lost
+        );
 
         let display_send = format!("{}", ConnectionError::SendFailed("write err".to_string()));
-        assert!(display_send.contains("write err"), "SendFailed should contain inner msg, got: {}", display_send);
+        assert!(
+            display_send.contains("write err"),
+            "SendFailed should contain inner msg, got: {}",
+            display_send
+        );
 
         let display_recv = format!("{}", ConnectionError::ReceiveFailed("read err".to_string()));
-        assert!(display_recv.contains("read err"), "ReceiveFailed should contain inner msg, got: {}", display_recv);
+        assert!(
+            display_recv.contains("read err"),
+            "ReceiveFailed should contain inner msg, got: {}",
+            display_recv
+        );
 
         let display_frame = format!("{}", ConnectionError::FramingError("bad frame".to_string()));
-        assert!(display_frame.contains("bad frame"), "FramingError should contain inner msg, got: {}", display_frame);
+        assert!(
+            display_frame.contains("bad frame"),
+            "FramingError should contain inner msg, got: {}",
+            display_frame
+        );
 
-        let display_init = format!("{}", ConnectionError::InitializationFailed("init err".to_string()));
-        assert!(display_init.contains("init err"), "InitializationFailed should contain inner msg, got: {}", display_init);
+        let display_init = format!(
+            "{}",
+            ConnectionError::InitializationFailed("init err".to_string())
+        );
+        assert!(
+            display_init.contains("init err"),
+            "InitializationFailed should contain inner msg, got: {}",
+            display_init
+        );
 
-        let display_state = format!("{}", ConnectionError::InvalidState(ConnectionState::Disconnected));
-        assert!(!display_state.is_empty(), "InvalidState should produce non-empty display");
+        let display_state = format!(
+            "{}",
+            ConnectionError::InvalidState(ConnectionState::Disconnected)
+        );
+        assert!(
+            !display_state.is_empty(),
+            "InvalidState should produce non-empty display"
+        );
 
         let display_closed = format!("{}", ConnectionError::StreamClosed);
-        assert!(!display_closed.is_empty(), "StreamClosed should produce non-empty display");
+        assert!(
+            !display_closed.is_empty(),
+            "StreamClosed should produce non-empty display"
+        );
     }
 
     #[test]
     fn test_connection_error_to_string() {
         let error = ConnectionError::SendFailed("test".to_string());
         let s: String = error.into();
-        assert!(s.contains("test"), "From<ConnectionError> for String should contain inner msg");
+        assert!(
+            s.contains("test"),
+            "From<ConnectionError> for String should contain inner msg"
+        );
     }
 }

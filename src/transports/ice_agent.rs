@@ -1,17 +1,17 @@
-//! ICE Agent - NAT traversal state machine and hole punch coordination
+//! ICE Agent - NAT traversal state machine and hole punch coordination.
 //!
-//! Manages the ICE (Interactive Connectivity Establishment) process for
-//! establishing peer-to-peer connections through NAT.
+//! Manages the [ICE (Interactive Connectivity Establishment)](https://datatracker.ietf.org/doc/html/rfc8445)
+//! process for establishing peer-to-peer connections through NAT.
 
 use crate::network_utils::PartyId;
-use crate::transports::ice::{
-    CandidatePair, CandidatePairState, IceCandidate, LocalCandidates,
-};
+use crate::transports::ice::{CandidatePair, CandidatePairState, IceCandidate, LocalCandidates};
 use crate::transports::net_envelope::NetEnvelope;
 use crate::transports::stun::StunClient;
 use dashmap::DashMap;
 use quinn::Endpoint;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, DurationMilliSeconds};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,19 +19,27 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, info, trace, warn};
 
-/// ICE agent role determines who initiates checks and nominates pairs
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ICE agent role determines who initiates checks and nominates pairs.
+///
+/// Per [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445), one agent must be
+/// controlling (initiates checks, nominates pairs) and one must be controlled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IceRole {
     /// Initiates connectivity checks and nominates successful pairs
     Controlling,
-    /// Responds to checks and waits for nomination
+    /// Responds to checks and waits for nomination (default)
+    #[default]
     Controlled,
 }
 
-/// ICE connection state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ICE connection state.
+///
+/// The state machine progresses from `New` through `Gathering`, `Checking`,
+/// to either `Completed` (success) or `Failed` (no working path found).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IceState {
-    /// Initial state, not started
+    /// Initial state, not started (default)
+    #[default]
     New,
     /// Gathering local candidates (STUN queries in progress)
     Gathering,
@@ -51,24 +59,32 @@ pub enum IceState {
     Closed,
 }
 
-/// Configuration for the ICE agent
-#[derive(Debug, Clone)]
+/// Configuration for the ICE agent.
+///
+/// Controls timing parameters for connectivity checking, hole punching,
+/// and overall ICE process timeouts.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IceAgentConfig {
     /// STUN servers for candidate gathering
     pub stun_servers: Vec<SocketAddr>,
-    /// Timeout for each connectivity check attempt
+    /// Timeout for each connectivity check attempt (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub check_timeout: Duration,
     /// Maximum retransmissions per check
     pub check_retries: u32,
-    /// Interval between checks (pacing)
+    /// Interval between checks (pacing, serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub check_pace: Duration,
     /// Use aggressive nomination (nominate first successful pair)
     pub aggressive_nomination: bool,
-    /// Total timeout for the ICE process
+    /// Total timeout for the ICE process (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub overall_timeout: Duration,
     /// Number of probe packets for hole punching
     pub probe_count: u32,
-    /// Interval between probe packets
+    /// Interval between probe packets (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub probe_interval: Duration,
 }
 
@@ -89,8 +105,10 @@ impl Default for IceAgentConfig {
     }
 }
 
-/// Configuration validation errors
-#[derive(Debug, Clone)]
+/// Configuration validation errors.
+///
+/// Returned by [`IceAgentConfig::validate`] when configuration parameters are invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// Check timeout must be positive
     InvalidCheckTimeout,
@@ -225,8 +243,10 @@ struct PendingCheck {
     retries: u32,
 }
 
-/// ICE Agent errors
-#[derive(Debug, Clone)]
+/// ICE Agent errors.
+///
+/// These errors are returned by [`IceAgent`] methods when ICE operations fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IceError {
     /// Candidate gathering failed
     GatheringFailed(String),
@@ -679,9 +699,7 @@ impl IceAgent {
             );
 
             // Perform QUIC-based connectivity check
-            let result = self
-                .perform_quic_check(endpoint, pair_idx)
-                .await;
+            let result = self.perform_quic_check(endpoint, pair_idx).await;
 
             match result {
                 Ok(check_result) if check_result.success => {
@@ -689,10 +707,7 @@ impl IceAgent {
                     self.check_list[pair_idx].rtt_ms =
                         check_result.rtt.map(|d| d.as_millis() as u64);
 
-                    info!(
-                        "Pair {} succeeded (RTT: {:?})",
-                        pair_idx, check_result.rtt
-                    );
+                    info!("Pair {} succeeded (RTT: {:?})", pair_idx, check_result.rtt);
 
                     // Aggressive nomination: nominate first successful pair
                     if self.config.aggressive_nomination && self.role == IceRole::Controlling {
@@ -768,9 +783,7 @@ impl IceAgent {
 
             // Attempt QUIC connection
             let connect_result = match endpoint.connect(target, "localhost") {
-                Ok(connecting) => {
-                    tokio::time::timeout(self.config.check_timeout, connecting).await
-                }
+                Ok(connecting) => tokio::time::timeout(self.config.check_timeout, connecting).await,
                 Err(e) => {
                     debug!("Failed to initiate connection: {}", e);
                     continue;
@@ -821,22 +834,30 @@ pub struct HolePunchCoordinator {
     config: HolePunchConfig,
 }
 
-/// Configuration for hole punching
-#[derive(Debug, Clone)]
+/// Configuration for hole punching.
+///
+/// Controls timing parameters for coordinated UDP hole punching.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HolePunchConfig {
-    /// Initial delay before first attempt
+    /// Initial delay before first attempt (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub initial_delay: Duration,
-    /// Jitter range to add randomness
+    /// Jitter range to add randomness (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub jitter_range: Duration,
-    /// Interval between probe packets
+    /// Interval between probe packets (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub probe_interval: Duration,
     /// Number of probe packets to send
     pub probe_count: u32,
-    /// Timeout for connection attempt
+    /// Timeout for connection attempt (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub connection_timeout: Duration,
-    /// Delay between retry attempts
+    /// Delay between retry attempts (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub retry_delay: Duration,
-    /// Backoff factor for retries
+    /// Backoff factor for retries (e.g., 1.5 means 50% increase per retry)
     pub backoff_factor: f64,
 }
 
@@ -854,8 +875,10 @@ impl Default for HolePunchConfig {
     }
 }
 
-/// Hole punch errors
-#[derive(Debug, Clone)]
+/// Errors from hole punch coordination.
+///
+/// Returned by [`HolePunchCoordinator`] when hole punching fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HolePunchError {
     /// Timeout waiting for response
     Timeout,
@@ -921,7 +944,11 @@ impl HolePunchCoordinator {
     pub async fn execute(
         &mut self,
         endpoint: &Endpoint,
-        signaling_send: impl Fn(NetEnvelope) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+        signaling_send: impl Fn(
+            NetEnvelope,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+        >,
         signaling_recv: Arc<Mutex<tokio::sync::mpsc::Receiver<NetEnvelope>>>,
     ) -> Result<quinn::Connection, HolePunchError> {
         for attempt in 0..self.max_retries {
@@ -966,7 +993,11 @@ impl HolePunchCoordinator {
     async fn attempt_punch(
         &mut self,
         endpoint: &Endpoint,
-        signaling_send: &impl Fn(NetEnvelope) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+        signaling_send: &impl Fn(
+            NetEnvelope,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+        >,
         signaling_recv: &Arc<Mutex<tokio::sync::mpsc::Receiver<NetEnvelope>>>,
     ) -> Result<quinn::Connection, HolePunchError> {
         // Calculate synchronized punch time
@@ -1022,7 +1053,9 @@ impl HolePunchCoordinator {
             })
             .await
             .map_err(|_| HolePunchError::Timeout)?
-            .ok_or(HolePunchError::SignalingError("No request received".to_string()))?;
+            .ok_or(HolePunchError::SignalingError(
+                "No request received".to_string(),
+            ))?;
 
             // Send ack
             if let NetEnvelope::PunchRequest { transaction_id, .. } = request {
@@ -1078,17 +1111,15 @@ impl HolePunchCoordinator {
         // but also attempt to connect (simultaneous open pattern)
 
         // First, try to accept for a short time
-        let accept_result = tokio::time::timeout(
-            Duration::from_millis(500),
-            async {
-                endpoint
-                    .accept()
-                    .await
-                    .ok_or(HolePunchError::NoIncoming)?
-                    .await
-                    .map_err(|e| HolePunchError::ConnectionFailed(e.to_string()))
-            }
-        ).await;
+        let accept_result = tokio::time::timeout(Duration::from_millis(500), async {
+            endpoint
+                .accept()
+                .await
+                .ok_or(HolePunchError::NoIncoming)?
+                .await
+                .map_err(|e| HolePunchError::ConnectionFailed(e.to_string()))
+        })
+        .await;
 
         match accept_result {
             Ok(Ok(conn)) => return Ok(conn),
@@ -1100,28 +1131,23 @@ impl HolePunchCoordinator {
             .connect(self.remote_addr, "localhost")
             .map_err(|e| HolePunchError::ConnectionFailed(e.to_string()))?;
 
-        let connect_result = tokio::time::timeout(
-            self.config.connection_timeout,
-            connecting
-        ).await;
+        let connect_result = tokio::time::timeout(self.config.connection_timeout, connecting).await;
 
         match connect_result {
             Ok(Ok(conn)) => Ok(conn),
             Ok(Err(e)) => Err(HolePunchError::ConnectionFailed(e.to_string())),
             Err(_) => {
                 // Final attempt: try accepting again
-                tokio::time::timeout(
-                    Duration::from_millis(1000),
-                    async {
-                        endpoint
-                            .accept()
-                            .await
-                            .ok_or(HolePunchError::NoIncoming)?
-                            .await
-                            .map_err(|e| HolePunchError::ConnectionFailed(e.to_string()))
-                    }
-                ).await
-                    .map_err(|_| HolePunchError::Timeout)?
+                tokio::time::timeout(Duration::from_millis(1000), async {
+                    endpoint
+                        .accept()
+                        .await
+                        .ok_or(HolePunchError::NoIncoming)?
+                        .await
+                        .map_err(|e| HolePunchError::ConnectionFailed(e.to_string()))
+                })
+                .await
+                .map_err(|_| HolePunchError::Timeout)?
             }
         }
     }
@@ -1548,7 +1574,10 @@ mod integration_tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // First gather should succeed
-        agent.gather_candidates(&[local_addr], &socket).await.unwrap();
+        agent
+            .gather_candidates(&[local_addr], &socket)
+            .await
+            .unwrap();
 
         // Second gather should fail (wrong state)
         let result = agent.gather_candidates(&[local_addr], &socket).await;
@@ -1565,7 +1594,10 @@ mod integration_tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Gather local candidates first
-        agent.gather_candidates(&[local_addr], &socket).await.unwrap();
+        agent
+            .gather_candidates(&[local_addr], &socket)
+            .await
+            .unwrap();
 
         // Create remote candidates
         let remote_candidate = IceCandidate::host(remote_addr, 1);
@@ -1700,7 +1732,12 @@ mod integration_tests {
 
         // Agent1 receives Agent2's candidates
         agent1
-            .set_remote_candidates(50, candidates2.ufrag, candidates2.pwd, candidates2.candidates)
+            .set_remote_candidates(
+                50,
+                candidates2.ufrag,
+                candidates2.pwd,
+                candidates2.candidates,
+            )
             .unwrap();
 
         // Agent2 receives Agent1's candidates
@@ -1741,7 +1778,10 @@ mod integration_tests {
                     let addr =
                         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 10000 + i as u16);
                     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                    agent.gather_candidates(&[addr], &socket).await.map(|_| agent)
+                    agent
+                        .gather_candidates(&[addr], &socket)
+                        .await
+                        .map(|_| agent)
                 })
             })
             .collect();
@@ -1800,7 +1840,10 @@ mod integration_tests {
         };
 
         let mut manager = QuicNetworkManager::with_config(config);
-        manager.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        manager
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
 
         let message = manager.create_ice_candidates_message().await;
         assert!(message.is_ok());
@@ -1925,8 +1968,7 @@ mod integration_tests {
         let stun_server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 3478);
 
         let host_candidate = IceCandidate::host(host_addr, 1);
-        let srflx_candidate =
-            IceCandidate::server_reflexive(srflx_addr, host_addr, stun_server, 1);
+        let srflx_candidate = IceCandidate::server_reflexive(srflx_addr, host_addr, stun_server, 1);
 
         // Host should have higher priority than server reflexive
         assert!(host_candidate.priority > srflx_candidate.priority);
@@ -1946,7 +1988,10 @@ mod integration_tests {
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        agent.gather_candidates(&[local_addr], &socket).await.unwrap();
+        agent
+            .gather_candidates(&[local_addr], &socket)
+            .await
+            .unwrap();
 
         // Set remote candidates pointing to an unreachable address
         let unreachable = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255)), 9999);
@@ -1986,8 +2031,14 @@ mod integration_tests {
         let mut manager2 = QuicNetworkManager::with_config(config2);
 
         // Start both endpoints
-        manager1.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        manager2.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        manager1
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        manager2
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
 
         // Get party IDs
         let party1 = manager1.party_id();
@@ -1999,16 +2050,8 @@ mod integration_tests {
         let candidates1 = manager1.gather_ice_candidates().await.unwrap();
         let candidates2 = manager2.gather_ice_candidates().await.unwrap();
 
-        info!(
-            "Party {} gathered {} candidates",
-            party1,
-            candidates1.len()
-        );
-        info!(
-            "Party {} gathered {} candidates",
-            party2,
-            candidates2.len()
-        );
+        info!("Party {} gathered {} candidates", party1, candidates1.len());
+        info!("Party {} gathered {} candidates", party2, candidates2.len());
 
         // Verify both have host candidates
         assert!(

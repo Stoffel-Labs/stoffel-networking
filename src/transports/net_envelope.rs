@@ -1,6 +1,6 @@
+use crate::transports::ice::IceCandidate;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use crate::transports::ice::IceCandidate;
 
 /// Network envelope used on QUIC to distinguish control messages (like handshakes)
 /// from protocol payloads. If deserialization of this wrapper fails on receive,
@@ -16,7 +16,6 @@ pub enum NetEnvelope {
     // =========================================================================
     // ICE NAT Traversal Messages
     // =========================================================================
-
     /// ICE candidate exchange - sent after handshake to share connectivity candidates
     IceCandidates {
         /// ICE username fragment for authentication
@@ -99,8 +98,8 @@ impl NetEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use crate::transports::ice::IceCandidate;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn test_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), port)
@@ -147,13 +146,21 @@ mod tests {
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
-        if let NetEnvelope::IceCandidates { ufrag, pwd, candidates } = deserialized {
+        if let NetEnvelope::IceCandidates {
+            ufrag,
+            pwd,
+            candidates,
+        } = deserialized
+        {
             assert_eq!(ufrag, "abcd");
             assert_eq!(pwd, "secret_password_long_enough");
             assert_eq!(candidates.len(), 1);
             let c = &candidates[0];
             assert_eq!(c.address, test_addr(5000));
-            assert_eq!(c.candidate_type, crate::transports::ice::CandidateType::Host);
+            assert_eq!(
+                c.candidate_type,
+                crate::transports::ice::CandidateType::Host
+            );
             assert_eq!(c.foundation, original_foundation);
             assert_eq!(c.priority, original_priority);
             assert_eq!(c.component, 1);
@@ -173,7 +180,12 @@ mod tests {
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
-        if let NetEnvelope::PunchRequest { transaction_id, target_address, delay_ms } = deserialized {
+        if let NetEnvelope::PunchRequest {
+            transaction_id,
+            target_address,
+            delay_ms,
+        } = deserialized
+        {
             assert_eq!(transaction_id, 12345);
             assert_eq!(target_address, target);
             assert_eq!(delay_ms, 50);
@@ -190,7 +202,11 @@ mod tests {
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
-        if let NetEnvelope::PunchAck { transaction_id, timestamp_ms } = deserialized {
+        if let NetEnvelope::PunchAck {
+            transaction_id,
+            timestamp_ms,
+        } = deserialized
+        {
             assert_eq!(transaction_id, 99999);
             assert_eq!(timestamp_ms, 1700000000000);
         } else {
@@ -208,7 +224,13 @@ mod tests {
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
-        if let NetEnvelope::ConnectivityCheck { transaction_id, is_response, use_candidate, ufrag } = deserialized {
+        if let NetEnvelope::ConnectivityCheck {
+            transaction_id,
+            is_response,
+            use_candidate,
+            ufrag,
+        } = deserialized
+        {
             assert_eq!(transaction_id, 777);
             assert!(is_response);
             assert!(!use_candidate);
@@ -220,9 +242,7 @@ mod tests {
 
     #[test]
     fn test_relay_request_round_trip() {
-        let envelope = NetEnvelope::RelayRequest {
-            target_party_id: 3,
-        };
+        let envelope = NetEnvelope::RelayRequest { target_party_id: 3 };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
         if let NetEnvelope::RelayRequest { target_party_id } = deserialized {
@@ -243,7 +263,12 @@ mod tests {
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
-        if let NetEnvelope::RelayOffer { relay_address, allocation_token, for_party_id } = deserialized {
+        if let NetEnvelope::RelayOffer {
+            relay_address,
+            allocation_token,
+            for_party_id,
+        } = deserialized
+        {
             assert_eq!(relay_address, relay_addr);
             assert_eq!(allocation_token, token);
             assert_eq!(for_party_id, 7);
@@ -262,7 +287,12 @@ mod tests {
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
-        if let NetEnvelope::RelayedData { target_party_id, source_party_id, payload: p } = deserialized {
+        if let NetEnvelope::RelayedData {
+            target_party_id,
+            source_party_id,
+            payload: p,
+        } = deserialized
+        {
             assert_eq!(target_party_id, 1);
             assert_eq!(source_party_id, 2);
             assert_eq!(p, payload);
@@ -296,7 +326,12 @@ mod tests {
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
-        if let NetEnvelope::IceCandidates { ufrag, pwd, candidates } = deserialized {
+        if let NetEnvelope::IceCandidates {
+            ufrag,
+            pwd,
+            candidates,
+        } = deserialized
+        {
             assert_eq!(ufrag, "u");
             assert_eq!(pwd, "p");
             assert!(candidates.is_empty());
@@ -352,7 +387,12 @@ mod tests {
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
-        if let NetEnvelope::RelayedData { target_party_id, source_party_id, payload } = deserialized {
+        if let NetEnvelope::RelayedData {
+            target_party_id,
+            source_party_id,
+            payload,
+        } = deserialized
+        {
             assert_eq!(target_party_id, 5);
             assert_eq!(source_party_id, 10);
             assert!(payload.is_empty());
@@ -402,7 +442,10 @@ mod tests {
         };
         let bytes1 = envelope.serialize();
         let bytes2 = envelope.serialize();
-        assert_eq!(bytes1, bytes2, "serializing the same value twice must produce identical bytes");
+        assert_eq!(
+            bytes1, bytes2,
+            "serializing the same value twice must produce identical bytes"
+        );
     }
 
     #[test]

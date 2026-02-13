@@ -3,14 +3,18 @@
 //! Implements RFC 8445 candidate types, priority calculation, and pair formation
 //! for NAT traversal in QUIC connections.
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use rand::Rng;
 
-/// ICE candidate types per RFC 8445
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// ICE candidate types per [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445).
+///
+/// Candidate types indicate how an address was discovered and affect priority
+/// calculation during connectivity checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum CandidateType {
-    /// Local interface address (highest priority)
+    /// Local interface address (highest priority, default)
+    #[default]
     Host,
     /// STUN-discovered reflexive address
     ServerReflexive,
@@ -38,8 +42,11 @@ pub enum TransportProtocol {
     Udp,
 }
 
-/// Single ICE candidate representing a potential connection endpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Single ICE candidate representing a potential connection endpoint.
+///
+/// An ICE candidate contains all information needed to attempt a connection
+/// to a peer, including the network address, candidate type, and priority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IceCandidate {
     /// Unique identifier for this candidate (used for pairing)
     pub foundation: String,
@@ -68,9 +75,7 @@ impl IceCandidate {
         component_id: u32,
     ) -> u32 {
         let type_preference = candidate_type.type_preference();
-        (type_preference << 24)
-            + ((local_preference as u32) << 8)
-            + (256 - component_id.min(256))
+        (type_preference << 24) + ((local_preference as u32) << 8) + (256 - component_id.min(256))
     }
 
     /// Creates a foundation string based on candidate properties
@@ -80,8 +85,8 @@ impl IceCandidate {
         base_addr: Option<SocketAddr>,
         stun_server: Option<SocketAddr>,
     ) -> String {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         candidate_type.hash(&mut hasher);
@@ -122,8 +127,11 @@ impl IceCandidate {
         let local_preference = Self::compute_local_preference(&reflexive_addr);
         let priority =
             Self::calculate_priority(CandidateType::ServerReflexive, local_preference, component);
-        let foundation =
-            Self::generate_foundation(CandidateType::ServerReflexive, Some(base_addr), Some(stun_server));
+        let foundation = Self::generate_foundation(
+            CandidateType::ServerReflexive,
+            Some(base_addr),
+            Some(stun_server),
+        );
 
         Self {
             foundation,
@@ -171,10 +179,14 @@ impl IceCandidate {
     }
 }
 
-/// State of a candidate pair during connectivity checking
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// State of a candidate pair during connectivity checking.
+///
+/// Pairs start in `Frozen` state and progress through `Waiting`, `InProgress`,
+/// to either `Succeeded` or `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CandidatePairState {
-    /// Pair has not been checked yet
+    /// Pair has not been checked yet (default)
+    #[default]
     Frozen,
     /// Pair is waiting for its turn to be checked
     Waiting,
@@ -221,11 +233,7 @@ impl CandidatePair {
     }
 
     /// Creates a new candidate pair
-    pub fn new(
-        local: IceCandidate,
-        remote: IceCandidate,
-        is_controlling: bool,
-    ) -> Self {
+    pub fn new(local: IceCandidate, remote: IceCandidate, is_controlling: bool) -> Self {
         let (controlling_priority, controlled_priority) = if is_controlling {
             (local.priority, remote.priority)
         } else {
@@ -260,7 +268,8 @@ impl CandidatePair {
                     // Only pair candidates with compatible address families
                     let compatible = matches!(
                         (&local.address, &remote.address),
-                        (SocketAddr::V4(_), SocketAddr::V4(_)) | (SocketAddr::V6(_), SocketAddr::V6(_))
+                        (SocketAddr::V4(_), SocketAddr::V4(_))
+                            | (SocketAddr::V6(_), SocketAddr::V6(_))
                     );
 
                     if compatible {
@@ -578,7 +587,10 @@ mod tests {
         let locals: Vec<IceCandidate> = (0..100)
             .map(|i| {
                 IceCandidate::host(
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)), 5000 + i as u16),
+                    SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                        5000 + i as u16,
+                    ),
                     1,
                 )
             })
@@ -587,7 +599,10 @@ mod tests {
         let remotes: Vec<IceCandidate> = (0..100)
             .map(|i| {
                 IceCandidate::host(
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, (i / 256) as u8, (i % 256) as u8)), 6000 + i as u16),
+                    SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(172, 16, (i / 256) as u8, (i % 256) as u8)),
+                        6000 + i as u16,
+                    ),
                     1,
                 )
             })
@@ -635,9 +650,17 @@ mod tests {
 
     #[test]
     fn test_type_preferences_ordered() {
-        assert!(CandidateType::Host.type_preference() > CandidateType::PeerReflexive.type_preference());
-        assert!(CandidateType::PeerReflexive.type_preference() > CandidateType::ServerReflexive.type_preference());
-        assert!(CandidateType::ServerReflexive.type_preference() > CandidateType::Relay.type_preference());
+        assert!(
+            CandidateType::Host.type_preference() > CandidateType::PeerReflexive.type_preference()
+        );
+        assert!(
+            CandidateType::PeerReflexive.type_preference()
+                > CandidateType::ServerReflexive.type_preference()
+        );
+        assert!(
+            CandidateType::ServerReflexive.type_preference()
+                > CandidateType::Relay.type_preference()
+        );
     }
 
     #[test]
@@ -648,10 +671,8 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5000),
             1,
         );
-        let ipv6_candidate = IceCandidate::host(
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5000),
-            1,
-        );
+        let ipv6_candidate =
+            IceCandidate::host(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5000), 1);
 
         assert!(ipv4_candidate.priority > ipv6_candidate.priority);
     }
@@ -662,8 +683,14 @@ mod tests {
         assert!(lc.is_empty());
         assert_eq!(lc.len(), 0);
 
-        lc.add_host(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5000));
-        lc.add_host(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5001));
+        lc.add_host(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            5000,
+        ));
+        lc.add_host(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
+            5001,
+        ));
 
         assert!(!lc.is_empty());
         assert_eq!(lc.len(), 2);

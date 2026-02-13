@@ -2,14 +2,15 @@
 name = "stoffelnet"
 version = "0.1.0"
 edition = "2021"
-contributors = ["Stoffel Labs Inc"]
-homepage = "stoffelmpc.com"
+authors = ["Stoffel Labs Inc <contact@stoffelmpc.com>"]
+homepage = "https://stoffelmpc.com"
 repository = "https://github.com/Stoffel-Labs/stoffel-networking.git"
+documentation = "https://docs.rs/stoffelnet"
 categories = ["cryptography", "network-programming"]
-keywords = ["api", "protocol", "networking", "client", "server"]
+keywords = ["mpc", "quic", "networking", "p2p", "nat-traversal"]
 license = "Apache-2.0"
 readme = "README.md"
-description = "A library that contains networking utilities for the Stoffel stack"
+description = "QUIC-based P2P networking library for MPC applications with NAT traversal support"
 
 
 [lib]
@@ -19,6 +20,7 @@ crate-type = ["rlib", "cdylib"]
 quinn = "0.11.8"
 rustls = "0.23.29"
 serde = { version = "1.0.219", features = ["derive"] }
+serde_with = { version = "3.12", features = ["std"] }
 tokio = { version = "1.46.1", features = ["macros", "rt-multi-thread", "test-util"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 rcgen = "0.14.2"

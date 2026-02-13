@@ -33,9 +33,7 @@ use tokio::task::AbortHandle;
 use rustls::crypto::CryptoProvider;
 
 use crate::network_utils::{Network, Node, PartyId};
-use crate::transports::quic::{
-    ConnectionState, QuicNetworkManager, QuicNode, PeerConnection,
-};
+use crate::transports::quic::{ConnectionState, PeerConnection, QuicNetworkManager, QuicNode};
 
 // ============================================================================
 // ERROR CODES
@@ -88,9 +86,8 @@ thread_local! {
 /// Sets the last error message for the current thread
 fn set_last_error(err: impl ToString) {
     LAST_ERROR.with(|e| {
-        let msg = CString::new(err.to_string()).unwrap_or_else(|_| {
-            CString::new("Unknown error (invalid UTF-8)").unwrap()
-        });
+        let msg = CString::new(err.to_string())
+            .unwrap_or_else(|_| CString::new("Unknown error (invalid UTF-8)").unwrap());
         *e.borrow_mut() = Some(msg);
     });
 }
@@ -141,8 +138,8 @@ impl RuntimeHandle {
         // if already installed, which we ignore.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let runtime = Runtime::new()
-            .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+        let runtime =
+            Runtime::new().map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
         Ok(Self { runtime })
     }
 
@@ -209,9 +206,8 @@ pub type StoffelNodeHandle = *mut c_void;
 pub type StoffelConnectCallback = Option<extern "C" fn(result: c_int, user_data: *mut c_void)>;
 
 /// Callback type for receive completion
-pub type StoffelReceiveCallback = Option<
-    extern "C" fn(result: c_int, data: *const u8, len: usize, user_data: *mut c_void),
->;
+pub type StoffelReceiveCallback =
+    Option<extern "C" fn(result: c_int, data: *const u8, len: usize, user_data: *mut c_void)>;
 
 /// Callback type for send completion
 pub type StoffelSendCallback = Option<extern "C" fn(result: c_int, user_data: *mut c_void)>;
@@ -280,10 +276,7 @@ pub extern "C" fn stoffelnet_runtime_destroy(runtime: StoffelRuntimeHandle) {
 /// The address must be a valid null-terminated C string.
 /// The returned handle must be freed with `stoffelnet_node_destroy`.
 #[unsafe(no_mangle)]
-pub extern "C" fn stoffelnet_node_new(
-    address: *const c_char,
-    party_id: u64,
-) -> StoffelNodeHandle {
+pub extern "C" fn stoffelnet_node_new(address: *const c_char, party_id: u64) -> StoffelNodeHandle {
     if address.is_null() {
         set_last_error("Null address pointer");
         return std::ptr::null_mut();
@@ -847,7 +840,11 @@ pub extern "C" fn stoffelnet_manager_is_party_connected(
         manager.is_party_connected(party_id as PartyId).await
     });
 
-    if is_connected { 1 } else { 0 }
+    if is_connected {
+        1
+    } else {
+        0
+    }
 }
 
 // ============================================================================
@@ -902,9 +899,7 @@ pub extern "C" fn stoffelnet_connection_send(
         &[]
     };
 
-    let result = runtime_handle.block_on(async {
-        conn_handle.connection.send(bytes).await
-    });
+    let result = runtime_handle.block_on(async { conn_handle.connection.send(bytes).await });
 
     match result {
         Ok(_) => STOFFELNET_OK,
@@ -958,9 +953,7 @@ pub extern "C" fn stoffelnet_connection_receive(
     let conn_handle = unsafe { &*(conn as *const PeerConnectionHandle) };
     let runtime_handle = unsafe { &*(runtime as *const RuntimeHandle) };
 
-    let result = runtime_handle.block_on(async {
-        conn_handle.connection.receive().await
-    });
+    let result = runtime_handle.block_on(async { conn_handle.connection.receive().await });
 
     match result {
         Ok(data) => {
@@ -1103,11 +1096,21 @@ pub extern "C" fn stoffelnet_connection_receive_async(
         if let Some(cb) = callback {
             match result {
                 Ok(data) => {
-                    cb(STOFFELNET_OK, data.as_ptr(), data.len(), user_data as *mut c_void);
+                    cb(
+                        STOFFELNET_OK,
+                        data.as_ptr(),
+                        data.len(),
+                        user_data as *mut c_void,
+                    );
                 }
                 Err(e) => {
                     set_last_error(e);
-                    cb(STOFFELNET_ERR_RECEIVE, std::ptr::null(), 0, user_data as *mut c_void);
+                    cb(
+                        STOFFELNET_ERR_RECEIVE,
+                        std::ptr::null(),
+                        0,
+                        user_data as *mut c_void,
+                    );
                 }
             }
         }
@@ -1167,9 +1170,7 @@ pub extern "C" fn stoffelnet_connection_state(
     let conn_handle = unsafe { &*(conn as *const PeerConnectionHandle) };
     let runtime_handle = unsafe { &*(runtime as *const RuntimeHandle) };
 
-    let state = runtime_handle.block_on(async {
-        conn_handle.connection.state().await
-    });
+    let state = runtime_handle.block_on(async { conn_handle.connection.state().await });
 
     match state {
         ConnectionState::Connected => STOFFELNET_STATE_CONNECTED,
@@ -1205,11 +1206,14 @@ pub extern "C" fn stoffelnet_connection_is_connected(
     let conn_handle = unsafe { &*(conn as *const PeerConnectionHandle) };
     let runtime_handle = unsafe { &*(runtime as *const RuntimeHandle) };
 
-    let is_connected = runtime_handle.block_on(async {
-        conn_handle.connection.is_connected().await
-    });
+    let is_connected =
+        runtime_handle.block_on(async { conn_handle.connection.is_connected().await });
 
-    if is_connected { 1 } else { 0 }
+    if is_connected {
+        1
+    } else {
+        0
+    }
 }
 
 /// Closes a connection
@@ -1234,9 +1238,7 @@ pub extern "C" fn stoffelnet_connection_close(
     let conn_handle = unsafe { &*(conn as *const PeerConnectionHandle) };
     let runtime_handle = unsafe { &*(runtime as *const RuntimeHandle) };
 
-    let _ = runtime_handle.block_on(async {
-        conn_handle.connection.close().await
-    });
+    let _ = runtime_handle.block_on(async { conn_handle.connection.close().await });
 }
 
 /// Destroys a connection handle
@@ -1361,10 +1363,19 @@ mod tests {
     #[test]
     fn test_null_handling() {
         // Test that null handles are handled gracefully
-        assert_eq!(stoffelnet_manager_add_node(std::ptr::null_mut(), std::ptr::null(), 0), STOFFELNET_ERR_NULL_POINTER);
-        assert_eq!(stoffelnet_manager_connect_to_party(std::ptr::null_mut(), 0), STOFFELNET_ERR_NULL_POINTER);
+        assert_eq!(
+            stoffelnet_manager_add_node(std::ptr::null_mut(), std::ptr::null(), 0),
+            STOFFELNET_ERR_NULL_POINTER
+        );
+        assert_eq!(
+            stoffelnet_manager_connect_to_party(std::ptr::null_mut(), 0),
+            STOFFELNET_ERR_NULL_POINTER
+        );
         assert!(stoffelnet_manager_get_connection(std::ptr::null_mut(), 0).is_null());
-        assert_eq!(stoffelnet_manager_is_party_connected(std::ptr::null_mut(), 0), 0);
+        assert_eq!(
+            stoffelnet_manager_is_party_connected(std::ptr::null_mut(), 0),
+            0
+        );
 
         stoffelnet_runtime_destroy(std::ptr::null_mut()); // Should not crash
         stoffelnet_manager_destroy(std::ptr::null_mut()); // Should not crash

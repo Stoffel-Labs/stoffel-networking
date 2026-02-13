@@ -1,4 +1,3 @@
-
 use ark_ff::Field;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -127,7 +126,10 @@ mod tests {
         let key = NodePublicKey(vec![1, 2, 3, 4, 5]);
         let id_first = key.derive_id();
         let id_second = key.derive_id();
-        assert_eq!(id_first, id_second, "derive_id must return the same value for the same key bytes");
+        assert_eq!(
+            id_first, id_second,
+            "derive_id must return the same value for the same key bytes"
+        );
     }
 
     #[test]

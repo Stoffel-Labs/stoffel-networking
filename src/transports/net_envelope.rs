@@ -83,6 +83,12 @@ pub enum NetEnvelope {
         /// The actual payload being relayed
         payload: Vec<u8>,
     },
+
+    /// Keep-alive heartbeat to prevent idle timeout and measure RTT
+    Heartbeat {
+        /// Timestamp in milliseconds since epoch for RTT measurement
+        timestamp_ms: u64,
+    },
 }
 
 impl NetEnvelope {
@@ -274,6 +280,20 @@ mod tests {
             assert_eq!(for_party_id, 7);
         } else {
             panic!("expected RelayOffer variant");
+        }
+    }
+
+    #[test]
+    fn test_heartbeat_round_trip() {
+        let envelope = NetEnvelope::Heartbeat {
+            timestamp_ms: 1700000000000,
+        };
+        let bytes = envelope.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
+        if let NetEnvelope::Heartbeat { timestamp_ms } = deserialized {
+            assert_eq!(timestamp_ms, 1700000000000);
+        } else {
+            panic!("expected Heartbeat variant");
         }
     }
 
@@ -486,6 +506,9 @@ mod tests {
                 target_party_id: 1,
                 source_party_id: 2,
                 payload: vec![1],
+            },
+            NetEnvelope::Heartbeat {
+                timestamp_ms: 1000,
             },
         ];
 

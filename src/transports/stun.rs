@@ -1,10 +1,13 @@
-//! STUN (Session Traversal Utilities for NAT) client implementation
+//! STUN (Session Traversal Utilities for NAT) client implementation.
 //!
 //! Provides reflexive address discovery for NAT traversal using STUN binding requests.
-//! Implements a minimal STUN client per RFC 5389/8489.
+//! Implements a minimal STUN client per [RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389)
+//! and [RFC 8489](https://datatracker.ietf.org/doc/html/rfc8489).
 
 use byteorder::{BigEndian, ByteOrder};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, DurationMilliSeconds};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -24,12 +27,16 @@ const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 /// STUN header size
 const STUN_HEADER_SIZE: usize = 20;
 
-/// Configuration for a STUN server
-#[derive(Debug, Clone)]
+/// Configuration for a STUN server.
+///
+/// Specifies connection parameters for querying a single STUN server.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StunServerConfig {
     /// Server address
     pub address: SocketAddr,
-    /// Timeout for each request
+    /// Timeout for each request (serialized as milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub timeout: Duration,
     /// Maximum retries
     pub max_retries: u32,
@@ -68,8 +75,10 @@ pub struct StunBindingResult {
     pub rtt: Duration,
 }
 
-/// STUN client errors
-#[derive(Debug, Clone)]
+/// STUN client errors.
+///
+/// These errors are returned by [`StunClient`] methods when STUN operations fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StunError {
     /// Network I/O error
     NetworkError(String),
@@ -115,9 +124,7 @@ impl StunClient {
     /// which SocketAddr doesn't support. Users should resolve addresses and use
     /// `StunClient::new()` with resolved IP addresses.
     pub fn with_default_servers() -> Self {
-        Self {
-            servers: vec![],
-        }
+        Self { servers: vec![] }
     }
 
     /// Discovers the reflexive address using the given UDP socket
@@ -302,7 +309,9 @@ impl StunClient {
         // Verify magic cookie
         let magic = BigEndian::read_u32(&data[4..8]);
         if magic != STUN_MAGIC_COOKIE {
-            return Err(StunError::InvalidResponse("Invalid magic cookie".to_string()));
+            return Err(StunError::InvalidResponse(
+                "Invalid magic cookie".to_string(),
+            ));
         }
 
         // Verify transaction ID
@@ -460,7 +469,10 @@ pub fn detect_symmetric_nat(results: &[StunBindingResult]) -> bool {
     // If we get different reflexive addresses from different servers,
     // we're likely behind a symmetric NAT
     let first_addr = results[0].reflexive_address;
-    results.iter().skip(1).any(|r| r.reflexive_address != first_addr)
+    results
+        .iter()
+        .skip(1)
+        .any(|r| r.reflexive_address != first_addr)
 }
 
 #[cfg(test)]
@@ -565,7 +577,9 @@ mod tests {
 
     #[test]
     fn test_parse_xor_mapped_address_ipv6() {
-        let transaction_id: [u8; 12] = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let transaction_id: [u8; 12] = [
+            0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        ];
         let magic_cookie = STUN_MAGIC_COOKIE.to_be_bytes();
 
         // Target: IPv6 address 2001:db8::1, port 9876
@@ -593,7 +607,10 @@ mod tests {
         data[4..20].copy_from_slice(&xor_addr);
 
         let result = StunClient::parse_xor_mapped_address(&data, &magic_cookie, &transaction_id);
-        assert!(result.is_some(), "Expected Some for valid IPv6 XOR-MAPPED-ADDRESS");
+        assert!(
+            result.is_some(),
+            "Expected Some for valid IPv6 XOR-MAPPED-ADDRESS"
+        );
 
         let addr = result.unwrap();
         assert_eq!(addr.port(), expected_port);
@@ -610,11 +627,17 @@ mod tests {
         BigEndian::write_u32(&mut data[4..8], u32::from(ip));
 
         let result = StunClient::parse_mapped_address(&data);
-        assert!(result.is_some(), "Expected Some for valid IPv4 MAPPED-ADDRESS");
+        assert!(
+            result.is_some(),
+            "Expected Some for valid IPv4 MAPPED-ADDRESS"
+        );
 
         let addr = result.unwrap();
         assert_eq!(addr.port(), 8080);
-        assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))
+        );
     }
 
     #[test]
@@ -629,7 +652,10 @@ mod tests {
         data[4..20].copy_from_slice(&expected_ip.octets());
 
         let result = StunClient::parse_mapped_address(&data);
-        assert!(result.is_some(), "Expected Some for valid IPv6 MAPPED-ADDRESS");
+        assert!(
+            result.is_some(),
+            "Expected Some for valid IPv6 MAPPED-ADDRESS"
+        );
 
         let addr = result.unwrap();
         assert_eq!(addr.port(), expected_port);
@@ -644,7 +670,10 @@ mod tests {
         let mut mapped_data = vec![0u8; 8];
         mapped_data[1] = 0x01; // IPv4
         BigEndian::write_u16(&mut mapped_data[2..4], 1111);
-        BigEndian::write_u32(&mut mapped_data[4..8], u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        BigEndian::write_u32(
+            &mut mapped_data[4..8],
+            u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+        );
         let mapped_attr = build_attr(ATTR_MAPPED_ADDRESS, &mapped_data);
 
         // Build XOR-MAPPED-ADDRESS attribute with IP 192.168.1.1:2222
@@ -663,11 +692,17 @@ mod tests {
 
         let response = build_test_response(&transaction_id, &attrs);
         let result = StunClient::parse_binding_response(&response, &transaction_id);
-        assert!(result.is_ok(), "Expected Ok for valid response with both attributes");
+        assert!(
+            result.is_ok(),
+            "Expected Ok for valid response with both attributes"
+        );
 
         let addr = result.unwrap();
         // XOR-MAPPED-ADDRESS should be preferred
-        assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1))
+        );
         assert_eq!(addr.port(), 2222);
     }
 
@@ -683,7 +718,11 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StunError::InvalidResponse(msg) => {
-                assert!(msg.contains("too short"), "Expected 'too short' in error message, got: {}", msg);
+                assert!(
+                    msg.contains("too short"),
+                    "Expected 'too short' in error message, got: {}",
+                    msg
+                );
             }
             other => panic!("Expected InvalidResponse, got: {:?}", other),
         }
@@ -703,7 +742,11 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StunError::InvalidResponse(msg) => {
-                assert!(msg.contains("message type"), "Expected 'message type' in error, got: {}", msg);
+                assert!(
+                    msg.contains("message type"),
+                    "Expected 'message type' in error, got: {}",
+                    msg
+                );
             }
             other => panic!("Expected InvalidResponse, got: {:?}", other),
         }
@@ -723,7 +766,11 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StunError::InvalidResponse(msg) => {
-                assert!(msg.contains("length mismatch"), "Expected 'length mismatch' in error, got: {}", msg);
+                assert!(
+                    msg.contains("length mismatch"),
+                    "Expected 'length mismatch' in error, got: {}",
+                    msg
+                );
             }
             other => panic!("Expected InvalidResponse, got: {:?}", other),
         }
@@ -744,7 +791,11 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StunError::InvalidResponse(msg) => {
-                assert!(msg.contains("magic cookie"), "Expected 'magic cookie' in error, got: {}", msg);
+                assert!(
+                    msg.contains("magic cookie"),
+                    "Expected 'magic cookie' in error, got: {}",
+                    msg
+                );
             }
             other => panic!("Expected InvalidResponse, got: {:?}", other),
         }
@@ -762,7 +813,11 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StunError::InvalidResponse(msg) => {
-                assert!(msg.contains("Transaction ID mismatch"), "Expected 'Transaction ID mismatch' in error, got: {}", msg);
+                assert!(
+                    msg.contains("Transaction ID mismatch"),
+                    "Expected 'Transaction ID mismatch' in error, got: {}",
+                    msg
+                );
             }
             other => panic!("Expected InvalidResponse, got: {:?}", other),
         }
@@ -778,7 +833,11 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StunError::InvalidResponse(msg) => {
-                assert!(msg.contains("No mapped address"), "Expected 'No mapped address' in error, got: {}", msg);
+                assert!(
+                    msg.contains("No mapped address"),
+                    "Expected 'No mapped address' in error, got: {}",
+                    msg
+                );
             }
             other => panic!("Expected InvalidResponse, got: {:?}", other),
         }
@@ -796,7 +855,10 @@ mod tests {
         BigEndian::write_u32(&mut data[4..8], 0x12345678);
 
         let result = StunClient::parse_xor_mapped_address(&data, &magic_cookie, &transaction_id);
-        assert!(result.is_none(), "Expected None for unknown address family 0x03");
+        assert!(
+            result.is_none(),
+            "Expected None for unknown address family 0x03"
+        );
     }
 
     #[test]
@@ -811,7 +873,10 @@ mod tests {
         data[1] = 0x01; // IPv4 family (irrelevant — rejected by length)
 
         let result = StunClient::parse_xor_mapped_address(&data, &magic_cookie, &transaction_id);
-        assert!(result.is_none(), "Expected None for attribute shorter than 8 bytes");
+        assert!(
+            result.is_none(),
+            "Expected None for attribute shorter than 8 bytes"
+        );
     }
 
     #[test]
@@ -825,7 +890,10 @@ mod tests {
         BigEndian::write_u16(&mut data[2..4], 5555);
 
         let result = StunClient::parse_xor_mapped_address(&data, &magic_cookie, &transaction_id);
-        assert!(result.is_none(), "Expected None for truncated IPv6 attribute (< 20 bytes)");
+        assert!(
+            result.is_none(),
+            "Expected None for truncated IPv6 attribute (< 20 bytes)"
+        );
     }
 
     // ==================== Edge case tests ====================
@@ -833,7 +901,10 @@ mod tests {
     #[test]
     fn test_no_servers_configured() {
         let client = StunClient::new(vec![]);
-        assert!(!client.has_servers(), "Expected has_servers() to return false for empty server list");
+        assert!(
+            !client.has_servers(),
+            "Expected has_servers() to return false for empty server list"
+        );
     }
 
     #[test]

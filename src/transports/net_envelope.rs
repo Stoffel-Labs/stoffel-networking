@@ -89,6 +89,34 @@ pub enum NetEnvelope {
         /// Timestamp in milliseconds since epoch for RTT measurement
         timestamp_ms: u64,
     },
+
+    // =========================================================================
+    // Consensus Messages
+    // =========================================================================
+
+    /// Client requests the node's canonical node list (optional, defensive).
+    NodeListRequest,
+
+    /// Node sends its canonical ordered list of node public keys.
+    /// Auto-pushed to clients after consensus. Position = PartyId (0..N-1).
+    NodeListResponse {
+        /// DER-encoded SPKI bytes for each node, ordered by PartyId
+        node_keys: Vec<Vec<u8>>,
+    },
+
+    /// Node-to-node: SHA-256 digest of sorted client public key list.
+    ClientListDigest {
+        /// 32-byte SHA-256 digest
+        digest: Vec<u8>,
+        /// Number of clients included in the digest
+        client_count: usize,
+    },
+
+    /// Node-to-node: full sorted client key list (diagnostic fallback).
+    ClientListFull {
+        /// DER-encoded SPKI bytes for each client
+        client_keys: Vec<Vec<u8>>,
+    },
 }
 
 impl NetEnvelope {
@@ -294,6 +322,93 @@ mod tests {
             assert_eq!(timestamp_ms, 1700000000000);
         } else {
             panic!("expected Heartbeat variant");
+        }
+    }
+
+    #[test]
+    fn test_node_list_request_round_trip() {
+        let envelope = NetEnvelope::NodeListRequest;
+        let bytes = envelope.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
+        assert!(matches!(deserialized, NetEnvelope::NodeListRequest));
+    }
+
+    #[test]
+    fn test_node_list_response_round_trip() {
+        let node_keys = vec![vec![1, 2, 3], vec![4, 5, 6, 7]];
+        let envelope = NetEnvelope::NodeListResponse {
+            node_keys: node_keys.clone(),
+        };
+        let bytes = envelope.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
+        if let NetEnvelope::NodeListResponse { node_keys: keys } = deserialized {
+            assert_eq!(keys, node_keys);
+        } else {
+            panic!("expected NodeListResponse variant");
+        }
+    }
+
+    #[test]
+    fn test_node_list_response_empty_keys() {
+        let envelope = NetEnvelope::NodeListResponse {
+            node_keys: vec![],
+        };
+        let bytes = envelope.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
+        if let NetEnvelope::NodeListResponse { node_keys } = deserialized {
+            assert!(node_keys.is_empty());
+        } else {
+            panic!("expected NodeListResponse variant");
+        }
+    }
+
+    #[test]
+    fn test_client_list_digest_round_trip() {
+        let digest = vec![0xAB; 32];
+        let envelope = NetEnvelope::ClientListDigest {
+            digest: digest.clone(),
+            client_count: 5,
+        };
+        let bytes = envelope.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
+        if let NetEnvelope::ClientListDigest {
+            digest: d,
+            client_count,
+        } = deserialized
+        {
+            assert_eq!(d, digest);
+            assert_eq!(client_count, 5);
+        } else {
+            panic!("expected ClientListDigest variant");
+        }
+    }
+
+    #[test]
+    fn test_client_list_full_round_trip() {
+        let client_keys = vec![vec![10, 20], vec![30, 40, 50]];
+        let envelope = NetEnvelope::ClientListFull {
+            client_keys: client_keys.clone(),
+        };
+        let bytes = envelope.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
+        if let NetEnvelope::ClientListFull { client_keys: keys } = deserialized {
+            assert_eq!(keys, client_keys);
+        } else {
+            panic!("expected ClientListFull variant");
+        }
+    }
+
+    #[test]
+    fn test_client_list_full_empty() {
+        let envelope = NetEnvelope::ClientListFull {
+            client_keys: vec![],
+        };
+        let bytes = envelope.serialize();
+        let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
+        if let NetEnvelope::ClientListFull { client_keys } = deserialized {
+            assert!(client_keys.is_empty());
+        } else {
+            panic!("expected ClientListFull variant");
         }
     }
 
@@ -509,6 +624,17 @@ mod tests {
             },
             NetEnvelope::Heartbeat {
                 timestamp_ms: 1000,
+            },
+            NetEnvelope::NodeListRequest,
+            NetEnvelope::NodeListResponse {
+                node_keys: vec![vec![1, 2, 3]],
+            },
+            NetEnvelope::ClientListDigest {
+                digest: vec![0xAB; 32],
+                client_count: 2,
+            },
+            NetEnvelope::ClientListFull {
+                client_keys: vec![vec![1, 2]],
             },
         ];
 

@@ -32,7 +32,7 @@ use tokio::task::AbortHandle;
 
 use rustls::crypto::CryptoProvider;
 
-use crate::network_utils::{Network, Node, PartyId};
+use crate::network_utils::{Network, Node, PartyId, VerifiedOrdering};
 use crate::transports::quic::{ConnectionState, PeerConnection, QuicNetworkManager, QuicNode};
 
 // ============================================================================
@@ -61,6 +61,8 @@ pub const STOFFELNET_ERR_RUNTIME: c_int = -8;
 pub const STOFFELNET_ERR_INVALID_UTF8: c_int = -9;
 /// Operation cancelled
 pub const STOFFELNET_ERR_CANCELLED: c_int = -10;
+/// Consensus protocol error
+pub const STOFFELNET_ERR_CONSENSUS: c_int = -11;
 
 // ============================================================================
 // CONNECTION STATE CONSTANTS
@@ -179,6 +181,11 @@ pub struct NodeHandle {
     node: QuicNode,
 }
 
+/// Wrapper for verified ordering
+pub struct VerifiedOrderingHandle {
+    ordering: VerifiedOrdering,
+}
+
 // ============================================================================
 // OPAQUE POINTER TYPES
 // ============================================================================
@@ -197,6 +204,9 @@ pub type StoffelAsyncOperationHandle = *mut c_void;
 
 /// Opaque pointer to a node
 pub type StoffelNodeHandle = *mut c_void;
+
+/// Opaque pointer to a verified ordering
+pub type StoffelVerifiedOrderingHandle = *mut c_void;
 
 // ============================================================================
 // CALLBACK TYPES
@@ -1303,6 +1313,272 @@ pub extern "C" fn stoffelnet_free_string(str: *mut c_char) {
 }
 
 // ============================================================================
+// CONSENSUS FFI
+// ============================================================================
+
+/// Sets the expected number of parties (nodes) for consensus.
+/// Must be called before listen().
+///
+/// # Safety
+///
+/// The manager handle must be a valid, non-null pointer obtained from
+/// `stoffelnet_manager_new`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_set_expected_parties(
+    manager: StoffelNetworkManagerHandle,
+    count: usize,
+) -> c_int {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+    handle
+        .runtime
+        .block_on(async {
+            let mut mgr = handle.manager.lock().await;
+            mgr.set_expected_parties(count);
+        });
+
+    STOFFELNET_OK
+}
+
+/// Sets the expected number of clients for consensus.
+/// Must be called before listen().
+///
+/// # Safety
+///
+/// The manager handle must be a valid, non-null pointer obtained from
+/// `stoffelnet_manager_new`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_set_expected_clients(
+    manager: StoffelNetworkManagerHandle,
+    count: usize,
+) -> c_int {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+    handle
+        .runtime
+        .block_on(async {
+            let mut mgr = handle.manager.lock().await;
+            mgr.set_expected_clients(count);
+        });
+
+    STOFFELNET_OK
+}
+
+/// Returns the verified ordering after consensus has completed.
+/// Returns NULL if consensus is not yet complete or not required.
+///
+/// # Safety
+///
+/// The manager handle must be a valid, non-null pointer.
+/// The returned handle must be freed with `stoffelnet_ordering_destroy`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_get_verified_ordering(
+    manager: StoffelNetworkManagerHandle,
+) -> StoffelVerifiedOrderingHandle {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return std::ptr::null_mut();
+    }
+
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+    let ordering = handle.runtime.block_on(async {
+        let mgr = handle.manager.lock().await;
+        mgr.verified_ordering()
+    });
+
+    match ordering {
+        Some(o) => {
+            Box::into_raw(Box::new(VerifiedOrderingHandle { ordering: o }))
+                as StoffelVerifiedOrderingHandle
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Returns the number of nodes in the verified ordering.
+///
+/// # Safety
+///
+/// The ordering handle must be a valid, non-null pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_ordering_node_count(
+    ordering: StoffelVerifiedOrderingHandle,
+) -> usize {
+    if ordering.is_null() {
+        set_last_error("Null ordering handle");
+        return 0;
+    }
+
+    let handle = unsafe { &*(ordering as *const VerifiedOrderingHandle) };
+    handle.ordering.node_count()
+}
+
+/// Returns the number of clients in the verified ordering.
+///
+/// # Safety
+///
+/// The ordering handle must be a valid, non-null pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_ordering_client_count(
+    ordering: StoffelVerifiedOrderingHandle,
+) -> usize {
+    if ordering.is_null() {
+        set_last_error("Null ordering handle");
+        return 0;
+    }
+
+    let handle = unsafe { &*(ordering as *const VerifiedOrderingHandle) };
+    handle.ordering.client_count()
+}
+
+/// Gets the public key for a given party ID from the verified ordering.
+///
+/// # Safety
+///
+/// - The ordering handle must be a valid, non-null pointer.
+/// - out_key and out_len must be valid, non-null pointers.
+/// - The caller must free the returned key bytes with `stoffelnet_free_bytes`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_ordering_node_key(
+    ordering: StoffelVerifiedOrderingHandle,
+    party_id: usize,
+    out_key: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    if ordering.is_null() || out_key.is_null() || out_len.is_null() {
+        set_last_error("Null pointer argument");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let handle = unsafe { &*(ordering as *const VerifiedOrderingHandle) };
+    match handle.ordering.node_key(party_id) {
+        Some(pk) => {
+            let mut bytes = pk.0.clone();
+            let len = bytes.len();
+            let ptr = bytes.as_mut_ptr();
+            std::mem::forget(bytes);
+            unsafe {
+                *out_key = ptr;
+                *out_len = len;
+            }
+            STOFFELNET_OK
+        }
+        None => {
+            set_last_error(format!("Party ID {} not found in ordering", party_id));
+            STOFFELNET_ERR_PARTY_NOT_FOUND
+        }
+    }
+}
+
+/// Gets the public key for a given client ID from the verified ordering.
+///
+/// # Safety
+///
+/// - The ordering handle must be a valid, non-null pointer.
+/// - out_key and out_len must be valid, non-null pointers.
+/// - The caller must free the returned key bytes with `stoffelnet_free_bytes`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_ordering_client_key(
+    ordering: StoffelVerifiedOrderingHandle,
+    client_id: usize,
+    out_key: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    if ordering.is_null() || out_key.is_null() || out_len.is_null() {
+        set_last_error("Null pointer argument");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let handle = unsafe { &*(ordering as *const VerifiedOrderingHandle) };
+    match handle.ordering.client_key(client_id) {
+        Some(pk) => {
+            let mut bytes = pk.0.clone();
+            let len = bytes.len();
+            let ptr = bytes.as_mut_ptr();
+            std::mem::forget(bytes);
+            unsafe {
+                *out_key = ptr;
+                *out_len = len;
+            }
+            STOFFELNET_OK
+        }
+        None => {
+            set_last_error(format!("Client ID {} not found in ordering", client_id));
+            STOFFELNET_ERR_PARTY_NOT_FOUND
+        }
+    }
+}
+
+/// Destroys a verified ordering handle.
+///
+/// # Safety
+///
+/// The handle must not be used after this function is called.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_ordering_destroy(ordering: StoffelVerifiedOrderingHandle) {
+    if !ordering.is_null() {
+        unsafe {
+            let _ = Box::from_raw(ordering as *mut VerifiedOrderingHandle);
+        }
+    }
+}
+
+/// Client-side: Reads auto-pushed NodeListResponse from each node connection
+/// and verifies they all agree. Returns a verified ordering handle.
+///
+/// # Safety
+///
+/// - conn_handles must point to an array of `count` valid `StoffelPeerConnectionHandle` values.
+/// - runtime must be a valid, non-null `StoffelRuntimeHandle`.
+/// - The returned handle must be freed with `stoffelnet_ordering_destroy`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_verify_node_ordering(
+    conn_handles: *const StoffelPeerConnectionHandle,
+    count: usize,
+    runtime: StoffelRuntimeHandle,
+) -> StoffelVerifiedOrderingHandle {
+    if conn_handles.is_null() || runtime.is_null() {
+        set_last_error("Null pointer argument");
+        return std::ptr::null_mut();
+    }
+
+    if count == 0 {
+        set_last_error("No connections provided");
+        return std::ptr::null_mut();
+    }
+
+    let rt = unsafe { &*(runtime as *const RuntimeHandle) };
+
+    // Collect Arc<dyn PeerConnection> from the opaque handles
+    let connections: Vec<Arc<dyn PeerConnection>> = (0..count)
+        .map(|i| {
+            let handle_ptr = unsafe { *conn_handles.add(i) };
+            let handle = unsafe { &*(handle_ptr as *const PeerConnectionHandle) };
+            Arc::clone(&handle.connection)
+        })
+        .collect();
+
+    match rt.block_on(QuicNetworkManager::verify_node_ordering(&connections)) {
+        Ok(ordering) => {
+            Box::into_raw(Box::new(VerifiedOrderingHandle { ordering }))
+                as StoffelVerifiedOrderingHandle
+        }
+        Err(e) => {
+            set_last_error(format!("Consensus verification failed: {}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -1561,5 +1837,105 @@ mod tests {
         stoffelnet_runtime_destroy(rt1);
         stoffelnet_runtime_destroy(rt2);
         stoffelnet_runtime_destroy(rt3);
+    }
+
+    // ========================================================================
+    // Consensus FFI Tests
+    // ========================================================================
+
+    #[test]
+    fn test_consensus_error_code_constant() {
+        assert_eq!(STOFFELNET_ERR_CONSENSUS, -11);
+    }
+
+    #[test]
+    fn test_ordering_null_checks() {
+        // All ordering functions should handle null gracefully
+        assert_eq!(stoffelnet_ordering_node_count(std::ptr::null_mut()), 0);
+        assert_eq!(stoffelnet_ordering_client_count(std::ptr::null_mut()), 0);
+
+        let mut key: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        assert_eq!(
+            stoffelnet_ordering_node_key(std::ptr::null_mut(), 0, &mut key, &mut len),
+            STOFFELNET_ERR_NULL_POINTER
+        );
+        assert_eq!(
+            stoffelnet_ordering_client_key(std::ptr::null_mut(), 0, &mut key, &mut len),
+            STOFFELNET_ERR_NULL_POINTER
+        );
+
+        // destroy with null should not crash
+        stoffelnet_ordering_destroy(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn test_ordering_lifecycle() {
+        use crate::network_utils::NodePublicKey;
+
+        let ordering = VerifiedOrdering::new(
+            vec![NodePublicKey(vec![1, 2, 3]), NodePublicKey(vec![4, 5, 6])],
+            vec![NodePublicKey(vec![7, 8, 9])],
+        );
+        let handle = Box::into_raw(Box::new(VerifiedOrderingHandle { ordering }))
+            as StoffelVerifiedOrderingHandle;
+
+        assert_eq!(stoffelnet_ordering_node_count(handle), 2);
+        assert_eq!(stoffelnet_ordering_client_count(handle), 1);
+
+        // Get node key
+        let mut key: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let result = stoffelnet_ordering_node_key(handle, 0, &mut key, &mut len);
+        assert_eq!(result, STOFFELNET_OK);
+        assert_eq!(len, 3);
+        let bytes = unsafe { Vec::from_raw_parts(key, len, len) };
+        assert_eq!(bytes, vec![1, 2, 3]);
+
+        // Get client key
+        let mut key: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let result = stoffelnet_ordering_client_key(handle, 0, &mut key, &mut len);
+        assert_eq!(result, STOFFELNET_OK);
+        assert_eq!(len, 3);
+        let bytes = unsafe { Vec::from_raw_parts(key, len, len) };
+        assert_eq!(bytes, vec![7, 8, 9]);
+
+        // Out of bounds
+        let mut key: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let result = stoffelnet_ordering_node_key(handle, 99, &mut key, &mut len);
+        assert_eq!(result, STOFFELNET_ERR_PARTY_NOT_FOUND);
+
+        stoffelnet_ordering_destroy(handle);
+    }
+
+    #[test]
+    fn test_set_expected_parties_null() {
+        assert_eq!(
+            stoffelnet_manager_set_expected_parties(std::ptr::null_mut(), 3),
+            STOFFELNET_ERR_NULL_POINTER
+        );
+    }
+
+    #[test]
+    fn test_set_expected_clients_null() {
+        assert_eq!(
+            stoffelnet_manager_set_expected_clients(std::ptr::null_mut(), 2),
+            STOFFELNET_ERR_NULL_POINTER
+        );
+    }
+
+    #[test]
+    fn test_get_verified_ordering_null() {
+        let result = stoffelnet_manager_get_verified_ordering(std::ptr::null_mut());
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_verify_node_ordering_null() {
+        let result =
+            stoffelnet_verify_node_ordering(std::ptr::null(), 1, std::ptr::null_mut());
+        assert!(result.is_null());
     }
 }

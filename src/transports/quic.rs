@@ -4867,6 +4867,44 @@ mod tests {
         assert_eq!(digest1.len(), 32); // SHA-256 = 32 bytes
     }
 
+    /// PoC validation for review finding:
+    /// disconnected clients are removed from connection maps, but stale keys
+    /// remain in client_public_keys and still influence consensus inputs.
+    #[tokio::test]
+    async fn test_poc_cleanup_dead_connections_removes_client_public_keys() {
+        ensure_crypto_provider();
+
+        let manager = QuicNetworkManager::new();
+        let client_id: ClientId = 7;
+        let client_key = NodePublicKey(vec![7, 7, 7]);
+        let conn = Arc::new(LoopbackPeerConnection::new(
+            "127.0.0.1:47007".parse().unwrap(),
+            None,
+        )) as Arc<dyn PeerConnection>;
+
+        manager.client_connections.insert(client_id, conn.clone());
+        manager.client_ids.insert(client_id);
+        manager
+            .client_public_keys
+            .insert(client_id, client_key.clone());
+
+        assert_eq!(manager.get_sorted_client_keys(), vec![client_key]);
+
+        conn.close().await.expect("close should succeed");
+        manager.cleanup_dead_connections().await;
+
+        assert!(manager.client_connections.get(&client_id).is_none());
+        assert!(!manager.client_ids.contains(&client_id));
+        assert!(
+            manager.client_public_keys.get(&client_id).is_none(),
+            "cleanup_dead_connections should remove stale client_public_keys entries"
+        );
+        assert!(
+            manager.get_sorted_client_keys().is_empty(),
+            "stale keys must not remain in consensus digest inputs"
+        );
+    }
+
     #[tokio::test]
     async fn test_backward_compatible_no_consensus() {
         ensure_crypto_provider();

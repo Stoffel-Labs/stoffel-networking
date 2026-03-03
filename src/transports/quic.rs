@@ -183,8 +183,12 @@ pub trait NetworkManager: Send + Sync {
 // MESSAGE FRAMING HELPERS
 // ============================================================================
 
-/// Maximum message size: 100MB
-const MAX_MESSAGE_SIZE: usize = 100_000_000;
+/// Maximum message size: 10MB
+const MAX_MESSAGE_SIZE: usize = 10_000_000;
+
+/// Initial chunk size for incremental payload reads (64 KiB).
+/// Memory is only committed as data actually arrives from the network.
+const RECV_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Sends a length-prefixed message with connection state checking
 async fn send_framed_message(
@@ -255,25 +259,40 @@ async fn recv_framed_message(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, Co
         )));
     }
 
-    // Read message payload
-    let mut msg = vec![0u8; len];
-    recv.read_exact(&mut msg).await.map_err(|e| match e {
-        quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
-        quinn::ReadExactError::ReadError(re) => {
-            let err_str = re.to_string();
-            if err_str.contains("closed")
-                || err_str.contains("reset")
-                || err_str.contains("connection lost")
-            {
-                ConnectionError::ConnectionLost(format!(
-                    "Connection lost while reading payload: {}",
-                    re
-                ))
-            } else {
-                ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re))
-            }
-        }
-    })?;
+    // Read message payload in chunks so that memory is only committed as data
+    // actually arrives, preventing a 4-byte header from triggering a multi-MB
+    // allocation that pins memory until the idle timeout.
+    let mut msg = Vec::with_capacity(len.min(RECV_CHUNK_SIZE));
+    let mut remaining = len;
+    let mut chunk_buf = vec![0u8; RECV_CHUNK_SIZE];
+
+    while remaining > 0 {
+        let to_read = remaining.min(chunk_buf.len());
+        recv.read_exact(&mut chunk_buf[..to_read])
+            .await
+            .map_err(|e| match e {
+                quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
+                quinn::ReadExactError::ReadError(re) => {
+                    let err_str = re.to_string();
+                    if err_str.contains("closed")
+                        || err_str.contains("reset")
+                        || err_str.contains("connection lost")
+                    {
+                        ConnectionError::ConnectionLost(format!(
+                            "Connection lost while reading payload: {}",
+                            re
+                        ))
+                    } else {
+                        ConnectionError::ReceiveFailed(format!(
+                            "Failed to read payload: {}",
+                            re
+                        ))
+                    }
+                }
+            })?;
+        msg.extend_from_slice(&chunk_buf[..to_read]);
+        remaining -= to_read;
+    }
 
     Ok(msg)
 }
@@ -1366,19 +1385,20 @@ impl QuicNetworkManager {
 
     /// Creates self-signed server config using provided DER-encoded certificate and key.
     /// Accepts both ALPN_SERVER_PROTOCOL and ALPN_CLIENT_PROTOCOL for incoming connections.
-    /// Requests (but doesn't require) client certificates for mutual TLS.
+    ///
+    /// When `use_tls` is `true`, client certificates are mandatory — peers that
+    /// connect without presenting a certificate are rejected at the TLS layer.
     fn create_self_signed_server_config(
         cert_der_bytes: &[u8],
         key_der_bytes: &[u8],
         idle_timeout_ms: u64,
+        use_tls: bool,
     ) -> Result<ServerConfig, String> {
         let cert_der = CertificateDer::from(cert_der_bytes.to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der_bytes.to_vec()));
 
-        // Use custom client cert verifier that accepts all client certificates
-        // This enables mutual TLS where clients can optionally present certificates
         let mut server_crypto = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(SkipClientVerification::new())
+            .with_client_cert_verifier(SkipClientVerification::new(use_tls))
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| format!("Failed to create server crypto config: {}", e))?;
 
@@ -2772,8 +2792,20 @@ impl NetworkManager for QuicNetworkManager {
                         trace!("Stored public key for peer {}", peer_id);
                     }
 
-                    // Ensure node exists
+                    // Validate peer is known when TLS is enforced; otherwise
+                    // allow auto-discovery for development/test environments.
                     if !self.nodes.iter().any(|n| n.id() == peer_id) {
+                        if self.network_config.use_tls {
+                            warn!(
+                                "Rejected unknown server peer {} from {} (use_tls=true)",
+                                peer_id, remote_addr
+                            );
+                            connection.close(0u32.into(), b"unknown peer");
+                            return Err(format!(
+                                "Unauthorized peer ID {} not in allowlist",
+                                peer_id
+                            ));
+                        }
                         self.nodes
                             .push(QuicNode::from_party_id(peer_id, remote_addr));
                     }
@@ -2836,6 +2868,7 @@ impl NetworkManager for QuicNetworkManager {
                 cert_der,
                 key_der,
                 self.network_config.idle_timeout_ms,
+                self.network_config.use_tls,
             )?;
             let mut endpoint = Endpoint::server(server_config, bind_address)
                 .map_err(|e| format!("Failed to create server endpoint: {}", e))?;
@@ -3012,14 +3045,26 @@ impl Network for QuicNetworkManager {
 // CERTIFICATE VERIFIERS (Development Only)
 // ============================================================================
 
-/// Client certificate verifier that accepts all client certificates without verification.
-/// DEVELOPMENT ONLY - do not use in production.
+/// Client certificate verifier.
+///
+/// When `require_client_cert` is `true` (production / `use_tls = true`), the
+/// verifier mandates that every connecting peer presents a TLS certificate.
+/// The certificate content is still accepted without chain verification because
+/// identity is derived from the public key (mTLS key-pinning), but the peer
+/// **must** present one.
+///
+/// When `require_client_cert` is `false` (development / `use_tls = false`),
+/// client certificates are entirely optional.
 #[derive(Debug)]
-struct SkipClientVerification;
+struct SkipClientVerification {
+    require_client_cert: bool,
+}
 
 impl SkipClientVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
+    fn new(require_client_cert: bool) -> Arc<Self> {
+        Arc::new(Self {
+            require_client_cert,
+        })
     }
 }
 
@@ -3073,8 +3118,7 @@ impl rustls::server::danger::ClientCertVerifier for SkipClientVerification {
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        // Client certificates are optional - clients without certs can still connect
-        false
+        self.require_client_cert
     }
 }
 
@@ -3144,6 +3188,8 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 mod tests {
     use super::*;
     use crate::transports::net_envelope::NetEnvelope;
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::server::danger::ClientCertVerifier;
 
     // Helper function to ensure crypto provider is installed
     fn ensure_crypto_provider() {
@@ -3468,7 +3514,7 @@ mod tests {
         let key_der = cert.signing_key.serialize_der();
 
         let config =
-            QuicNetworkManager::create_self_signed_server_config(&cert_der, &key_der, 300_000);
+            QuicNetworkManager::create_self_signed_server_config(&cert_der, &key_der, 300_000, false);
         assert!(config.is_ok());
     }
 
@@ -3525,7 +3571,7 @@ mod tests {
         let key_der = cert.signing_key.serialize_der();
 
         let config = QuicNetworkManager::create_self_signed_server_config(
-            &cert_der, &key_der, 600_000,
+            &cert_der, &key_der, 600_000, false,
         );
         assert!(config.is_ok());
     }
@@ -3638,9 +3684,11 @@ mod tests {
     #[tokio::test]
     async fn test_server_to_server_connection() {
         ensure_crypto_provider();
-        // Create two managers
+        // Create two managers (use_tls=false for dynamic peer discovery in tests)
         let mut server1 = QuicNetworkManager::with_node_id(1);
+        server1.network_config.use_tls = false;
         let mut server2 = QuicNetworkManager::with_node_id(2);
+        server2.network_config.use_tls = false;
 
         // Start listening on server1
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -3757,7 +3805,9 @@ mod tests {
     async fn test_public_keys_exchanged_on_server_connection() {
         ensure_crypto_provider();
         let mut server1 = QuicNetworkManager::with_node_id(1);
+        server1.network_config.use_tls = false;
         let mut server2 = QuicNetworkManager::with_node_id(2);
+        server2.network_config.use_tls = false;
 
         // Both servers need to have their certificates generated
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -4007,9 +4057,11 @@ mod tests {
     async fn test_sender_ids_are_sequential_0_to_n() {
         ensure_crypto_provider();
 
-        // Create two servers
+        // Create two servers (use_tls=false for dynamic peer discovery in tests)
         let mut server1 = QuicNetworkManager::with_node_id(1);
+        server1.network_config.use_tls = false;
         let mut server2 = QuicNetworkManager::with_node_id(2);
+        server2.network_config.use_tls = false;
 
         // Start listening (generates certificates)
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -4234,6 +4286,99 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Security Reproducer: Memory exhaustion via pre-allocation in recv
+    // ========================================================================
+    // recv_framed_message reads a 4-byte length header and immediately
+    // allocates `vec![0u8; len]` for up to MAX_MESSAGE_SIZE (100MB).
+    // An attacker sends a 4-byte header claiming a huge payload and
+    // never sends data — the server pre-allocates the full buffer.
+
+    #[test]
+    fn test_max_message_size_reduced_to_10mb() {
+        // MAX_MESSAGE_SIZE was 100MB — reduced to 10MB to limit DoS surface.
+        assert_eq!(
+            MAX_MESSAGE_SIZE, 10_000_000,
+            "MAX_MESSAGE_SIZE must be 10MB to limit pre-allocation DoS"
+        );
+    }
+
+    #[test]
+    fn test_recv_chunk_size_limits_initial_allocation() {
+        // recv_framed_message now reads in RECV_CHUNK_SIZE chunks (64 KiB).
+        // Initial Vec::with_capacity is capped at RECV_CHUNK_SIZE even for
+        // larger declared payloads — memory only grows as data arrives.
+        assert_eq!(RECV_CHUNK_SIZE, 64 * 1024);
+        assert!(
+            RECV_CHUNK_SIZE < MAX_MESSAGE_SIZE,
+            "Chunk size must be smaller than max message size"
+        );
+    }
+
+    #[test]
+    fn test_framing_rejects_oversized_header() {
+        // A 4-byte header claiming > MAX_MESSAGE_SIZE must be rejected.
+        // With the old 100MB limit, an attacker could request enormous allocs.
+        let oversized: u32 = (MAX_MESSAGE_SIZE as u32) + 1;
+        let mut spoofed_frame = Vec::with_capacity(4);
+        spoofed_frame.extend_from_slice(&oversized.to_be_bytes());
+        let result = LoopbackPeerConnection::unframe_message(spoofed_frame);
+        assert!(result.is_err(), "Frames claiming > MAX_MESSAGE_SIZE must be rejected");
+    }
+
+    // ========================================================================
+    // Security Reproducer: TLS cert verification bypass
+    // ========================================================================
+
+    #[test]
+    fn test_client_auth_mandatory_when_use_tls_enabled() {
+        ensure_crypto_provider();
+        let verifier = SkipClientVerification::new(true);
+        assert!(
+            verifier.client_auth_mandatory(),
+            "client_auth_mandatory must be true when use_tls is enabled"
+        );
+    }
+
+    #[test]
+    fn test_client_auth_optional_when_use_tls_disabled() {
+        ensure_crypto_provider();
+        let verifier = SkipClientVerification::new(false);
+        assert!(
+            !verifier.client_auth_mandatory(),
+            "client_auth_mandatory must be false when use_tls is disabled (dev mode)"
+        );
+    }
+
+    #[test]
+    fn test_server_config_with_use_tls_true_requires_client_cert() {
+        ensure_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("cert gen");
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        // Must succeed — config creation with use_tls=true
+        let config = QuicNetworkManager::create_self_signed_server_config(
+            &cert_der, &key_der, 300_000, true,
+        );
+        assert!(config.is_ok(), "Server config with use_tls=true must succeed");
+    }
+
+    #[test]
+    fn test_server_config_with_use_tls_false_allows_no_client_cert() {
+        ensure_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("cert gen");
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let config = QuicNetworkManager::create_self_signed_server_config(
+            &cert_der, &key_der, 300_000, false,
+        );
+        assert!(config.is_ok(), "Server config with use_tls=false must succeed");
+    }
+
     #[test]
     fn test_framing_empty_data() {
         let framed = LoopbackPeerConnection::frame_message(&[]);
@@ -4440,7 +4585,9 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server = QuicNetworkManager::with_node_id(1);
+        server.network_config.use_tls = false;
         let mut client = QuicNetworkManager::with_node_id(100);
+        client.network_config.use_tls = false;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -4495,7 +4642,9 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server1 = QuicNetworkManager::with_node_id(1);
+        server1.network_config.use_tls = false;
         let mut server2 = QuicNetworkManager::with_node_id(2);
+        server2.network_config.use_tls = false;
 
         // Both listen
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();

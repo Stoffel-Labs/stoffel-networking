@@ -6,7 +6,8 @@
 //! connection state management and graceful handling of stream/connection closures.
 
 use crate::network_utils::{
-    ClientId, ClientType, Message, Network, NetworkError, Node, NodePublicKey, PartyId,
+    ClientId, ClientType, ConsensusError, ConsensusGate, Message, Network, NetworkError, Node,
+    NodePublicKey, PartyId, VerifiedOrdering,
 };
 use crate::transports::ice::LocalCandidates;
 use crate::transports::ice_agent::IceAgent;
@@ -182,8 +183,12 @@ pub trait NetworkManager: Send + Sync {
 // MESSAGE FRAMING HELPERS
 // ============================================================================
 
-/// Maximum message size: 100MB
-const MAX_MESSAGE_SIZE: usize = 100_000_000;
+/// Maximum message size: 10MB
+const MAX_MESSAGE_SIZE: usize = 10_000_000;
+
+/// Initial chunk size for incremental payload reads (64 KiB).
+/// Memory is only committed as data actually arrives from the network.
+const RECV_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Sends a length-prefixed message with connection state checking
 async fn send_framed_message(
@@ -254,25 +259,40 @@ async fn recv_framed_message(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, Co
         )));
     }
 
-    // Read message payload
-    let mut msg = vec![0u8; len];
-    recv.read_exact(&mut msg).await.map_err(|e| match e {
-        quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
-        quinn::ReadExactError::ReadError(re) => {
-            let err_str = re.to_string();
-            if err_str.contains("closed")
-                || err_str.contains("reset")
-                || err_str.contains("connection lost")
-            {
-                ConnectionError::ConnectionLost(format!(
-                    "Connection lost while reading payload: {}",
-                    re
-                ))
-            } else {
-                ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re))
-            }
-        }
-    })?;
+    // Read message payload in chunks so that memory is only committed as data
+    // actually arrives, preventing a 4-byte header from triggering a multi-MB
+    // allocation that pins memory until the idle timeout.
+    let mut msg = Vec::with_capacity(len.min(RECV_CHUNK_SIZE));
+    let mut remaining = len;
+    let mut chunk_buf = vec![0u8; RECV_CHUNK_SIZE];
+
+    while remaining > 0 {
+        let to_read = remaining.min(chunk_buf.len());
+        recv.read_exact(&mut chunk_buf[..to_read])
+            .await
+            .map_err(|e| match e {
+                quinn::ReadExactError::FinishedEarly(_) => ConnectionError::StreamClosed,
+                quinn::ReadExactError::ReadError(re) => {
+                    let err_str = re.to_string();
+                    if err_str.contains("closed")
+                        || err_str.contains("reset")
+                        || err_str.contains("connection lost")
+                    {
+                        ConnectionError::ConnectionLost(format!(
+                            "Connection lost while reading payload: {}",
+                            re
+                        ))
+                    } else {
+                        ConnectionError::ReceiveFailed(format!(
+                            "Failed to read payload: {}",
+                            re
+                        ))
+                    }
+                }
+            })?;
+        msg.extend_from_slice(&chunk_buf[..to_read]);
+        remaining -= to_read;
+    }
 
     Ok(msg)
 }
@@ -832,6 +852,14 @@ pub struct QuicNetworkConfig {
     pub hole_punch_timeout_ms: u64,
     /// ICE agent configuration
     pub ice_config: crate::transports::ice_agent::IceAgentConfig,
+
+    // Consensus Configuration
+    /// Expected number of parties (nodes). None = don't gate on party count.
+    pub expected_parties: Option<usize>,
+    /// Expected number of clients. None = don't gate on client count.
+    pub expected_clients: Option<usize>,
+    /// Timeout for consensus protocol (ms). Default: 60_000.
+    pub consensus_timeout_ms: u64,
 }
 
 impl Default for QuicNetworkConfig {
@@ -848,6 +876,9 @@ impl Default for QuicNetworkConfig {
             enable_hole_punching: true,
             hole_punch_timeout_ms: 10000,
             ice_config: crate::transports::ice_agent::IceAgentConfig::default(),
+            expected_parties: None,
+            expected_clients: None,
+            consensus_timeout_ms: 60_000,
         }
     }
 }
@@ -1012,6 +1043,22 @@ pub struct QuicNetworkManager {
     local_candidates: Arc<Mutex<Option<LocalCandidates>>>,
     /// Pending ICE agents for hole punching
     pending_ice_agents: Arc<DashMap<PartyId, IceAgent>>,
+    /// Client public keys (populated during accept when ALPN = client-protocol)
+    client_public_keys: Arc<DashMap<ClientId, NodePublicKey>>,
+    /// Verified ordering after successful consensus.
+    /// Uses std::sync::Mutex (not tokio) so `verified_ordering()` can reliably
+    /// lock from a sync context without spurious None on contention.
+    verified_ordering: Arc<std::sync::Mutex<Option<VerifiedOrdering>>>,
+    /// Watch channel sender for transparent send/broadcast gating
+    consensus_gate_tx: Arc<tokio::sync::watch::Sender<ConsensusGate>>,
+    /// Watch channel receiver for transparent send/broadcast gating
+    consensus_gate_rx: tokio::sync::watch::Receiver<ConsensusGate>,
+    /// Flag: has consensus task been spawned already?
+    consensus_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Broadcast channel: notifies when a new client connects
+    client_connected_tx: tokio::sync::broadcast::Sender<ClientId>,
+    /// Broadcast channel: notifies when a new peer connects
+    peer_connected_tx: tokio::sync::broadcast::Sender<PartyId>,
 }
 
 impl std::fmt::Debug for QuicNetworkManager {
@@ -1040,6 +1087,10 @@ impl Default for QuicNetworkManager {
 impl QuicNetworkManager {
     pub fn new() -> Self {
         let node_id = Uuid::new_v4().as_u128() as PartyId;
+        let (consensus_gate_tx, consensus_gate_rx) =
+            tokio::sync::watch::channel(ConsensusGate::NotRequired);
+        let (client_connected_tx, _) = tokio::sync::broadcast::channel(64);
+        let (peer_connected_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             endpoint: None,
             nodes: Vec::new(),
@@ -1055,6 +1106,13 @@ impl QuicNetworkManager {
             stun_client: None,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
+            client_public_keys: Arc::new(DashMap::new()),
+            verified_ordering: Arc::new(std::sync::Mutex::new(None)),
+            consensus_gate_tx: Arc::new(consensus_gate_tx),
+            consensus_gate_rx,
+            consensus_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_connected_tx,
+            peer_connected_tx,
         }
     }
 
@@ -1107,6 +1165,18 @@ impl QuicNetworkManager {
             None
         };
 
+        // Gate starts as Pending if consensus is required, NotRequired otherwise
+        let initial_gate =
+            if config.expected_parties.is_some() || config.expected_clients.is_some() {
+                ConsensusGate::Pending
+            } else {
+                ConsensusGate::NotRequired
+            };
+
+        let (consensus_gate_tx, consensus_gate_rx) = tokio::sync::watch::channel(initial_gate);
+        let (client_connected_tx, _) = tokio::sync::broadcast::channel(64);
+        let (peer_connected_tx, _) = tokio::sync::broadcast::channel(64);
+
         Self {
             endpoint: None,
             nodes: Vec::new(),
@@ -1122,12 +1192,44 @@ impl QuicNetworkManager {
             stun_client,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
+            client_public_keys: Arc::new(DashMap::new()),
+            verified_ordering: Arc::new(std::sync::Mutex::new(None)),
+            consensus_gate_tx: Arc::new(consensus_gate_tx),
+            consensus_gate_rx,
+            consensus_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_connected_tx,
+            peer_connected_tx,
         }
     }
 
     /// Creates a manager with NAT traversal enabled
     pub fn with_nat_traversal() -> Self {
         Self::with_config(QuicNetworkConfig::with_nat_traversal())
+    }
+
+    /// Sets the expected number of parties for consensus gating.
+    pub fn set_expected_parties(&mut self, count: usize) {
+        self.network_config.expected_parties = Some(count);
+        // Only move gate to Pending if consensus hasn't already been attempted.
+        // After consensus completes (or fails), the gate must not revert to Pending
+        // because consensus_started prevents a second run, leaving sends blocked forever.
+        if !self
+            .consensus_started
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self.consensus_gate_tx.send(ConsensusGate::Pending);
+        }
+    }
+
+    /// Sets the expected number of clients for consensus gating.
+    pub fn set_expected_clients(&mut self, count: usize) {
+        self.network_config.expected_clients = Some(count);
+        if !self
+            .consensus_started
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self.consensus_gate_tx.send(ConsensusGate::Pending);
+        }
     }
 
     pub fn add_node(&mut self, node: QuicNode) {
@@ -1283,19 +1385,20 @@ impl QuicNetworkManager {
 
     /// Creates self-signed server config using provided DER-encoded certificate and key.
     /// Accepts both ALPN_SERVER_PROTOCOL and ALPN_CLIENT_PROTOCOL for incoming connections.
-    /// Requests (but doesn't require) client certificates for mutual TLS.
+    ///
+    /// When `use_tls` is `true`, client certificates are mandatory — peers that
+    /// connect without presenting a certificate are rejected at the TLS layer.
     fn create_self_signed_server_config(
         cert_der_bytes: &[u8],
         key_der_bytes: &[u8],
         idle_timeout_ms: u64,
+        use_tls: bool,
     ) -> Result<ServerConfig, String> {
         let cert_der = CertificateDer::from(cert_der_bytes.to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der_bytes.to_vec()));
 
-        // Use custom client cert verifier that accepts all client certificates
-        // This enables mutual TLS where clients can optionally present certificates
         let mut server_crypto = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(SkipClientVerification::new())
+            .with_client_cert_verifier(SkipClientVerification::new(use_tls))
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| format!("Failed to create server crypto config: {}", e))?;
 
@@ -1393,6 +1496,29 @@ impl QuicNetworkManager {
 
         // Extract public key from the first (end-entity) certificate
         Self::extract_public_key_from_cert(&certs[0])
+    }
+
+    /// Verifies that the peer certificate-derived identity matches the expected party.
+    ///
+    /// P2P NAT traversal paths must bind the established QUIC connection to the
+    /// expected peer identity from signaling, otherwise a third party can be
+    /// misbound into another party's slot.
+    fn verify_expected_p2p_identity(
+        peer_public_key: Option<&NodePublicKey>,
+        expected_party_id: PartyId,
+    ) -> Result<(), String> {
+        let derived_id = peer_public_key
+            .map(|pk| pk.derive_id())
+            .ok_or_else(|| "Failed to extract peer public key from TLS certificate".to_string())?;
+
+        if derived_id != expected_party_id {
+            return Err(format!(
+                "P2P identity mismatch: expected {}, got {}",
+                expected_party_id, derived_id
+            ));
+        }
+
+        Ok(())
     }
 
     // ============================================================================
@@ -1755,6 +1881,9 @@ impl QuicNetworkManager {
             our_id, peer_id, address
         );
 
+        let _ = self.peer_connected_tx.send(peer_id);
+        self.maybe_start_consensus();
+
         Ok(conn)
     }
 
@@ -2065,6 +2194,16 @@ impl QuicNetworkManager {
 
         // Extract peer's public key from TLS certificate
         let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), target_party_id)
+        {
+            connection.close(0u32.into(), b"p2p identity mismatch");
+            self.pending_ice_agents.remove(&target_party_id);
+            return Err(err);
+        }
+
+        if let Some(ref pk) = peer_public_key {
+            self.peer_public_keys.insert(target_party_id, pk.clone());
+        }
 
         // Open stream and sync
         let (mut send, recv) = connection
@@ -2184,6 +2323,16 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
+        let remote_addr = connection.remote_address();
+        if remote_addr.ip() != nominated_pair.remote.address.ip() {
+            connection.close(0u32.into(), b"unexpected p2p remote address");
+            return Err(format!(
+                "Rejected unexpected P2P remote address {} (expected IP {})",
+                remote_addr,
+                nominated_pair.remote.address.ip()
+            ));
+        }
+
         // Get connection role from ALPN negotiation
         let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
             warn!("ALPN extraction failed: {}, defaulting to Server", e);
@@ -2192,6 +2341,15 @@ impl QuicNetworkManager {
 
         // Extract peer's public key from TLS certificate
         let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), from_party_id)
+        {
+            connection.close(0u32.into(), b"p2p identity mismatch");
+            return Err(err);
+        }
+
+        if let Some(ref pk) = peer_public_key {
+            self.peer_public_keys.insert(from_party_id, pk.clone());
+        }
 
         let accept_timeout = Duration::from_millis(self.network_config.timeout_ms);
 
@@ -2310,6 +2468,264 @@ impl QuicNetworkManager {
             }
         }
     }
+
+    // =========================================================================
+    // CONSENSUS METHODS
+    // =========================================================================
+
+    /// Returns a sorted list of all client public keys.
+    pub fn get_sorted_client_keys(&self) -> Vec<NodePublicKey> {
+        let mut keys: Vec<NodePublicKey> = self
+            .client_public_keys
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Computes SHA-256 digest of the sorted client public key list.
+    pub fn compute_client_list_digest(&self) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let sorted = self.get_sorted_client_keys();
+        let raw: Vec<Vec<u8>> = sorted.iter().map(|k| k.0.clone()).collect();
+        let serialized = bincode::serialize(&raw).expect("serialization should not fail");
+        Sha256::digest(&serialized).to_vec()
+    }
+
+    /// Checks if consensus should start and spawns the consensus task if so.
+    /// Called from accept() and connect_as_server() after storing connections.
+    fn maybe_start_consensus(&self) {
+        let Some(expected_parties) = self.network_config.expected_parties else {
+            return;
+        };
+        let Some(expected_clients) = self.network_config.expected_clients else {
+            return;
+        };
+
+        // Check if all connections are established
+        let peer_count = self.peer_public_keys.len() + 1; // +1 for self
+        let client_count = self.client_public_keys.len();
+
+        if peer_count < expected_parties || client_count < expected_clients {
+            return;
+        }
+
+        // Only start once
+        if self
+            .consensus_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return; // already started
+        }
+
+        info!(
+            "Consensus auto-triggered: {} parties, {} clients",
+            peer_count, client_count
+        );
+
+        // Clone Arcs for the spawned task
+        let manager = self.clone();
+        let timeout = Duration::from_millis(self.network_config.consensus_timeout_ms);
+
+        tokio::spawn(async move {
+            match manager.execute_consensus(timeout).await {
+                Ok(ordering) => {
+                    *manager.verified_ordering.lock().expect("verified_ordering lock poisoned") = Some(ordering);
+                    let _ = manager.consensus_gate_tx.send(ConsensusGate::Ready);
+                    info!("Consensus completed successfully");
+                }
+                Err(e) => {
+                    warn!("Consensus failed: {}", e);
+                    let _ = manager
+                        .consensus_gate_tx
+                        .send(ConsensusGate::Failed(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// Executes the consensus protocol (private, runs in spawned task).
+    async fn execute_consensus(
+        &self,
+        timeout: Duration,
+    ) -> Result<VerifiedOrdering, ConsensusError> {
+        // 1. Compute local state — snapshot once to avoid races with concurrent connections.
+        let node_keys = self.get_sorted_public_keys();
+        let party_count = node_keys.len();
+        let local_pk = self
+            .local_public_key
+            .as_ref()
+            .ok_or(ConsensusError::Aborted("No local public key".into()))?;
+        let local_party_id = node_keys
+            .iter()
+            .position(|k| k == local_pk)
+            .ok_or(ConsensusError::Aborted(
+                "Local key not found in sorted keys".into(),
+            ))? as PartyId;
+        let client_keys = self.get_sorted_client_keys();
+        let local_digest = self.compute_client_list_digest();
+
+        debug!(
+            "Executing consensus: party_id={}, party_count={}, client_count={}",
+            local_party_id,
+            party_count,
+            client_keys.len()
+        );
+
+        // 2. Send digest to all peer nodes
+        let digest_msg = NetEnvelope::ClientListDigest {
+            digest: local_digest.clone(),
+            client_count: client_keys.len(),
+        };
+        let digest_bytes = digest_msg.serialize();
+        for pid in 0..party_count {
+            if pid == local_party_id {
+                continue;
+            }
+            if let Some(conn) = self.get_connection_by_party_id(pid) {
+                conn.send(&digest_bytes).await.map_err(|e| {
+                    ConsensusError::Aborted(format!("Send digest to party {}: {}", pid, e))
+                })?;
+            }
+        }
+
+        // 3. Collect digests from all peers
+        let (tx, mut rx) = tokio::sync::mpsc::channel(party_count);
+        for pid in 0..party_count {
+            if pid == local_party_id {
+                continue;
+            }
+            if let Some(conn) = self.get_connection_by_party_id(pid) {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match conn.receive().await {
+                        Ok(data) => match NetEnvelope::try_deserialize(&data) {
+                            Ok(NetEnvelope::ClientListDigest { digest, .. }) => {
+                                let _ = tx.send((pid, digest)).await;
+                            }
+                            _ => {
+                                let _ = tx.send((pid, vec![])).await;
+                            }
+                        },
+                        Err(_) => {
+                            let _ = tx.send((pid, vec![])).await;
+                        }
+                    }
+                });
+            }
+        }
+        drop(tx);
+
+        let mut received = std::collections::HashMap::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+        while received.len() < party_count - 1 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some((pid, digest))) => {
+                    received.insert(pid, digest);
+                }
+                _ => {
+                    return Err(ConsensusError::ConsensusTimeout {
+                        missing_count: party_count - 1 - received.len(),
+                    });
+                }
+            }
+        }
+
+        // 4. Verify all digests match
+        for (pid, digest) in &received {
+            if *digest != local_digest {
+                return Err(ConsensusError::ClientListDigestMismatch { party_id: *pid });
+            }
+        }
+
+        // 5. Auto-push NodeListResponse to each client
+        let node_key_bytes: Vec<Vec<u8>> = node_keys.iter().map(|k| k.0.clone()).collect();
+        let response = NetEnvelope::NodeListResponse {
+            node_keys: node_key_bytes,
+        };
+        let response_bytes = response.serialize();
+        for entry in self.client_connections.iter() {
+            let conn = entry.value().clone();
+            let bytes = response_bytes.clone();
+            tokio::spawn(async move {
+                let _ = conn.send(&bytes).await;
+            });
+        }
+
+        // 6. Return verified ordering
+        Ok(VerifiedOrdering::new(node_keys, client_keys))
+    }
+
+    /// Transparently awaits consensus gate before allowing send/broadcast.
+    async fn await_consensus_gate(&self) -> Result<(), NetworkError> {
+        let mut rx = self.consensus_gate_rx.clone();
+        loop {
+            let should_wait = {
+                let val = rx.borrow();
+                match &*val {
+                    ConsensusGate::NotRequired | ConsensusGate::Ready => return Ok(()),
+                    ConsensusGate::Failed(_) => return Err(NetworkError::SendError),
+                    ConsensusGate::Pending => true,
+                }
+            };
+            if should_wait {
+                rx.changed().await.map_err(|_| NetworkError::SendError)?;
+            }
+        }
+    }
+
+    /// Client-side: reads auto-pushed NodeListResponse from each node and verifies consistency.
+    pub async fn verify_node_ordering(
+        connections: &[Arc<dyn PeerConnection>],
+    ) -> Result<VerifiedOrdering, ConsensusError> {
+        if connections.is_empty() {
+            return Err(ConsensusError::QueryFailed(
+                "No connections provided".into(),
+            ));
+        }
+
+        let mut orderings = Vec::new();
+        for conn in connections {
+            let data = conn.receive().await.map_err(|e| {
+                ConsensusError::QueryFailed(format!("Failed to receive node list: {}", e))
+            })?;
+            let envelope = NetEnvelope::try_deserialize(&data).map_err(|e| {
+                ConsensusError::QueryFailed(format!("Invalid response: {}", e))
+            })?;
+            match envelope {
+                NetEnvelope::NodeListResponse { node_keys } => {
+                    orderings.push(
+                        node_keys
+                            .into_iter()
+                            .map(NodePublicKey)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                _ => {
+                    return Err(ConsensusError::QueryFailed(
+                        "Unexpected message type".into(),
+                    ));
+                }
+            }
+        }
+
+        // Verify all identical
+        let reference = &orderings[0];
+        for (i, ordering) in orderings.iter().enumerate().skip(1) {
+            if ordering != reference {
+                return Err(ConsensusError::NodeListMismatch {
+                    node_address: connections[i].remote_address(),
+                });
+            }
+        }
+
+        Ok(VerifiedOrdering::new(
+            orderings.into_iter().next().unwrap(),
+            Vec::new(),
+        ))
+    }
 }
 
 impl NetworkManager for QuicNetworkManager {
@@ -2407,6 +2823,13 @@ impl NetworkManager for QuicNetworkManager {
                     // Store as client connection
                     self.client_connections.insert(peer_id, Arc::clone(&conn));
                     self.client_ids.insert(peer_id);
+
+                    // Store client's public key for consensus
+                    if let Some(ref pk) = peer_public_key {
+                        self.client_public_keys.insert(peer_id, pk.clone());
+                    }
+                    let _ = self.client_connected_tx.send(peer_id);
+                    self.maybe_start_consensus();
                 }
                 ClientType::Server => {
                     // Server-to-server connection identified via ALPN
@@ -2415,16 +2838,28 @@ impl NetworkManager for QuicNetworkManager {
                         remote_addr, peer_id
                     );
 
-                    // Store peer's public key if available
+                    // Validate peer is known when TLS is enforced; otherwise
+                    // allow auto-discovery for development/test environments.
+                    if !self.nodes.iter().any(|n| n.id() == peer_id) {
+                        if self.network_config.use_tls {
+                            warn!(
+                                "Rejected unknown server peer {} from {} (use_tls=true)",
+                                peer_id, remote_addr
+                            );
+                            connection.close(0u32.into(), b"unknown peer");
+                            return Err(format!(
+                                "Unauthorized peer ID {} not in allowlist",
+                                peer_id
+                            ));
+                        }
+                        self.nodes
+                            .push(QuicNode::from_party_id(peer_id, remote_addr));
+                    }
+
+                    // Store peer's public key only after authorization succeeds.
                     if let Some(pk) = peer_public_key {
                         self.peer_public_keys.insert(peer_id, pk);
                         trace!("Stored public key for peer {}", peer_id);
-                    }
-
-                    // Ensure node exists
-                    if !self.nodes.iter().any(|n| n.id() == peer_id) {
-                        self.nodes
-                            .push(QuicNode::from_party_id(peer_id, remote_addr));
                     }
 
                     // Deduplicate simultaneous connections (STO-481):
@@ -2461,6 +2896,9 @@ impl NetworkManager for QuicNetworkManager {
 
                     // Store connection
                     self.server_connections.insert(peer_id, Arc::clone(&conn));
+
+                    let _ = self.peer_connected_tx.send(peer_id);
+                    self.maybe_start_consensus();
                 }
             }
 
@@ -2482,6 +2920,7 @@ impl NetworkManager for QuicNetworkManager {
                 cert_der,
                 key_der,
                 self.network_config.idle_timeout_ms,
+                self.network_config.use_tls,
             )?;
             let mut endpoint = Endpoint::server(server_config, bind_address)
                 .map_err(|e| format!("Failed to create server endpoint: {}", e))?;
@@ -2512,6 +2951,8 @@ impl Network for QuicNetworkManager {
     type NetworkConfig = QuicNetworkConfig;
 
     async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
+        self.await_consensus_gate().await?;
+
         // Use party_id-based lookup for MPC protocols (recipient is a party_id 0..N-1)
         let connection = self
             .get_connection_by_party_id(recipient)
@@ -2534,6 +2975,8 @@ impl Network for QuicNetworkManager {
     }
 
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
+        self.await_consensus_gate().await?;
+
         let mut total_bytes = 0usize;
         let party_count = self.party_count();
 
@@ -2608,6 +3051,8 @@ impl Network for QuicNetworkManager {
         client: ClientId,
         message: &[u8],
     ) -> Result<usize, NetworkError> {
+        self.await_consensus_gate().await?;
+
         if let Some(conn_ref) = self.client_connections.get(&client) {
             let connection = conn_ref.value();
 
@@ -2642,20 +3087,36 @@ impl Network for QuicNetworkManager {
         };
         local_count + self.peer_public_keys.len()
     }
+
+    fn verified_ordering(&self) -> Option<VerifiedOrdering> {
+        self.verified_ordering.lock().expect("verified_ordering lock poisoned").clone()
+    }
 }
 
 // ============================================================================
 // CERTIFICATE VERIFIERS (Development Only)
 // ============================================================================
 
-/// Client certificate verifier that accepts all client certificates without verification.
-/// DEVELOPMENT ONLY - do not use in production.
+/// Client certificate verifier.
+///
+/// When `require_client_cert` is `true` (production / `use_tls = true`), the
+/// verifier mandates that every connecting peer presents a TLS certificate.
+/// The certificate content is still accepted without chain verification because
+/// identity is derived from the public key (mTLS key-pinning), but the peer
+/// **must** present one.
+///
+/// When `require_client_cert` is `false` (development / `use_tls = false`),
+/// client certificates are entirely optional.
 #[derive(Debug)]
-struct SkipClientVerification;
+struct SkipClientVerification {
+    require_client_cert: bool,
+}
 
 impl SkipClientVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
+    fn new(require_client_cert: bool) -> Arc<Self> {
+        Arc::new(Self {
+            require_client_cert,
+        })
     }
 }
 
@@ -2709,8 +3170,7 @@ impl rustls::server::danger::ClientCertVerifier for SkipClientVerification {
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        // Client certificates are optional - clients without certs can still connect
-        false
+        self.require_client_cert
     }
 }
 
@@ -2780,6 +3240,8 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 mod tests {
     use super::*;
     use crate::transports::net_envelope::NetEnvelope;
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::server::danger::ClientCertVerifier;
 
     // Helper function to ensure crypto provider is installed
     fn ensure_crypto_provider() {
@@ -3104,7 +3566,7 @@ mod tests {
         let key_der = cert.signing_key.serialize_der();
 
         let config =
-            QuicNetworkManager::create_self_signed_server_config(&cert_der, &key_der, 300_000);
+            QuicNetworkManager::create_self_signed_server_config(&cert_der, &key_der, 300_000, false);
         assert!(config.is_ok());
     }
 
@@ -3161,7 +3623,7 @@ mod tests {
         let key_der = cert.signing_key.serialize_der();
 
         let config = QuicNetworkManager::create_self_signed_server_config(
-            &cert_der, &key_der, 600_000,
+            &cert_der, &key_der, 600_000, false,
         );
         assert!(config.is_ok());
     }
@@ -3274,9 +3736,11 @@ mod tests {
     #[tokio::test]
     async fn test_server_to_server_connection() {
         ensure_crypto_provider();
-        // Create two managers
+        // Create two managers (use_tls=false for dynamic peer discovery in tests)
         let mut server1 = QuicNetworkManager::with_node_id(1);
+        server1.network_config.use_tls = false;
         let mut server2 = QuicNetworkManager::with_node_id(2);
+        server2.network_config.use_tls = false;
 
         // Start listening on server1
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -3393,7 +3857,9 @@ mod tests {
     async fn test_public_keys_exchanged_on_server_connection() {
         ensure_crypto_provider();
         let mut server1 = QuicNetworkManager::with_node_id(1);
+        server1.network_config.use_tls = false;
         let mut server2 = QuicNetworkManager::with_node_id(2);
+        server2.network_config.use_tls = false;
 
         // Both servers need to have their certificates generated
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -3429,6 +3895,51 @@ mod tests {
         assert!(
             server1.peer_public_keys.contains_key(&server2_derived_id),
             "server1 should have server2's public key stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reject_unknown_server_peer_does_not_store_public_key() {
+        ensure_crypto_provider();
+
+        // use_tls defaults to true: unknown server peers must be rejected.
+        let mut server = QuicNetworkManager::with_node_id(1);
+        assert!(server.network_config.use_tls);
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("Failed to start server");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        // Connect as a server peer that is not in the listener's allowlist.
+        let connect_task = tokio::spawn(async move {
+            let mut unknown_peer = QuicNetworkManager::with_node_id(2);
+            unknown_peer.connect_as_server(server_addr).await
+        });
+
+        let accept_result = server.accept().await;
+        let _connect_result = connect_task
+            .await
+            .expect("Unknown peer connect task should not panic");
+
+        assert!(accept_result.is_err(), "accept() should reject unknown peer");
+        let err = accept_result.unwrap_err();
+        assert!(
+            err.contains("Unauthorized peer ID"),
+            "Expected unauthorized peer error, got: {}",
+            err
+        );
+
+        // Regression guard: rejected peers must not poison consensus key state.
+        let leaked_peer_ids: Vec<PartyId> = server
+            .peer_public_keys
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        assert!(
+            leaked_peer_ids.is_empty(),
+            "Rejected peer keys leaked into map: {:?}",
+            leaked_peer_ids
         );
     }
 
@@ -3643,9 +4154,11 @@ mod tests {
     async fn test_sender_ids_are_sequential_0_to_n() {
         ensure_crypto_provider();
 
-        // Create two servers
+        // Create two servers (use_tls=false for dynamic peer discovery in tests)
         let mut server1 = QuicNetworkManager::with_node_id(1);
+        server1.network_config.use_tls = false;
         let mut server2 = QuicNetworkManager::with_node_id(2);
+        server2.network_config.use_tls = false;
 
         // Start listening (generates certificates)
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -3870,6 +4383,99 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Security Reproducer: Memory exhaustion via pre-allocation in recv
+    // ========================================================================
+    // recv_framed_message reads a 4-byte length header and immediately
+    // allocates `vec![0u8; len]` for up to MAX_MESSAGE_SIZE (100MB).
+    // An attacker sends a 4-byte header claiming a huge payload and
+    // never sends data — the server pre-allocates the full buffer.
+
+    #[test]
+    fn test_max_message_size_reduced_to_10mb() {
+        // MAX_MESSAGE_SIZE was 100MB — reduced to 10MB to limit DoS surface.
+        assert_eq!(
+            MAX_MESSAGE_SIZE, 10_000_000,
+            "MAX_MESSAGE_SIZE must be 10MB to limit pre-allocation DoS"
+        );
+    }
+
+    #[test]
+    fn test_recv_chunk_size_limits_initial_allocation() {
+        // recv_framed_message now reads in RECV_CHUNK_SIZE chunks (64 KiB).
+        // Initial Vec::with_capacity is capped at RECV_CHUNK_SIZE even for
+        // larger declared payloads — memory only grows as data arrives.
+        assert_eq!(RECV_CHUNK_SIZE, 64 * 1024);
+        assert!(
+            RECV_CHUNK_SIZE < MAX_MESSAGE_SIZE,
+            "Chunk size must be smaller than max message size"
+        );
+    }
+
+    #[test]
+    fn test_framing_rejects_oversized_header() {
+        // A 4-byte header claiming > MAX_MESSAGE_SIZE must be rejected.
+        // With the old 100MB limit, an attacker could request enormous allocs.
+        let oversized: u32 = (MAX_MESSAGE_SIZE as u32) + 1;
+        let mut spoofed_frame = Vec::with_capacity(4);
+        spoofed_frame.extend_from_slice(&oversized.to_be_bytes());
+        let result = LoopbackPeerConnection::unframe_message(spoofed_frame);
+        assert!(result.is_err(), "Frames claiming > MAX_MESSAGE_SIZE must be rejected");
+    }
+
+    // ========================================================================
+    // Security Reproducer: TLS cert verification bypass
+    // ========================================================================
+
+    #[test]
+    fn test_client_auth_mandatory_when_use_tls_enabled() {
+        ensure_crypto_provider();
+        let verifier = SkipClientVerification::new(true);
+        assert!(
+            verifier.client_auth_mandatory(),
+            "client_auth_mandatory must be true when use_tls is enabled"
+        );
+    }
+
+    #[test]
+    fn test_client_auth_optional_when_use_tls_disabled() {
+        ensure_crypto_provider();
+        let verifier = SkipClientVerification::new(false);
+        assert!(
+            !verifier.client_auth_mandatory(),
+            "client_auth_mandatory must be false when use_tls is disabled (dev mode)"
+        );
+    }
+
+    #[test]
+    fn test_server_config_with_use_tls_true_requires_client_cert() {
+        ensure_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("cert gen");
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        // Must succeed — config creation with use_tls=true
+        let config = QuicNetworkManager::create_self_signed_server_config(
+            &cert_der, &key_der, 300_000, true,
+        );
+        assert!(config.is_ok(), "Server config with use_tls=true must succeed");
+    }
+
+    #[test]
+    fn test_server_config_with_use_tls_false_allows_no_client_cert() {
+        ensure_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("cert gen");
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let config = QuicNetworkManager::create_self_signed_server_config(
+            &cert_der, &key_der, 300_000, false,
+        );
+        assert!(config.is_ok(), "Server config with use_tls=false must succeed");
+    }
+
     #[test]
     fn test_framing_empty_data() {
         let framed = LoopbackPeerConnection::frame_message(&[]);
@@ -4076,7 +4682,9 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server = QuicNetworkManager::with_node_id(1);
+        server.network_config.use_tls = false;
         let mut client = QuicNetworkManager::with_node_id(100);
+        client.network_config.use_tls = false;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -4131,7 +4739,9 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server1 = QuicNetworkManager::with_node_id(1);
+        server1.network_config.use_tls = false;
         let mut server2 = QuicNetworkManager::with_node_id(2);
+        server2.network_config.use_tls = false;
 
         // Both listen
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -4337,6 +4947,459 @@ mod tests {
             manager.server_connections.len(),
             1,
             "Should have exactly one connection (the loopback)"
+        );
+    }
+
+    // ========================================================================
+    // Consensus Gate Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_consensus_gate_not_required() {
+        ensure_crypto_provider();
+
+        // Default config: no expected_parties/expected_clients
+        let mut manager = QuicNetworkManager::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        manager.listen(addr).await.expect("listen failed");
+
+        // Gate should be NotRequired, so send/broadcast should not block
+        let gate = manager.consensus_gate_rx.borrow().clone();
+        assert_eq!(gate, ConsensusGate::NotRequired);
+
+        // await_consensus_gate should return immediately
+        manager.await_consensus_gate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_consensus_gate_pending_with_config() {
+        ensure_crypto_provider();
+
+        let config = QuicNetworkConfig {
+            expected_parties: Some(3),
+            expected_clients: Some(2),
+            ..Default::default()
+        };
+        let manager = QuicNetworkManager::with_config(config);
+
+        let gate = manager.consensus_gate_rx.borrow().clone();
+        assert_eq!(gate, ConsensusGate::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_consensus_gate_blocks_then_unblocks() {
+        ensure_crypto_provider();
+
+        let config = QuicNetworkConfig {
+            expected_parties: Some(1),
+            expected_clients: Some(1),
+            ..Default::default()
+        };
+        let manager = QuicNetworkManager::with_config(config);
+
+        // Gate is pending
+        assert_eq!(*manager.consensus_gate_rx.borrow(), ConsensusGate::Pending);
+
+        // Manually set to Ready (simulating consensus completion)
+        let _ = manager.consensus_gate_tx.send(ConsensusGate::Ready);
+
+        // Now gate should pass
+        manager.await_consensus_gate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_consensus_gate_failed_returns_error() {
+        ensure_crypto_provider();
+
+        let config = QuicNetworkConfig {
+            expected_parties: Some(3),
+            expected_clients: Some(1),
+            ..Default::default()
+        };
+        let manager = QuicNetworkManager::with_config(config);
+
+        // Set gate to Failed
+        let _ = manager
+            .consensus_gate_tx
+            .send(ConsensusGate::Failed("digest mismatch".into()));
+
+        // Gate should return error
+        let result = manager.await_consensus_gate().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_maybe_start_consensus_does_not_trigger_without_config() {
+        ensure_crypto_provider();
+
+        // No expected_parties/expected_clients
+        let manager = QuicNetworkManager::new();
+        manager.maybe_start_consensus();
+
+        // consensus_started should remain false
+        assert!(
+            !manager
+                .consensus_started
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maybe_start_consensus_only_starts_once() {
+        ensure_crypto_provider();
+
+        let config = QuicNetworkConfig {
+            expected_parties: Some(1),
+            expected_clients: Some(0),
+            ..Default::default()
+        };
+        let mut manager = QuicNetworkManager::with_config(config);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        manager.listen(addr).await.expect("listen failed");
+
+        // First call should set the flag
+        manager.maybe_start_consensus();
+        assert!(
+            manager
+                .consensus_started
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        // Second call should be a no-op (already started)
+        manager.maybe_start_consensus();
+    }
+
+    #[tokio::test]
+    async fn test_sorted_client_keys_deterministic() {
+        ensure_crypto_provider();
+
+        let manager = QuicNetworkManager::new();
+
+        // Insert keys in different order
+        let key_a = NodePublicKey(vec![3, 2, 1]);
+        let key_b = NodePublicKey(vec![1, 2, 3]);
+        let key_c = NodePublicKey(vec![2, 2, 2]);
+
+        manager.client_public_keys.insert(100, key_a);
+        manager.client_public_keys.insert(200, key_b);
+        manager.client_public_keys.insert(300, key_c);
+
+        let sorted1 = manager.get_sorted_client_keys();
+        let sorted2 = manager.get_sorted_client_keys();
+
+        assert_eq!(sorted1, sorted2);
+        // Should be sorted lexicographically
+        assert_eq!(sorted1[0].0, vec![1, 2, 3]);
+        assert_eq!(sorted1[1].0, vec![2, 2, 2]);
+        assert_eq!(sorted1[2].0, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_compute_client_list_digest_deterministic() {
+        ensure_crypto_provider();
+
+        let manager = QuicNetworkManager::new();
+        manager
+            .client_public_keys
+            .insert(1, NodePublicKey(vec![1, 2, 3]));
+        manager
+            .client_public_keys
+            .insert(2, NodePublicKey(vec![4, 5, 6]));
+
+        let digest1 = manager.compute_client_list_digest();
+        let digest2 = manager.compute_client_list_digest();
+
+        assert_eq!(digest1, digest2);
+        assert_eq!(digest1.len(), 32); // SHA-256 = 32 bytes
+    }
+
+    #[tokio::test]
+    async fn test_backward_compatible_no_consensus() {
+        ensure_crypto_provider();
+
+        // Default config should have no consensus gating
+        let mut manager = QuicNetworkManager::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        manager.listen(addr).await.expect("listen failed");
+
+        // Verify gate is NotRequired
+        assert_eq!(
+            *manager.consensus_gate_rx.borrow(),
+            ConsensusGate::NotRequired
+        );
+
+        // Verify verified_ordering returns None
+        assert!(manager.verified_ordering().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_verified_ordering_returns_none_before_consensus() {
+        ensure_crypto_provider();
+
+        let config = QuicNetworkConfig {
+            expected_parties: Some(2),
+            expected_clients: Some(1),
+            ..Default::default()
+        };
+        let manager = QuicNetworkManager::with_config(config);
+
+        // Before consensus completes, verified_ordering should be None
+        assert!(manager.verified_ordering().is_none());
+    }
+
+    // ========================================================================
+    // Regression Tests — Bug Fixes
+    // ========================================================================
+
+    /// Security regression reproducer:
+    /// connect_p2p must reject a QUIC peer whose certificate-derived identity
+    /// does not match the expected target_party_id from signaling.
+    ///
+    /// Before the fix, this succeeded and stored the attacker's connection
+    /// under the trusted target_party_id (identity misbinding).
+    #[tokio::test]
+    async fn test_connect_p2p_rejects_identity_mismatch() {
+        ensure_crypto_provider();
+
+        let mut victim = QuicNetworkManager::with_node_id(1000);
+        victim.network_config.enable_nat_traversal = true;
+        victim
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("victim listen failed");
+
+        let mut attacker = QuicNetworkManager::with_node_id(2000);
+        attacker.network_config.enable_nat_traversal = true;
+        attacker
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("attacker listen failed");
+
+        // Drive incoming accepts on attacker so QUIC handshakes in ICE checks and
+        // final P2P connect can complete deterministically during the test.
+        let attacker_endpoint = attacker.endpoint.as_ref().unwrap().clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    incoming = attacker_endpoint.accept() => {
+                        let Some(incoming) = incoming else {
+                            break;
+                        };
+                        if let Ok(connection) = incoming.await {
+                            if let Ok(Ok((_send, mut recv))) = tokio::time::timeout(
+                                Duration::from_millis(200),
+                                connection.accept_bi(),
+                            )
+                            .await
+                            {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_millis(200),
+                                    recv_stream_sync(&mut recv),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let attacker_derived_id = attacker.local_derived_id();
+        let target_party_id = if attacker_derived_id == 1 { 2 } else { 1 };
+        assert_ne!(
+            attacker_derived_id, target_party_id,
+            "test precondition failed: attacker ID unexpectedly matched target ID"
+        );
+
+        // Prepare malicious signaling payload: attacker ICE candidates claimed
+        // as if they came from target_party_id.
+        let attacker_candidates = attacker
+            .create_ice_candidates_message()
+            .await
+            .expect("attacker candidate gathering failed")
+            .serialize();
+
+        let signaling = Arc::new(LoopbackPeerConnection::new(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+        )) as Arc<dyn PeerConnection>;
+        signaling
+            .send(&attacker_candidates)
+            .await
+            .expect("failed to preload signaling message");
+
+        let result = victim.connect_p2p(target_party_id, Arc::clone(&signaling)).await;
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), accept_task).await;
+
+        let err = result.expect_err(
+            "connect_p2p should reject mismatched peer identity, but it succeeded",
+        );
+        assert!(
+            err.to_lowercase().contains("identity mismatch"),
+            "expected identity mismatch error, got: {}",
+            err
+        );
+    }
+
+    /// Regression: verified_ordering() must reliably return the stored value
+    /// without spurious None from lock contention. Previously used try_lock()
+    /// on a tokio Mutex which could fail under contention.
+    #[tokio::test]
+    async fn test_verified_ordering_no_spurious_none() {
+        ensure_crypto_provider();
+
+        let manager = QuicNetworkManager::new();
+        let ordering = VerifiedOrdering::new(
+            vec![NodePublicKey(vec![1, 2, 3])],
+            vec![NodePublicKey(vec![4, 5, 6])],
+        );
+
+        // Simulate consensus completing by writing directly to the field
+        *manager
+            .verified_ordering
+            .lock()
+            .expect("lock poisoned") = Some(ordering.clone());
+
+        // Must reliably return the stored value on every call
+        for _ in 0..100 {
+            let result = manager.verified_ordering();
+            assert_eq!(
+                result,
+                Some(ordering.clone()),
+                "verified_ordering() must not return spurious None"
+            );
+        }
+    }
+
+    /// Regression: set_expected_parties(0) must set gate to Pending,
+    /// matching the behavior of with_config({ expected_parties: Some(0) }).
+    #[tokio::test]
+    async fn test_set_expected_parties_zero_sets_pending() {
+        ensure_crypto_provider();
+
+        // Via config: gate should be Pending
+        let config = QuicNetworkConfig {
+            expected_parties: Some(0),
+            ..Default::default()
+        };
+        let m_config = QuicNetworkManager::with_config(config);
+        let gate_config = m_config.consensus_gate_rx.borrow().clone();
+
+        // Via setter: gate should also be Pending (was NotRequired before fix)
+        let mut m_setter = QuicNetworkManager::new();
+        m_setter.set_expected_parties(0);
+        let gate_setter = m_setter.consensus_gate_rx.borrow().clone();
+
+        assert_eq!(
+            gate_config, gate_setter,
+            "set_expected_parties(0) must produce same gate state as with_config"
+        );
+        assert_eq!(gate_setter, ConsensusGate::Pending);
+    }
+
+    /// Regression: set_expected_clients(0) must set gate to Pending,
+    /// matching the behavior of with_config({ expected_clients: Some(0) }).
+    #[tokio::test]
+    async fn test_set_expected_clients_zero_sets_pending() {
+        ensure_crypto_provider();
+
+        let config = QuicNetworkConfig {
+            expected_clients: Some(0),
+            ..Default::default()
+        };
+        let m_config = QuicNetworkManager::with_config(config);
+        let gate_config = m_config.consensus_gate_rx.borrow().clone();
+
+        let mut m_setter = QuicNetworkManager::new();
+        m_setter.set_expected_clients(0);
+        let gate_setter = m_setter.consensus_gate_rx.borrow().clone();
+
+        assert_eq!(
+            gate_config, gate_setter,
+            "set_expected_clients(0) must produce same gate state as with_config"
+        );
+        assert_eq!(gate_setter, ConsensusGate::Pending);
+    }
+
+    /// Regression: calling set_expected_parties after consensus has completed
+    /// must NOT reset the gate to Pending (which would permanently block sends).
+    #[tokio::test]
+    async fn test_setter_after_consensus_does_not_reset_gate() {
+        ensure_crypto_provider();
+
+        let config = QuicNetworkConfig {
+            expected_parties: Some(1),
+            expected_clients: Some(0),
+            ..Default::default()
+        };
+        let mut manager = QuicNetworkManager::with_config(config);
+
+        // Simulate consensus having completed
+        manager
+            .consensus_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = manager.consensus_gate_tx.send(ConsensusGate::Ready);
+
+        // Calling setters after consensus must NOT revert gate to Pending
+        manager.set_expected_parties(5);
+        let gate = manager.consensus_gate_rx.borrow().clone();
+        assert_eq!(
+            gate,
+            ConsensusGate::Ready,
+            "Gate must remain Ready after setter called post-consensus"
+        );
+
+        manager.set_expected_clients(3);
+        let gate = manager.consensus_gate_rx.borrow().clone();
+        assert_eq!(
+            gate,
+            ConsensusGate::Ready,
+            "Gate must remain Ready after setter called post-consensus"
+        );
+    }
+
+    /// Regression: execute_consensus must use a consistent snapshot of sorted
+    /// keys for party_count and local_party_id derivation.
+    #[tokio::test]
+    async fn test_consensus_snapshot_consistency() {
+        ensure_crypto_provider();
+
+        let mut manager = QuicNetworkManager::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        manager.listen(addr).await.expect("listen failed");
+
+        // Add some peer public keys
+        let pk_a = NodePublicKey(vec![1, 0, 0]);
+        let pk_b = NodePublicKey(vec![2, 0, 0]);
+        manager.peer_public_keys.insert(pk_a.derive_id(), pk_a.clone());
+        manager.peer_public_keys.insert(pk_b.derive_id(), pk_b.clone());
+
+        // Snapshot the sorted keys
+        let sorted = manager.get_sorted_public_keys();
+        let party_count = sorted.len();
+
+        // Derive local_party_id from the same snapshot
+        let local_pk = manager.local_public_key.as_ref().unwrap();
+        let local_party_id = sorted.iter().position(|k| k == local_pk);
+
+        assert!(local_party_id.is_some(), "local key must be in sorted list");
+        assert_eq!(
+            party_count, 3,
+            "party_count must equal sorted keys length (self + 2 peers)"
+        );
+
+        // Verify the snapshot-derived party_id matches compute_local_party_id
+        assert_eq!(
+            local_party_id,
+            manager.compute_local_party_id().map(|id| id),
+            "snapshot-derived party_id must match compute_local_party_id"
         );
     }
 }

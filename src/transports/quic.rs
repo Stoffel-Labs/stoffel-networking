@@ -1498,6 +1498,29 @@ impl QuicNetworkManager {
         Self::extract_public_key_from_cert(&certs[0])
     }
 
+    /// Verifies that the peer certificate-derived identity matches the expected party.
+    ///
+    /// P2P NAT traversal paths must bind the established QUIC connection to the
+    /// expected peer identity from signaling, otherwise a third party can be
+    /// misbound into another party's slot.
+    fn verify_expected_p2p_identity(
+        peer_public_key: Option<&NodePublicKey>,
+        expected_party_id: PartyId,
+    ) -> Result<(), String> {
+        let derived_id = peer_public_key
+            .map(|pk| pk.derive_id())
+            .ok_or_else(|| "Failed to extract peer public key from TLS certificate".to_string())?;
+
+        if derived_id != expected_party_id {
+            return Err(format!(
+                "P2P identity mismatch: expected {}, got {}",
+                expected_party_id, derived_id
+            ));
+        }
+
+        Ok(())
+    }
+
     // ============================================================================
     // SENDER_ID COMPUTATION
     // ============================================================================
@@ -2171,6 +2194,16 @@ impl QuicNetworkManager {
 
         // Extract peer's public key from TLS certificate
         let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), target_party_id)
+        {
+            connection.close(0u32.into(), b"p2p identity mismatch");
+            self.pending_ice_agents.remove(&target_party_id);
+            return Err(err);
+        }
+
+        if let Some(ref pk) = peer_public_key {
+            self.peer_public_keys.insert(target_party_id, pk.clone());
+        }
 
         // Open stream and sync
         let (mut send, recv) = connection
@@ -2290,6 +2323,16 @@ impl QuicNetworkManager {
             .await
             .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
+        let remote_addr = connection.remote_address();
+        if remote_addr.ip() != nominated_pair.remote.address.ip() {
+            connection.close(0u32.into(), b"unexpected p2p remote address");
+            return Err(format!(
+                "Rejected unexpected P2P remote address {} (expected IP {})",
+                remote_addr,
+                nominated_pair.remote.address.ip()
+            ));
+        }
+
         // Get connection role from ALPN negotiation
         let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
             warn!("ALPN extraction failed: {}, defaulting to Server", e);
@@ -2298,6 +2341,15 @@ impl QuicNetworkManager {
 
         // Extract peer's public key from TLS certificate
         let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), from_party_id)
+        {
+            connection.close(0u32.into(), b"p2p identity mismatch");
+            return Err(err);
+        }
+
+        if let Some(ref pk) = peer_public_key {
+            self.peer_public_keys.insert(from_party_id, pk.clone());
+        }
 
         let accept_timeout = Duration::from_millis(self.network_config.timeout_ms);
 
@@ -2786,12 +2838,6 @@ impl NetworkManager for QuicNetworkManager {
                         remote_addr, peer_id
                     );
 
-                    // Store peer's public key if available
-                    if let Some(pk) = peer_public_key {
-                        self.peer_public_keys.insert(peer_id, pk);
-                        trace!("Stored public key for peer {}", peer_id);
-                    }
-
                     // Validate peer is known when TLS is enforced; otherwise
                     // allow auto-discovery for development/test environments.
                     if !self.nodes.iter().any(|n| n.id() == peer_id) {
@@ -2808,6 +2854,12 @@ impl NetworkManager for QuicNetworkManager {
                         }
                         self.nodes
                             .push(QuicNode::from_party_id(peer_id, remote_addr));
+                    }
+
+                    // Store peer's public key only after authorization succeeds.
+                    if let Some(pk) = peer_public_key {
+                        self.peer_public_keys.insert(peer_id, pk);
+                        trace!("Stored public key for peer {}", peer_id);
                     }
 
                     // Deduplicate simultaneous connections (STO-481):
@@ -3843,6 +3895,51 @@ mod tests {
         assert!(
             server1.peer_public_keys.contains_key(&server2_derived_id),
             "server1 should have server2's public key stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reject_unknown_server_peer_does_not_store_public_key() {
+        ensure_crypto_provider();
+
+        // use_tls defaults to true: unknown server peers must be rejected.
+        let mut server = QuicNetworkManager::with_node_id(1);
+        assert!(server.network_config.use_tls);
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("Failed to start server");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        // Connect as a server peer that is not in the listener's allowlist.
+        let connect_task = tokio::spawn(async move {
+            let mut unknown_peer = QuicNetworkManager::with_node_id(2);
+            unknown_peer.connect_as_server(server_addr).await
+        });
+
+        let accept_result = server.accept().await;
+        let _connect_result = connect_task
+            .await
+            .expect("Unknown peer connect task should not panic");
+
+        assert!(accept_result.is_err(), "accept() should reject unknown peer");
+        let err = accept_result.unwrap_err();
+        assert!(
+            err.contains("Unauthorized peer ID"),
+            "Expected unauthorized peer error, got: {}",
+            err
+        );
+
+        // Regression guard: rejected peers must not poison consensus key state.
+        let leaked_peer_ids: Vec<PartyId> = server
+            .peer_public_keys
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        assert!(
+            leaked_peer_ids.is_empty(),
+            "Rejected peer keys leaked into map: {:?}",
+            leaked_peer_ids
         );
     }
 
@@ -5053,6 +5150,103 @@ mod tests {
     // ========================================================================
     // Regression Tests — Bug Fixes
     // ========================================================================
+
+    /// Security regression reproducer:
+    /// connect_p2p must reject a QUIC peer whose certificate-derived identity
+    /// does not match the expected target_party_id from signaling.
+    ///
+    /// Before the fix, this succeeded and stored the attacker's connection
+    /// under the trusted target_party_id (identity misbinding).
+    #[tokio::test]
+    async fn test_connect_p2p_rejects_identity_mismatch() {
+        ensure_crypto_provider();
+
+        let mut victim = QuicNetworkManager::with_node_id(1000);
+        victim.network_config.enable_nat_traversal = true;
+        victim
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("victim listen failed");
+
+        let mut attacker = QuicNetworkManager::with_node_id(2000);
+        attacker.network_config.enable_nat_traversal = true;
+        attacker
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("attacker listen failed");
+
+        // Drive incoming accepts on attacker so QUIC handshakes in ICE checks and
+        // final P2P connect can complete deterministically during the test.
+        let attacker_endpoint = attacker.endpoint.as_ref().unwrap().clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    incoming = attacker_endpoint.accept() => {
+                        let Some(incoming) = incoming else {
+                            break;
+                        };
+                        if let Ok(connection) = incoming.await {
+                            if let Ok(Ok((_send, mut recv))) = tokio::time::timeout(
+                                Duration::from_millis(200),
+                                connection.accept_bi(),
+                            )
+                            .await
+                            {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_millis(200),
+                                    recv_stream_sync(&mut recv),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let attacker_derived_id = attacker.local_derived_id();
+        let target_party_id = if attacker_derived_id == 1 { 2 } else { 1 };
+        assert_ne!(
+            attacker_derived_id, target_party_id,
+            "test precondition failed: attacker ID unexpectedly matched target ID"
+        );
+
+        // Prepare malicious signaling payload: attacker ICE candidates claimed
+        // as if they came from target_party_id.
+        let attacker_candidates = attacker
+            .create_ice_candidates_message()
+            .await
+            .expect("attacker candidate gathering failed")
+            .serialize();
+
+        let signaling = Arc::new(LoopbackPeerConnection::new(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+        )) as Arc<dyn PeerConnection>;
+        signaling
+            .send(&attacker_candidates)
+            .await
+            .expect("failed to preload signaling message");
+
+        let result = victim.connect_p2p(target_party_id, Arc::clone(&signaling)).await;
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), accept_task).await;
+
+        let err = result.expect_err(
+            "connect_p2p should reject mismatched peer identity, but it succeeded",
+        );
+        assert!(
+            err.to_lowercase().contains("identity mismatch"),
+            "expected identity mismatch error, got: {}",
+            err
+        );
+    }
 
     /// Regression: verified_ordering() must reliably return the stored value
     /// without spurious None from lock contention. Previously used try_lock()

@@ -5069,6 +5069,44 @@ mod tests {
         manager.maybe_start_consensus();
     }
 
+    /// PoC validation for review finding:
+    /// With only one expected threshold configured, gate is Pending but
+    /// maybe_start_consensus() exits early and sends remain blocked.
+    #[tokio::test]
+    async fn test_poc_consensus_gate_stuck_with_only_expected_parties() {
+        ensure_crypto_provider();
+
+        let config = QuicNetworkConfig {
+            expected_parties: Some(1),
+            expected_clients: None,
+            ..Default::default()
+        };
+        let mut manager = QuicNetworkManager::with_config(config);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        manager.listen(addr).await.expect("listen failed");
+
+        assert_eq!(*manager.consensus_gate_rx.borrow(), ConsensusGate::Pending);
+
+        manager.maybe_start_consensus();
+
+        let gate_result = tokio::time::timeout(
+            Duration::from_millis(200),
+            manager.await_consensus_gate(),
+        )
+        .await;
+
+        assert!(
+            gate_result.is_ok(),
+            "consensus gate stayed blocked when expected_parties threshold was already met"
+        );
+        assert!(
+            manager
+                .consensus_started
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "consensus should start when one configured threshold is met"
+        );
+    }
+
     #[tokio::test]
     async fn test_sorted_client_keys_deterministic() {
         ensure_crypto_provider();

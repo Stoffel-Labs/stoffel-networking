@@ -2484,13 +2484,12 @@ impl QuicNetworkManager {
         keys
     }
 
-    /// Computes SHA-256 digest of the sorted client public key list.
+    /// Computes BLAKE3 digest of the sorted client public key list.
     pub fn compute_client_list_digest(&self) -> Vec<u8> {
-        use sha2::{Digest, Sha256};
         let sorted = self.get_sorted_client_keys();
         let raw: Vec<Vec<u8>> = sorted.iter().map(|k| k.0.clone()).collect();
         let serialized = bincode::serialize(&raw).expect("serialization should not fail");
-        Sha256::digest(&serialized).to_vec()
+        blake3::hash(&serialized).as_bytes().to_vec()
     }
 
     /// Checks if consensus should start and spawns the consensus task if so.
@@ -5110,7 +5109,7 @@ mod tests {
         let digest2 = manager.compute_client_list_digest();
 
         assert_eq!(digest1, digest2);
-        assert_eq!(digest1.len(), 32); // SHA-256 = 32 bytes
+        assert_eq!(digest1.len(), 32); // BLAKE3 = 32 bytes
     }
 
     #[tokio::test]

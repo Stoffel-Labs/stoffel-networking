@@ -96,17 +96,29 @@ pub enum NetEnvelope {
     //
     // Architectural assumptions
     // --------------------------
-    // Nodes form a pre-configured peer network whose membership is established
-    // out-of-band — either via static configuration or a signaling/bootnode
-    // that all nodes connect to before the protocol starts.  Nodes therefore
-    // already know each other when consensus begins.
+    // Node membership is established out-of-band by the StoffelVM bootnode
+    // coordinator (see `StoffelVM/crates/stoffel-vm/src/net/discovery.rs`).
+    // The flow is:
+    //
+    //   1. Each node registers with the bootnode via `RegisterWithSession`,
+    //      supplying its listen address and the program it wants to run.
+    //   2. The bootnode waits until `n_parties` nodes have registered, then
+    //      broadcasts a `SessionAnnounce` message containing the agreed peer
+    //      list (PartyId → SocketAddr) to every registered node.
+    //   3. Nodes use that peer list to open direct QUIC connections to each
+    //      other — at this point they all know the full node membership.
+    //
+    // The in-network consensus protocol below runs *after* step 3.  Its job
+    // is not to discover nodes (the bootnode already handled that) but to
+    // agree on which *clients* have connected and produce a single
+    // `VerifiedOrdering` that every node shares before MPC execution starts.
     //
     // Clients (MPC input providers) connect to one or more nodes and learn the
     // canonical participant ordering *from* the nodes rather than deriving it
     // independently.
     //
     // Consensus proceeds in two phases:
-    //   1. Node ↔ Node: each node computes a SHA-256 digest of its sorted
+    //   1. Node ↔ Node: each node computes a BLAKE3 digest of its sorted
     //      client public-key list and broadcasts it as `ClientListDigest`.
     //      Once every node's digest matches, a `VerifiedOrdering` is committed.
     //   2. Node → Client: after phase 1, each node auto-pushes a
@@ -130,9 +142,9 @@ pub enum NetEnvelope {
         node_keys: Vec<Vec<u8>>,
     },
 
-    /// Node-to-node: SHA-256 digest of sorted client public key list.
+    /// Node-to-node: BLAKE3 digest of sorted client public key list.
     ClientListDigest {
-        /// 32-byte SHA-256 digest
+        /// 32-byte BLAKE3 digest
         digest: Vec<u8>,
         /// Number of clients included in the digest
         client_count: usize,

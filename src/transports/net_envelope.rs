@@ -93,8 +93,34 @@ pub enum NetEnvelope {
     // =========================================================================
     // Consensus Messages
     // =========================================================================
+    //
+    // Architectural assumptions
+    // --------------------------
+    // Nodes form a pre-configured peer network whose membership is established
+    // out-of-band — either via static configuration or a signaling/bootnode
+    // that all nodes connect to before the protocol starts.  Nodes therefore
+    // already know each other when consensus begins.
+    //
+    // Clients (MPC input providers) connect to one or more nodes and learn the
+    // canonical participant ordering *from* the nodes rather than deriving it
+    // independently.
+    //
+    // Consensus proceeds in two phases:
+    //   1. Node ↔ Node: each node computes a SHA-256 digest of its sorted
+    //      client public-key list and broadcasts it as `ClientListDigest`.
+    //      Once every node's digest matches, a `VerifiedOrdering` is committed.
+    //   2. Node → Client: after phase 1, each node auto-pushes a
+    //      `NodeListResponse` to every connected client.  Clients may also
+    //      request it explicitly via `NodeListRequest` as a defensive fallback
+    //      (e.g. if they connected after the initial push or missed it due to a
+    //      transient error).
 
-    /// Client requests the node's canonical node list (optional, defensive).
+    /// Client requests the node's canonical node list.
+    ///
+    /// This is a defensive/optional request: nodes auto-push `NodeListResponse`
+    /// to all connected clients after consensus completes, so under normal
+    /// operation a client never needs to send this.  It exists as a fallback
+    /// for clients that connect late or miss the initial push.
     NodeListRequest,
 
     /// Node sends its canonical ordered list of node public keys.

@@ -328,8 +328,18 @@ pub struct IceAgent {
 /// unspecified, multicast, broadcast, link-local (including 169.254.x.x cloud
 /// metadata range), and — unless `allow_loopback` is set — loopback.
 fn is_safe_remote_candidate(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
+    // Unspecified addresses (0.0.0.0 / ::) resolve to the local host's network
+    // stack rather than a distinct remote peer.  Multicast addresses target a
+    // group of hosts rather than a single endpoint.  Both are non-unicast and
+    // therefore never valid as a remote ICE candidate; they are grouped here
+    // because the same early-return applies to both, matching the common pattern
+    // used in WebRTC and other ICE implementations.
     if ip.is_unspecified() || ip.is_multicast() {
-        debug!("Rejected remote candidate: {} (unspecified/multicast)", ip);
+        debug!(
+            "Rejected remote candidate: {} ({})",
+            ip,
+            if ip.is_unspecified() { "unspecified" } else { "multicast" }
+        );
         return false;
     }
     if ip.is_loopback() && !allow_loopback {

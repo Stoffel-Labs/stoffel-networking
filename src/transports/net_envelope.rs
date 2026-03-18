@@ -108,24 +108,27 @@ pub enum NetEnvelope {
     //   3. Nodes use that peer list to open direct QUIC connections to each
     //      other — at this point they all know the full node membership.
     //
-    // The in-network consensus protocol below runs *after* step 3.  Its job
-    // is not to discover nodes (the bootnode already handled that) but to
-    // agree on which *clients* have connected and produce a single
-    // `VerifiedOrdering` that every node shares before MPC execution starts.
+    // The in-network consensus protocol below runs *after* step 3.  It has
+    // two goals:
+    //   a) Nodes agree on which *clients* have connected, so that every node
+    //      starts MPC with an identical, ordered client key list.
+    //   b) Clients learn the canonical ordered *node* key list, so they can
+    //      verify they are talking to the correct set of MPC nodes.
     //
-    // Clients (MPC input providers) connect to one or more nodes and learn the
-    // canonical participant ordering *from* the nodes rather than deriving it
-    // independently.
+    // Note: "node discovery" in step 3 above means nodes finding *each other*
+    // via the bootnode.  Clients still need to learn the node list, which is
+    // what phase 2 below provides.
     //
     // Consensus proceeds in two phases:
     //   1. Node ↔ Node: each node computes a BLAKE3 digest of its sorted
     //      client public-key list and broadcasts it as `ClientListDigest`.
-    //      Once every node's digest matches, a `VerifiedOrdering` is committed.
+    //      Once every node has seen matching digests from all peers, the
+    //      client ordering is considered committed.
     //   2. Node → Client: after phase 1, each node auto-pushes a
-    //      `NodeListResponse` to every connected client.  Clients may also
-    //      request it explicitly via `NodeListRequest` as a defensive fallback
-    //      (e.g. if they connected after the initial push or missed it due to a
-    //      transient error).
+    //      `NodeListResponse` (ordered node public keys, index = PartyId) to
+    //      every connected client.  Clients may also request it explicitly via
+    //      `NodeListRequest` as a defensive fallback (e.g. if they connected
+    //      after the initial push or missed it due to a transient error).
 
     /// Client requests the node's canonical node list.
     ///

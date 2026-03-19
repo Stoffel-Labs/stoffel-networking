@@ -5068,6 +5068,151 @@ mod tests {
         manager.maybe_start_consensus();
     }
 
+    /// PoC validation for review finding:
+    /// NodeListResponse sends are detached and not awaited, so application
+    /// traffic can be observed first by verify_node_ordering().
+    #[tokio::test]
+    async fn test_poc_nodelistresponse_can_lose_race_to_app_traffic() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct DeterministicRaceConnection {
+            remote_addr: SocketAddr,
+            queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+            send_lock: Arc<Mutex<()>>,
+            state: Arc<Mutex<ConnectionState>>,
+            node_list_waiting: Arc<AtomicBool>,
+            release_node_list: Arc<tokio::sync::Notify>,
+            remote_party_id: Arc<std::sync::Mutex<Option<PartyId>>>,
+        }
+
+        impl DeterministicRaceConnection {
+            fn new(remote_addr: SocketAddr) -> Self {
+                Self {
+                    remote_addr,
+                    queue: Arc::new(Mutex::new(VecDeque::new())),
+                    send_lock: Arc::new(Mutex::new(())),
+                    state: Arc::new(Mutex::new(ConnectionState::Connected)),
+                    node_list_waiting: Arc::new(AtomicBool::new(false)),
+                    release_node_list: Arc::new(tokio::sync::Notify::new()),
+                    remote_party_id: Arc::new(std::sync::Mutex::new(None)),
+                }
+            }
+        }
+
+        impl PeerConnection for DeterministicRaceConnection {
+            fn send<'a>(
+                &'a self,
+                data: &'a [u8],
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+                Box::pin(async move {
+                    if matches!(
+                        NetEnvelope::try_deserialize(data),
+                        Ok(NetEnvelope::NodeListResponse { .. })
+                    ) {
+                        self.node_list_waiting.store(true, Ordering::SeqCst);
+                        self.release_node_list.notified().await;
+                    }
+
+                    let _guard = self.send_lock.lock().await;
+                    self.queue.lock().await.push_back(data.to_vec());
+                    Ok(())
+                })
+            }
+
+            fn receive<'a>(
+                &'a self,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.queue
+                        .lock()
+                        .await
+                        .pop_front()
+                        .ok_or_else(|| "No queued message".to_string())
+                })
+            }
+
+            fn remote_address(&self) -> SocketAddr {
+                self.remote_addr
+            }
+
+            fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+                Box::pin(async move {
+                    *self.state.lock().await = ConnectionState::Closed;
+                    Ok(())
+                })
+            }
+
+            fn state<'a>(&'a self) -> Pin<Box<dyn Future<Output = ConnectionState> + Send + 'a>> {
+                Box::pin(async move { *self.state.lock().await })
+            }
+
+            fn is_connected<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+                Box::pin(async move { *self.state.lock().await == ConnectionState::Connected })
+            }
+
+            fn get_connection_role(&self) -> ClientType {
+                ClientType::Client
+            }
+
+            fn remote_party_id(&self) -> Option<PartyId> {
+                self.remote_party_id.lock().ok().and_then(|id| *id)
+            }
+
+            fn set_remote_party_id(&self, party_id: PartyId) {
+                if let Ok(mut id) = self.remote_party_id.lock() {
+                    *id = Some(party_id);
+                }
+            }
+        }
+
+        let mut manager = QuicNetworkManager::new();
+        manager
+            .ensure_local_certificate()
+            .expect("ensure_local_certificate failed");
+
+        let client_id = 42;
+        let race_conn = Arc::new(DeterministicRaceConnection::new(
+            "127.0.0.1:41042".parse().unwrap(),
+        ));
+        manager
+            .client_connections
+            .insert(client_id, race_conn.clone() as Arc<dyn PeerConnection>);
+        manager.client_ids.insert(client_id);
+
+        // Returns before detached NodeListResponse send completes.
+        manager
+            .execute_consensus(Duration::from_millis(500))
+            .await
+            .expect("consensus should succeed in single-party setup");
+
+        // Wait until detached NodeListResponse send is parked.
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while !race_conn.node_list_waiting.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("NodeListResponse send task did not reach waiting point");
+
+        // Application traffic can grab send lock and land first.
+        let app_msg = NetEnvelope::HoneyBadger(vec![1, 2, 3]).serialize();
+        race_conn
+            .send(&app_msg)
+            .await
+            .expect("app send should succeed");
+
+        // Let NodeListResponse send complete afterward.
+        race_conn.release_node_list.notify_waiters();
+
+        let result = QuicNetworkManager::verify_node_ordering(&[race_conn as Arc<dyn PeerConnection>]).await;
+        assert!(
+            result.is_ok(),
+            "verify_node_ordering should not fail because NodeListResponse was sent before gate opened"
+        );
+    }
+
     #[tokio::test]
     async fn test_sorted_client_keys_deterministic() {
         ensure_crypto_provider();

@@ -322,6 +322,52 @@ pub struct IceAgent {
     stun_client: StunClient,
 }
 
+/// Returns `true` if the IP address is safe to use as a remote ICE candidate.
+///
+/// Rejects addresses that could be used for SSRF attacks:
+/// unspecified, multicast, broadcast, link-local (including 169.254.x.x cloud
+/// metadata range), and — unless `allow_loopback` is set — loopback.
+fn is_safe_remote_candidate(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
+    // Unspecified addresses (0.0.0.0 / ::) resolve to the local host's network
+    // stack rather than a distinct remote peer.  Multicast addresses target a
+    // group of hosts rather than a single endpoint.  Both are non-unicast and
+    // therefore never valid as a remote ICE candidate; they are grouped here
+    // because the same early-return applies to both, matching the common pattern
+    // used in WebRTC and other ICE implementations.
+    if ip.is_unspecified() || ip.is_multicast() {
+        debug!(
+            "Rejected remote candidate: {} ({})",
+            ip,
+            if ip.is_unspecified() { "unspecified" } else { "multicast" }
+        );
+        return false;
+    }
+    if ip.is_loopback() && !allow_loopback {
+        debug!("Rejected remote candidate: {} (loopback)", ip);
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_link_local() {
+                debug!("Rejected remote candidate: {} (link-local)", ip);
+                return false;
+            }
+            if v4.is_broadcast() {
+                debug!("Rejected remote candidate: {} (broadcast)", ip);
+                return false;
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            // fe80::/10 — IPv6 link-local
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                debug!("Rejected remote candidate: {} (IPv6 link-local)", ip);
+                return false;
+            }
+        }
+    }
+    true
+}
+
 impl IceAgent {
     /// Creates a new ICE agent with the given configuration.
     ///
@@ -610,8 +656,30 @@ impl IceAgent {
             candidates.len()
         );
 
+        // Filter remote candidates to prevent SSRF attacks.
+        // Loopback is only allowed when local candidates also use loopback (test/dev).
+        let allow_loopback = self
+            .local_candidates
+            .candidates
+            .iter()
+            .any(|c| c.address.ip().is_loopback());
+
+        let safe_candidates: Vec<IceCandidate> = candidates
+            .into_iter()
+            .filter(|c| is_safe_remote_candidate(c.address.ip(), allow_loopback))
+            .collect();
+
+        if safe_candidates.is_empty() && !self.local_candidates.candidates.is_empty() {
+            warn!(
+                "All {} remote candidates from party {} were filtered as unsafe",
+                self.local_candidates.candidates.len(),
+                remote_party_id,
+            );
+            return Err(IceError::NoCandidates);
+        }
+
         self.remote_candidates = Some(LocalCandidates {
-            candidates,
+            candidates: safe_candidates,
             ufrag,
             pwd,
         });
@@ -2116,6 +2184,168 @@ mod integration_tests {
     }
 
     /// Test connectivity check message serialization
+    // ========================================================================
+    // Security Reproducer: SSRF via unvalidated remote ICE candidates
+    // ========================================================================
+    // Remote peers can supply arbitrary addresses as ICE candidates.
+    // set_remote_candidates() should filter out dangerous addresses
+    // (loopback, link-local, multicast, broadcast, unspecified) when
+    // the local agent is NOT itself using loopback (i.e. production mode).
+
+    #[tokio::test]
+    async fn test_ssrf_loopback_candidate_rejected_in_production_mode() {
+        // Simulate production: local candidate is a routable IP, not loopback
+        let config = test_ice_config();
+        let mut agent = IceAgent::new_unchecked(config, 1);
+
+        let public_addr: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Manually set local candidates to a public IP to simulate production
+        agent.local_candidates = LocalCandidates {
+            candidates: vec![IceCandidate::host(public_addr, 1)],
+            ufrag: "local_ufrag".to_string(),
+            pwd: "local_pwd_at_least_22_chars".to_string(),
+        };
+        agent.state = IceState::GatheringComplete;
+
+        // Attacker sends loopback as a remote candidate
+        let loopback_candidate =
+            IceCandidate::host("127.0.0.1:9999".parse().unwrap(), 1);
+
+        let result = agent.set_remote_candidates(
+            2,
+            "attacker_ufrag".to_string(),
+            "attacker_pwd_22_chars_xx".to_string(),
+            vec![loopback_candidate],
+        );
+
+        // BUG: Currently the loopback candidate is accepted.
+        // After fix, this should be Err(NoCandidates) because the only
+        // candidate was filtered out.
+        assert!(
+            result.is_err(),
+            "SSRF: loopback remote candidate should be rejected in production mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_link_local_candidate_rejected() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new_unchecked(config, 1);
+
+        let public_addr: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        agent.local_candidates = LocalCandidates {
+            candidates: vec![IceCandidate::host(public_addr, 1)],
+            ufrag: "local_ufrag".to_string(),
+            pwd: "local_pwd_at_least_22_chars".to_string(),
+        };
+        agent.state = IceState::GatheringComplete;
+
+        // Attacker sends link-local (169.254.169.254 — cloud metadata service)
+        let link_local_candidate =
+            IceCandidate::host("169.254.169.254:80".parse().unwrap(), 1);
+
+        let result = agent.set_remote_candidates(
+            2,
+            "attacker_ufrag".to_string(),
+            "attacker_pwd_22_chars_xx".to_string(),
+            vec![link_local_candidate],
+        );
+
+        assert!(
+            result.is_err(),
+            "SSRF: link-local remote candidate (cloud metadata) should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_multicast_candidate_rejected() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new_unchecked(config, 1);
+
+        let public_addr: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        agent.local_candidates = LocalCandidates {
+            candidates: vec![IceCandidate::host(public_addr, 1)],
+            ufrag: "local_ufrag".to_string(),
+            pwd: "local_pwd_at_least_22_chars".to_string(),
+        };
+        agent.state = IceState::GatheringComplete;
+
+        let multicast_candidate =
+            IceCandidate::host("224.0.0.1:5000".parse().unwrap(), 1);
+
+        let result = agent.set_remote_candidates(
+            2,
+            "attacker_ufrag".to_string(),
+            "attacker_pwd_22_chars_xx".to_string(),
+            vec![multicast_candidate],
+        );
+
+        assert!(
+            result.is_err(),
+            "SSRF: multicast remote candidate should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_unspecified_candidate_rejected() {
+        let config = test_ice_config();
+        let mut agent = IceAgent::new_unchecked(config, 1);
+
+        let public_addr: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        agent.local_candidates = LocalCandidates {
+            candidates: vec![IceCandidate::host(public_addr, 1)],
+            ufrag: "local_ufrag".to_string(),
+            pwd: "local_pwd_at_least_22_chars".to_string(),
+        };
+        agent.state = IceState::GatheringComplete;
+
+        let unspecified_candidate =
+            IceCandidate::host("0.0.0.0:5000".parse().unwrap(), 1);
+
+        let result = agent.set_remote_candidates(
+            2,
+            "attacker_ufrag".to_string(),
+            "attacker_pwd_22_chars_xx".to_string(),
+            vec![unspecified_candidate],
+        );
+
+        assert!(
+            result.is_err(),
+            "SSRF: unspecified (0.0.0.0) remote candidate should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_loopback_allowed_in_local_test_mode() {
+        // When local candidates are also loopback, loopback remotes are OK
+        let config = test_ice_config();
+        let mut agent = IceAgent::new_unchecked(config, 1);
+
+        let local_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        agent
+            .gather_candidates(&[local_addr], &socket)
+            .await
+            .unwrap();
+
+        let remote_loopback =
+            IceCandidate::host("127.0.0.1:6000".parse().unwrap(), 1);
+
+        let result = agent.set_remote_candidates(
+            2,
+            "test_ufrag".to_string(),
+            "test_pwd_at_least_22_chars".to_string(),
+            vec![remote_loopback],
+        );
+
+        assert!(
+            result.is_ok(),
+            "Loopback should be allowed when local candidates are also loopback"
+        );
+    }
+
     #[test]
     fn test_connectivity_check_message() {
         let check = NetEnvelope::ConnectivityCheck {

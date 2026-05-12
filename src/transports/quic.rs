@@ -4590,6 +4590,180 @@ mod tests {
         assert_eq!(data, b"hello from s1");
     }
 
+    /// AVSS-style STO-481 regression: all parties starting together should be
+    /// able to fully mesh without exposing stale duplicate-dial handles to the
+    /// caller.
+    ///
+    /// This covers the runtime pattern used by AVSS: every party registers every
+    /// other party, all parties dial concurrently, sorted party IDs are assigned
+    /// after connection setup, and callers use the resulting connections for
+    /// protocol messages.
+    #[tokio::test]
+    async fn test_sto_481_avss_style_four_party_simultaneous_full_mesh() {
+        ensure_crypto_provider();
+
+        let n = 4usize;
+        let mut managers = Vec::with_capacity(n);
+        for node_id in 0..n {
+            let mut manager = QuicNetworkManager::with_node_id(node_id);
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            manager.listen(addr).await.expect("listen failed");
+            managers.push(manager);
+        }
+
+        let bound_addresses: Vec<SocketAddr> = managers
+            .iter()
+            .map(|manager| manager.endpoint.as_ref().unwrap().local_addr().unwrap())
+            .collect();
+        let derived_ids: Vec<PartyId> = managers
+            .iter()
+            .map(QuicNetworkManager::local_derived_id)
+            .collect();
+
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    managers[i].add_node_with_party_id(derived_ids[j], bound_addresses[j]);
+                }
+            }
+        }
+
+        let mut accept_handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut acceptor = managers[i].clone();
+            accept_handles.push(tokio::spawn(async move {
+                let mut accepted = Vec::new();
+                for _ in 0..(n - 1) {
+                    let conn = tokio::time::timeout(Duration::from_secs(5), acceptor.accept())
+                        .await
+                        .map_err(|_| format!("node {} timed out waiting for accept", i))?
+                        .map_err(|e| format!("node {} accept failed: {}", i, e))?;
+                    accepted.push(conn);
+                }
+                Ok::<_, String>((i, accepted))
+            }));
+        }
+
+        let mut connect_handles = Vec::with_capacity(n * (n - 1));
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let mut dialer = managers[i].clone();
+                let peer_addr = bound_addresses[j];
+                connect_handles.push(tokio::spawn(async move {
+                    let conn = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        dialer.connect_as_server(peer_addr),
+                    )
+                    .await
+                    .map_err(|_| format!("node {} -> node {} connect timed out", i, j))?
+                    .map_err(|e| format!("node {} -> node {} connect failed: {}", i, j, e))?;
+                    Ok::<_, String>((i, j, conn))
+                }));
+            }
+        }
+
+        let mut returned_connections = Vec::with_capacity(n * (n - 1));
+        for handle in connect_handles {
+            match handle.await.expect("connect task panicked") {
+                Ok(conn) => returned_connections.push(conn),
+                Err(e) => panic!("connect_as_server failed during AVSS-style full mesh: {}", e),
+            }
+        }
+
+        for handle in accept_handles {
+            match handle.await.expect("accept task panicked") {
+                Ok((_node_id, _accepted)) => {}
+                Err(e) => panic!("accept failed during AVSS-style full mesh: {}", e),
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for (from, to, conn) in &returned_connections {
+            assert!(
+                conn.is_connected().await,
+                "connect_as_server returned a stale or closed tie-breaker handle for node {} -> node {}",
+                from,
+                to
+            );
+        }
+
+        for manager in &managers {
+            manager.assign_party_ids();
+        }
+
+        let local_party_ids: Vec<PartyId> = managers
+            .iter()
+            .map(|manager| {
+                manager
+                    .compute_local_party_id()
+                    .expect("local party ID should be computable after listen")
+            })
+            .collect();
+
+        let mut party_connections: Vec<
+            std::collections::HashMap<PartyId, Arc<dyn PeerConnection>>,
+        > = Vec::with_capacity(n);
+        for (idx, manager) in managers.iter().enumerate() {
+            let local_party_id = local_party_ids[idx];
+            let mut by_party = std::collections::HashMap::new();
+            for (_derived_id, conn) in manager.get_all_server_connections() {
+                if conn.remote_party_id() == Some(local_party_id) {
+                    continue;
+                }
+                if let Some(remote_party_id) = conn.remote_party_id() {
+                    by_party.insert(remote_party_id, conn);
+                }
+            }
+
+            for (peer_idx, peer_party_id) in local_party_ids.iter().enumerate() {
+                if peer_idx == idx {
+                    continue;
+                }
+                assert!(
+                    by_party.contains_key(peer_party_id),
+                    "node {} is missing a usable final connection to node {} party_id {}",
+                    idx,
+                    peer_idx,
+                    peer_party_id
+                );
+            }
+            party_connections.push(by_party);
+        }
+
+        for from in 0..n {
+            for to in 0..n {
+                if from == to {
+                    continue;
+                }
+
+                let payload = format!("avss-full-mesh:{}->{}", from, to).into_bytes();
+                party_connections[from]
+                    .get(&local_party_ids[to])
+                    .expect("sender should have final connection")
+                    .send(&payload)
+                    .await
+                    .expect("send over final full-mesh connection failed");
+
+                let received = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    party_connections[to]
+                        .get(&local_party_ids[from])
+                        .expect("receiver should have final connection")
+                        .receive(),
+                )
+                .await
+                .expect("receive over final full-mesh connection timed out")
+                .expect("receive over final full-mesh connection failed");
+
+                assert_eq!(received, payload);
+            }
+        }
+    }
+
     // ========================================================================
     // STO-485 Regression: accept_bi / recv_stream_sync must time out
     // ========================================================================

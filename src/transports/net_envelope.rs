@@ -145,12 +145,16 @@ pub enum NetEnvelope {
         node_keys: Vec<Vec<u8>>,
     },
 
-    /// Node-to-node: BLAKE3 digest of sorted client public key list.
+    /// Node-to-node: digests for sorted client and node public key lists.
     ClientListDigest {
-        /// 32-byte BLAKE3 digest
+        /// 32-byte BLAKE3 digest of sorted client keys
         digest: Vec<u8>,
-        /// Number of clients included in the digest
+        /// Number of clients included in the client digest
         client_count: usize,
+        /// 32-byte BLAKE3 digest of sorted node keys
+        node_digest: Vec<u8>,
+        /// Number of nodes included in the node digest
+        node_count: usize,
     },
 
     /// Node-to-node: full sorted client key list (diagnostic fallback).
@@ -409,16 +413,22 @@ mod tests {
         let envelope = NetEnvelope::ClientListDigest {
             digest: digest.clone(),
             client_count: 5,
+            node_digest: vec![0xCD; 32],
+            node_count: 3,
         };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
         if let NetEnvelope::ClientListDigest {
             digest: d,
             client_count,
+            node_digest,
+            node_count,
         } = deserialized
         {
             assert_eq!(d, digest);
             assert_eq!(client_count, 5);
+            assert_eq!(node_digest, vec![0xCD; 32]);
+            assert_eq!(node_count, 3);
         } else {
             panic!("expected ClientListDigest variant");
         }
@@ -673,6 +683,8 @@ mod tests {
             NetEnvelope::ClientListDigest {
                 digest: vec![0xAB; 32],
                 client_count: 2,
+                node_digest: vec![0xBC; 32],
+                node_count: 2,
             },
             NetEnvelope::ClientListFull {
                 client_keys: vec![vec![1, 2]],

@@ -1285,11 +1285,14 @@ impl QuicNetworkManager {
 
     /// Removes dead connections from both server and client connection maps
     pub async fn cleanup_dead_connections(&self) {
-        let mut to_remove = Vec::new();
+        let server_entries: Vec<(PartyId, Arc<dyn PeerConnection>)> = self
+            .server_connections
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect();
 
-        for entry in self.server_connections.iter() {
-            let party_id = *entry.key();
-            let conn = entry.value();
+        let mut to_remove = Vec::new();
+        for (party_id, conn) in server_entries {
             if !conn.is_connected().await {
                 to_remove.push(party_id);
             }
@@ -1299,11 +1302,14 @@ impl QuicNetworkManager {
             self.server_connections.remove(&party_id);
         }
 
-        let mut clients_to_remove = Vec::new();
+        let client_entries: Vec<(ClientId, Arc<dyn PeerConnection>)> = self
+            .client_connections
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect();
 
-        for entry in self.client_connections.iter() {
-            let client_id = *entry.key();
-            let conn = entry.value();
+        let mut clients_to_remove = Vec::new();
+        for (client_id, conn) in client_entries {
             if !conn.is_connected().await {
                 clients_to_remove.push(client_id);
             }
@@ -1317,8 +1323,12 @@ impl QuicNetworkManager {
 
     /// Checks connection health for a specific party
     pub async fn is_party_connected(&self, party_id: PartyId) -> bool {
-        if let Some(conn_ref) = self.server_connections.get(&party_id) {
-            conn_ref.value().is_connected().await
+        if let Some(connection) = self
+            .server_connections
+            .get(&party_id)
+            .map(|entry| Arc::clone(entry.value()))
+        {
+            connection.is_connected().await
         } else {
             false
         }
@@ -3008,8 +3018,11 @@ impl Network for QuicNetworkManager {
 
         // If no parties found, try legacy loopback as fallback
         if party_count == 0 {
-            if let Some(connection_ref) = self.server_connections.get(&self.node_id) {
-                let connection = connection_ref.value();
+            if let Some(connection) = self
+                .server_connections
+                .get(&self.node_id)
+                .map(|entry| Arc::clone(entry.value()))
+            {
                 if connection.send(message).await.is_ok() {
                     debug!("Successfully broadcasted message to self (loopback fallback)");
                     total_bytes += message.len();
@@ -3052,9 +3065,7 @@ impl Network for QuicNetworkManager {
     ) -> Result<usize, NetworkError> {
         self.await_consensus_gate().await?;
 
-        if let Some(conn_ref) = self.client_connections.get(&client) {
-            let connection = conn_ref.value();
-
+        if let Some(connection) = self.get_client_connection(client) {
             // Send directly without pre-checking is_connected() to avoid
             // check-then-act race (STO-478).
             match connection.send(message).await {

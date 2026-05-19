@@ -2492,6 +2492,14 @@ impl QuicNetworkManager {
         blake3::hash(&serialized).as_bytes().to_vec()
     }
 
+    /// Computes BLAKE3 digest of the sorted node public key list.
+    pub fn compute_node_list_digest(&self) -> Vec<u8> {
+        let sorted = self.get_sorted_public_keys();
+        let raw: Vec<Vec<u8>> = sorted.iter().map(|k| k.0.clone()).collect();
+        let serialized = bincode::serialize(&raw).expect("serialization should not fail");
+        blake3::hash(&serialized).as_bytes().to_vec()
+    }
+
     /// Checks if consensus should start and spawns the consensus task if so.
     /// Called from accept() and connect_as_server() after storing connections.
     fn maybe_start_consensus(&self) {
@@ -2564,6 +2572,7 @@ impl QuicNetworkManager {
             ))? as PartyId;
         let client_keys = self.get_sorted_client_keys();
         let local_digest = self.compute_client_list_digest();
+        let local_node_digest = self.compute_node_list_digest();
 
         debug!(
             "Executing consensus: party_id={}, party_count={}, client_count={}",
@@ -2576,6 +2585,8 @@ impl QuicNetworkManager {
         let digest_msg = NetEnvelope::ClientListDigest {
             digest: local_digest.clone(),
             client_count: client_keys.len(),
+            node_digest: local_node_digest.clone(),
+            node_count: node_keys.len(),
         };
         let digest_bytes = digest_msg.serialize();
         for pid in 0..party_count {
@@ -2600,15 +2611,20 @@ impl QuicNetworkManager {
                 tokio::spawn(async move {
                     match conn.receive().await {
                         Ok(data) => match NetEnvelope::try_deserialize(&data) {
-                            Ok(NetEnvelope::ClientListDigest { digest, .. }) => {
-                                let _ = tx.send((pid, digest)).await;
+                            Ok(NetEnvelope::ClientListDigest {
+                                digest,
+                                node_digest,
+                                node_count,
+                                ..
+                            }) => {
+                                let _ = tx.send((pid, digest, node_digest, node_count)).await;
                             }
                             _ => {
-                                let _ = tx.send((pid, vec![])).await;
+                                let _ = tx.send((pid, vec![], vec![], 0)).await;
                             }
                         },
                         Err(_) => {
-                            let _ = tx.send((pid, vec![])).await;
+                            let _ = tx.send((pid, vec![], vec![], 0)).await;
                         }
                     }
                 });
@@ -2621,8 +2637,8 @@ impl QuicNetworkManager {
         while received.len() < party_count - 1 {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some((pid, digest))) => {
-                    received.insert(pid, digest);
+                Ok(Some((pid, digest, node_digest, node_count))) => {
+                    received.insert(pid, (digest, node_digest, node_count));
                 }
                 _ => {
                     return Err(ConsensusError::ConsensusTimeout {
@@ -2633,9 +2649,15 @@ impl QuicNetworkManager {
         }
 
         // 4. Verify all digests match
-        for (pid, digest) in &received {
+        for (pid, (digest, node_digest, node_count)) in &received {
             if *digest != local_digest {
                 return Err(ConsensusError::ClientListDigestMismatch { party_id: *pid });
+            }
+            if *node_count != node_keys.len() || *node_digest != local_node_digest {
+                return Err(ConsensusError::Aborted(format!(
+                    "Node list mismatch from party {}",
+                    pid
+                )));
             }
         }
 

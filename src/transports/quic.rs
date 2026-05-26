@@ -159,6 +159,9 @@ impl Debug for dyn PeerConnection {
     }
 }
 
+type SharedPeerConnectionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>>;
+
 // ============================================================================
 // NETWORK MANAGER TRAIT
 // ============================================================================
@@ -167,11 +170,9 @@ pub trait NetworkManager: Send + Sync {
     fn connect<'a>(
         &'a mut self,
         address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>>;
+    ) -> SharedPeerConnectionFuture<'a>;
 
-    fn accept<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>>;
+    fn accept<'a>(&'a mut self) -> SharedPeerConnectionFuture<'a>;
 
     fn listen<'a>(
         &'a mut self,
@@ -438,7 +439,7 @@ impl PeerConnection for QuicPeerConnection {
             }
 
             let mut send_guard = self.send_stream.lock().await;
-            match send_framed_message(&mut *send_guard, data).await {
+            match send_framed_message(&mut send_guard, data).await {
                 Ok(()) => Ok(()),
                 Err(ConnectionError::ConnectionLost(msg)) => {
                     self.update_state(ConnectionState::Disconnected).await;
@@ -467,7 +468,7 @@ impl PeerConnection for QuicPeerConnection {
             }
 
             let mut recv_guard = self.recv_stream.lock().await;
-            match recv_framed_message(&mut *recv_guard).await {
+            match recv_framed_message(&mut recv_guard).await {
                 Ok(data) => Ok(data),
                 Err(ConnectionError::ConnectionLost(msg)) => {
                     self.update_state(ConnectionState::Disconnected).await;
@@ -750,7 +751,7 @@ fn extract_alpn_role(connection: &Connection) -> Result<ClientType, String> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .map_err(|_| "Failed to downcast handshake data to rustls type".to_string())?;
 
-    match handshake.protocol.as_ref().map(|v| v.as_slice()) {
+    match handshake.protocol.as_deref() {
         Some(proto) if proto == ALPN_CLIENT_PROTOCOL => {
             trace!("ALPN negotiated: client-protocol");
             Ok(ClientType::Client)
@@ -2492,6 +2493,14 @@ impl QuicNetworkManager {
         blake3::hash(&serialized).as_bytes().to_vec()
     }
 
+    /// Computes BLAKE3 digest of the sorted node public key list.
+    pub fn compute_node_list_digest(&self) -> Vec<u8> {
+        let sorted = self.get_sorted_public_keys();
+        let raw: Vec<Vec<u8>> = sorted.iter().map(|k| k.0.clone()).collect();
+        let serialized = bincode::serialize(&raw).expect("serialization should not fail");
+        blake3::hash(&serialized).as_bytes().to_vec()
+    }
+
     /// Checks if consensus should start and spawns the consensus task if so.
     /// Called from accept() and connect_as_server() after storing connections.
     fn maybe_start_consensus(&self) {
@@ -2563,7 +2572,25 @@ impl QuicNetworkManager {
                 "Local key not found in sorted keys".into(),
             ))? as PartyId;
         let client_keys = self.get_sorted_client_keys();
+        if let Some(expected_parties) = self.network_config.expected_parties {
+            if party_count != expected_parties {
+                return Err(ConsensusError::Aborted(format!(
+                    "Expected {} parties, found {}",
+                    expected_parties, party_count
+                )));
+            }
+        }
+        if let Some(expected_clients) = self.network_config.expected_clients {
+            if client_keys.len() != expected_clients {
+                return Err(ConsensusError::Aborted(format!(
+                    "Expected {} clients, found {}",
+                    expected_clients,
+                    client_keys.len()
+                )));
+            }
+        }
         let local_digest = self.compute_client_list_digest();
+        let local_node_digest = self.compute_node_list_digest();
 
         debug!(
             "Executing consensus: party_id={}, party_count={}, client_count={}",
@@ -2576,16 +2603,38 @@ impl QuicNetworkManager {
         let digest_msg = NetEnvelope::ClientListDigest {
             digest: local_digest.clone(),
             client_count: client_keys.len(),
+            node_digest: local_node_digest.clone(),
+            node_count: node_keys.len(),
         };
         let digest_bytes = digest_msg.serialize();
+        let mut send_tasks = tokio::task::JoinSet::new();
         for pid in 0..party_count {
             if pid == local_party_id {
                 continue;
             }
             if let Some(conn) = self.get_connection_by_party_id(pid) {
-                conn.send(&digest_bytes).await.map_err(|e| {
-                    ConsensusError::Aborted(format!("Send digest to party {}: {}", pid, e))
-                })?;
+                let bytes = digest_bytes.clone();
+                send_tasks.spawn(async move {
+                    conn.send(&bytes).await.map_err(|e| (pid, e))?;
+                    Ok::<PartyId, (PartyId, String)>(pid)
+                });
+            }
+        }
+        while let Some(result) = send_tasks.join_next().await {
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err((pid, e))) => {
+                    return Err(ConsensusError::Aborted(format!(
+                        "Send digest to party {}: {}",
+                        pid, e
+                    )));
+                }
+                Err(e) => {
+                    return Err(ConsensusError::Aborted(format!(
+                        "Send digest task failed: {}",
+                        e
+                    )));
+                }
             }
         }
 
@@ -2600,15 +2649,22 @@ impl QuicNetworkManager {
                 tokio::spawn(async move {
                     match conn.receive().await {
                         Ok(data) => match NetEnvelope::try_deserialize(&data) {
-                            Ok(NetEnvelope::ClientListDigest { digest, .. }) => {
-                                let _ = tx.send((pid, digest)).await;
+                            Ok(NetEnvelope::ClientListDigest {
+                                digest,
+                                client_count,
+                                node_digest,
+                                node_count,
+                            }) => {
+                                let _ = tx
+                                    .send((pid, digest, client_count, node_digest, node_count))
+                                    .await;
                             }
                             _ => {
-                                let _ = tx.send((pid, vec![])).await;
+                                let _ = tx.send((pid, vec![], 0, vec![], 0)).await;
                             }
                         },
                         Err(_) => {
-                            let _ = tx.send((pid, vec![])).await;
+                            let _ = tx.send((pid, vec![], 0, vec![], 0)).await;
                         }
                     }
                 });
@@ -2621,8 +2677,8 @@ impl QuicNetworkManager {
         while received.len() < party_count - 1 {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some((pid, digest))) => {
-                    received.insert(pid, digest);
+                Ok(Some((pid, digest, client_count, node_digest, node_count))) => {
+                    received.insert(pid, (digest, client_count, node_digest, node_count));
                 }
                 _ => {
                     return Err(ConsensusError::ConsensusTimeout {
@@ -2633,9 +2689,15 @@ impl QuicNetworkManager {
         }
 
         // 4. Verify all digests match
-        for (pid, digest) in &received {
-            if *digest != local_digest {
+        for (pid, (digest, client_count, node_digest, node_count)) in &received {
+            if *client_count != client_keys.len() || *digest != local_digest {
                 return Err(ConsensusError::ClientListDigestMismatch { party_id: *pid });
+            }
+            if *node_count != node_keys.len() || *node_digest != local_node_digest {
+                return Err(ConsensusError::Aborted(format!(
+                    "Node list mismatch from party {}",
+                    pid
+                )));
             }
         }
 
@@ -2731,13 +2793,11 @@ impl NetworkManager for QuicNetworkManager {
     fn connect<'a>(
         &'a mut self,
         address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
+    ) -> SharedPeerConnectionFuture<'a> {
         Box::pin(async move { self.connect_as_server(address).await })
     }
 
-    fn accept<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
+    fn accept<'a>(&'a mut self) -> SharedPeerConnectionFuture<'a> {
         Box::pin(async move {
             let endpoint = self
                 .endpoint
@@ -3239,13 +3299,82 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 mod tests {
     use super::*;
     use crate::transports::net_envelope::NetEnvelope;
-    use rustls::client::danger::ServerCertVerifier;
     use rustls::server::danger::ClientCertVerifier;
 
     // Helper function to ensure crypto provider is installed
     fn ensure_crypto_provider() {
         // Install the default crypto provider (ring) if not already installed
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[derive(Clone)]
+    struct StaticPeerConnection {
+        response: Arc<Vec<u8>>,
+        sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        remote_addr: SocketAddr,
+        remote_party_id: Arc<std::sync::Mutex<Option<PartyId>>>,
+    }
+
+    impl StaticPeerConnection {
+        fn new(response: Vec<u8>) -> Self {
+            Self {
+                response: Arc::new(response),
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                remote_addr: "127.0.0.1:0".parse().unwrap(),
+                remote_party_id: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+    }
+
+    impl PeerConnection for StaticPeerConnection {
+        fn send<'a>(
+            &'a self,
+            data: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.sent
+                    .lock()
+                    .map_err(|_| "sent lock poisoned".to_string())?
+                    .push(data.to_vec());
+                Ok(())
+            })
+        }
+
+        fn receive<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+            Box::pin(async move { Ok((*self.response).clone()) })
+        }
+
+        fn remote_address(&self) -> SocketAddr {
+            self.remote_addr
+        }
+
+        fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn state<'a>(&'a self) -> Pin<Box<dyn Future<Output = ConnectionState> + Send + 'a>> {
+            Box::pin(async move { ConnectionState::Connected })
+        }
+
+        fn is_connected<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move { true })
+        }
+
+        fn get_connection_role(&self) -> ClientType {
+            ClientType::Server
+        }
+
+        fn remote_party_id(&self) -> Option<PartyId> {
+            self.remote_party_id.lock().ok().and_then(|id| *id)
+        }
+
+        fn set_remote_party_id(&self, party_id: PartyId) {
+            if let Ok(mut id) = self.remote_party_id.lock() {
+                *id = Some(party_id);
+            }
+        }
     }
 
     // ========================================================================
@@ -3411,8 +3540,6 @@ mod tests {
         manager
             .ensure_local_certificate()
             .expect("Failed to ensure certificate");
-
-        let local_pk = manager.local_public_key.clone().unwrap();
 
         // Add peer public keys that are lexicographically before and after local
         let pk_before = NodePublicKey(vec![0x00]); // Likely before any real key
@@ -4097,8 +4224,6 @@ mod tests {
         let mut manager = QuicNetworkManager::new();
         manager.ensure_local_certificate().unwrap();
 
-        let local_pk = manager.local_public_key.clone().unwrap();
-
         // Add peers with known public keys
         let peer_pk1 = NodePublicKey(vec![0x00, 0x00, 0x01]);
         let peer_pk2 = NodePublicKey(vec![0xFF, 0xFF, 0xFF]);
@@ -4405,10 +4530,12 @@ mod tests {
         // Initial Vec::with_capacity is capped at RECV_CHUNK_SIZE even for
         // larger declared payloads — memory only grows as data arrives.
         assert_eq!(RECV_CHUNK_SIZE, 64 * 1024);
-        assert!(
-            RECV_CHUNK_SIZE < MAX_MESSAGE_SIZE,
-            "Chunk size must be smaller than max message size"
-        );
+        const {
+            assert!(
+                RECV_CHUNK_SIZE < MAX_MESSAGE_SIZE,
+                "Chunk size must be smaller than max message size"
+            );
+        }
     }
 
     #[test]
@@ -5397,8 +5524,64 @@ mod tests {
         // Verify the snapshot-derived party_id matches compute_local_party_id
         assert_eq!(
             local_party_id,
-            manager.compute_local_party_id().map(|id| id),
+            manager.compute_local_party_id(),
             "snapshot-derived party_id must match compute_local_party_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_consensus_rejects_unexpected_client_count() {
+        let mut manager = QuicNetworkManager::with_config(QuicNetworkConfig {
+            expected_parties: Some(1),
+            expected_clients: Some(0),
+            ..QuicNetworkConfig::default()
+        });
+        manager.local_public_key = Some(NodePublicKey(vec![1]));
+        manager
+            .client_public_keys
+            .insert(1, NodePublicKey(vec![10, 20, 30]));
+
+        let result = manager.execute_consensus(Duration::from_millis(100)).await;
+
+        assert!(matches!(
+            result,
+            Err(ConsensusError::Aborted(message))
+                if message == "Expected 0 clients, found 1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_execute_consensus_rejects_peer_client_count_mismatch() {
+        let mut manager = QuicNetworkManager::with_config(QuicNetworkConfig {
+            expected_parties: Some(2),
+            expected_clients: Some(1),
+            ..QuicNetworkConfig::default()
+        });
+        let local_pk = NodePublicKey(vec![1]);
+        let peer_pk = NodePublicKey(vec![2]);
+        manager.local_public_key = Some(local_pk);
+        manager.peer_public_keys.insert(peer_pk.derive_id(), peer_pk.clone());
+        manager
+            .client_public_keys
+            .insert(1, NodePublicKey(vec![10, 20, 30]));
+
+        let peer_digest = NetEnvelope::ClientListDigest {
+            digest: manager.compute_client_list_digest(),
+            client_count: 2,
+            node_digest: manager.compute_node_list_digest(),
+            node_count: 2,
+        }
+        .serialize();
+        let peer_conn = StaticPeerConnection::new(peer_digest);
+        manager
+            .server_connections
+            .insert(peer_pk.derive_id(), Arc::new(peer_conn));
+
+        let result = manager.execute_consensus(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            result,
+            Err(ConsensusError::ClientListDigestMismatch { party_id: 1 })
         );
     }
 }

@@ -217,6 +217,9 @@ pub trait PeerConnection: Send + Sync {
     fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
+pub type BoxPeerConnectionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+
 /// Manages network connections.
 ///
 /// This trait defines the interface for managing network connections.
@@ -260,7 +263,7 @@ pub trait NetworkManager: Send + Sync {
     fn connect<'a>(
         &'a mut self,
         address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+    ) -> BoxPeerConnectionFuture<'a>;
 
     /// Accepts an incoming connection.
     ///
@@ -277,9 +280,7 @@ pub trait NetworkManager: Send + Sync {
     /// - The endpoint is closed
     /// - TLS handshake with the connecting peer fails
     /// - Stream initialization fails
-    fn accept<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+    fn accept<'a>(&'a mut self) -> BoxPeerConnectionFuture<'a>;
 
     /// Listens for incoming connections.
     ///

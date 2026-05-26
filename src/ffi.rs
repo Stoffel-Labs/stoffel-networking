@@ -20,6 +20,8 @@
 //! - Callbacks may be invoked from any thread in the tokio runtime thread pool
 //! - Thread-local error storage is used for error messages
 
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::net::SocketAddr;
@@ -29,8 +31,6 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
-
-use rustls::crypto::CryptoProvider;
 
 use crate::network_utils::{Network, Node, PartyId, VerifiedOrdering};
 use crate::transports::quic::{ConnectionState, PeerConnection, QuicNetworkManager, QuicNode};

@@ -1,0 +1,65 @@
+# Direct Container-to-Container Test (No NAT)
+# Tests if QUIC works between containers on the same network
+
+networks:
+  shared:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.0.0/24
+
+services:
+  signaling:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.signaling
+    networks:
+      shared:
+        ipv4_address: 10.100.0.10
+    environment:
+      - RUST_LOG=info
+      - BIND_ADDR=0.0.0.0:9000
+
+  # Peer A - direct on shared network (no NAT)
+  peer_a:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.peer
+    networks:
+      shared:
+        ipv4_address: 10.100.0.20
+    environment:
+      - RUST_LOG=info
+      - PEER_ID=1
+      - PEER_NAME=peer_a
+      - SIGNALING_SERVER=10.100.0.10:9000
+      - LOCAL_ADDR=0.0.0.0:5001
+    depends_on:
+      - signaling
+    command: >
+      sh -c "
+        sleep 2 &&
+        /app/nat_test_peer
+      "
+
+  # Peer B - direct on shared network (no NAT)
+  peer_b:
+    build:
+      context: ../..
+      dockerfile: tests/nat_simulation/Dockerfile.peer
+    networks:
+      shared:
+        ipv4_address: 10.100.0.21
+    environment:
+      - RUST_LOG=info
+      - PEER_ID=2
+      - PEER_NAME=peer_b
+      - SIGNALING_SERVER=10.100.0.10:9000
+      - LOCAL_ADDR=0.0.0.0:5002
+    depends_on:
+      - signaling
+    command: >
+      sh -c "
+        sleep 4 &&
+        /app/nat_test_peer
+      "

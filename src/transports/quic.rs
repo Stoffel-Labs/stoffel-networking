@@ -159,6 +159,9 @@ impl Debug for dyn PeerConnection {
     }
 }
 
+type SharedPeerConnectionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>>;
+
 // ============================================================================
 // NETWORK MANAGER TRAIT
 // ============================================================================
@@ -167,11 +170,9 @@ pub trait NetworkManager: Send + Sync {
     fn connect<'a>(
         &'a mut self,
         address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>>;
+    ) -> SharedPeerConnectionFuture<'a>;
 
-    fn accept<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>>;
+    fn accept<'a>(&'a mut self) -> SharedPeerConnectionFuture<'a>;
 
     fn listen<'a>(
         &'a mut self,
@@ -438,7 +439,7 @@ impl PeerConnection for QuicPeerConnection {
             }
 
             let mut send_guard = self.send_stream.lock().await;
-            match send_framed_message(&mut *send_guard, data).await {
+            match send_framed_message(&mut send_guard, data).await {
                 Ok(()) => Ok(()),
                 Err(ConnectionError::ConnectionLost(msg)) => {
                     self.update_state(ConnectionState::Disconnected).await;
@@ -467,7 +468,7 @@ impl PeerConnection for QuicPeerConnection {
             }
 
             let mut recv_guard = self.recv_stream.lock().await;
-            match recv_framed_message(&mut *recv_guard).await {
+            match recv_framed_message(&mut recv_guard).await {
                 Ok(data) => Ok(data),
                 Err(ConnectionError::ConnectionLost(msg)) => {
                     self.update_state(ConnectionState::Disconnected).await;
@@ -750,7 +751,7 @@ fn extract_alpn_role(connection: &Connection) -> Result<ClientType, String> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .map_err(|_| "Failed to downcast handshake data to rustls type".to_string())?;
 
-    match handshake.protocol.as_ref().map(|v| v.as_slice()) {
+    match handshake.protocol.as_deref() {
         Some(proto) if proto == ALPN_CLIENT_PROTOCOL => {
             trace!("ALPN negotiated: client-protocol");
             Ok(ClientType::Client)
@@ -2792,13 +2793,11 @@ impl NetworkManager for QuicNetworkManager {
     fn connect<'a>(
         &'a mut self,
         address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
+    ) -> SharedPeerConnectionFuture<'a> {
         Box::pin(async move { self.connect_as_server(address).await })
     }
 
-    fn accept<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn PeerConnection>, String>> + Send + 'a>> {
+    fn accept<'a>(&'a mut self) -> SharedPeerConnectionFuture<'a> {
         Box::pin(async move {
             let endpoint = self
                 .endpoint
@@ -3300,7 +3299,6 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 mod tests {
     use super::*;
     use crate::transports::net_envelope::NetEnvelope;
-    use rustls::client::danger::ServerCertVerifier;
     use rustls::server::danger::ClientCertVerifier;
 
     // Helper function to ensure crypto provider is installed
@@ -3542,8 +3540,6 @@ mod tests {
         manager
             .ensure_local_certificate()
             .expect("Failed to ensure certificate");
-
-        let local_pk = manager.local_public_key.clone().unwrap();
 
         // Add peer public keys that are lexicographically before and after local
         let pk_before = NodePublicKey(vec![0x00]); // Likely before any real key
@@ -4228,8 +4224,6 @@ mod tests {
         let mut manager = QuicNetworkManager::new();
         manager.ensure_local_certificate().unwrap();
 
-        let local_pk = manager.local_public_key.clone().unwrap();
-
         // Add peers with known public keys
         let peer_pk1 = NodePublicKey(vec![0x00, 0x00, 0x01]);
         let peer_pk2 = NodePublicKey(vec![0xFF, 0xFF, 0xFF]);
@@ -4536,10 +4530,12 @@ mod tests {
         // Initial Vec::with_capacity is capped at RECV_CHUNK_SIZE even for
         // larger declared payloads — memory only grows as data arrives.
         assert_eq!(RECV_CHUNK_SIZE, 64 * 1024);
-        assert!(
-            RECV_CHUNK_SIZE < MAX_MESSAGE_SIZE,
-            "Chunk size must be smaller than max message size"
-        );
+        const {
+            assert!(
+                RECV_CHUNK_SIZE < MAX_MESSAGE_SIZE,
+                "Chunk size must be smaller than max message size"
+            );
+        }
     }
 
     #[test]
@@ -5528,7 +5524,7 @@ mod tests {
         // Verify the snapshot-derived party_id matches compute_local_party_id
         assert_eq!(
             local_party_id,
-            manager.compute_local_party_id().map(|id| id),
+            manager.compute_local_party_id(),
             "snapshot-derived party_id must match compute_local_party_id"
         );
     }

@@ -7,7 +7,6 @@ use crate::network_utils::PartyId;
 use crate::transports::ice::{CandidatePair, CandidatePairState, IceCandidate, LocalCandidates};
 use crate::transports::net_envelope::NetEnvelope;
 use crate::transports::stun::StunClient;
-use dashmap::DashMap;
 use quinn::Endpoint;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -235,14 +234,6 @@ pub struct CheckResult {
     pub peer_reflexive: Option<IceCandidate>,
 }
 
-/// Pending connectivity check tracking
-#[derive(Debug)]
-struct PendingCheck {
-    pair_index: usize,
-    sent_at: Instant,
-    retries: u32,
-}
-
 /// ICE Agent errors.
 ///
 /// These errors are returned by [`IceAgent`] methods when ICE operations fail.
@@ -314,8 +305,6 @@ pub struct IceAgent {
     nominated_pair: Option<usize>,
     /// Transaction ID counter
     transaction_counter: u64,
-    /// Pending transactions
-    pending_transactions: DashMap<u64, PendingCheck>,
     /// Start time for timeout tracking
     start_time: Option<Instant>,
     /// STUN client for gathering
@@ -399,7 +388,6 @@ impl IceAgent {
             check_list: Vec::new(),
             nominated_pair: None,
             transaction_counter: 0,
-            pending_transactions: DashMap::new(),
             start_time: None,
             stun_client: StunClient::new(stun_servers),
         })
@@ -428,7 +416,6 @@ impl IceAgent {
             check_list: Vec::new(),
             nominated_pair: None,
             transaction_counter: 0,
-            pending_transactions: DashMap::new(),
             start_time: None,
             stun_client: StunClient::new(stun_servers),
         }
@@ -483,7 +470,7 @@ impl IceAgent {
     ///
     /// This makes it easy to verify that a STUN response corresponds to our request
     /// by checking if the upper bits match our party ID.
-    fn next_transaction_id(&mut self) -> u64 {
+    pub fn next_transaction_id(&mut self) -> u64 {
         self.transaction_counter += 1;
         ((self.local_party_id as u64) << 32) | (self.transaction_counter & 0xFFFFFFFF)
     }
@@ -985,9 +972,9 @@ impl HolePunchCoordinator {
         role: IceRole,
         config: HolePunchConfig,
     ) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         Self {
-            transaction_id: rng.r#gen(),
+            transaction_id: rng.random(),
             local_addr,
             remote_addr,
             role,
@@ -1075,7 +1062,7 @@ impl HolePunchCoordinator {
             .as_millis() as u64;
 
         let delay_ms = self.config.initial_delay.as_millis() as u64
-            + rand::thread_rng().gen_range(0..self.config.jitter_range.as_millis() as u64);
+            + rand::rng().random_range(0..self.config.jitter_range.as_millis() as u64);
 
         if self.role == IceRole::Controlling {
             // Send punch request with timing info
@@ -1087,7 +1074,7 @@ impl HolePunchCoordinator {
 
             signaling_send(request)
                 .await
-                .map_err(|e| HolePunchError::SignalingError(e))?;
+                .map_err(HolePunchError::SignalingError)?;
 
             // Wait for ack
             let ack_timeout = Duration::from_secs(5);
@@ -1133,7 +1120,7 @@ impl HolePunchCoordinator {
                 };
                 signaling_send(ack)
                     .await
-                    .map_err(|e| HolePunchError::SignalingError(e))?;
+                    .map_err(HolePunchError::SignalingError)?;
             }
         }
 
@@ -1189,9 +1176,8 @@ impl HolePunchCoordinator {
         })
         .await;
 
-        match accept_result {
-            Ok(Ok(conn)) => return Ok(conn),
-            _ => {}
+        if let Ok(Ok(conn)) = accept_result {
+            return Ok(conn);
         }
 
         // If accept didn't work, try connecting
@@ -2199,7 +2185,7 @@ mod integration_tests {
         let mut agent = IceAgent::new_unchecked(config, 1);
 
         let public_addr: SocketAddr = "203.0.113.5:5000".parse().unwrap();
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let _socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Manually set local candidates to a public IP to simulate production
         agent.local_candidates = LocalCandidates {

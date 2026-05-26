@@ -263,7 +263,7 @@ impl StunClient {
 
     /// Generates a random 12-byte transaction ID
     fn generate_transaction_id() -> [u8; 12] {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut id = [0u8; 12];
         rng.fill(&mut id);
         id
@@ -567,7 +567,7 @@ mod tests {
         BigEndian::write_u16(&mut attr[2..4], data.len() as u16);
         attr[4..].copy_from_slice(data);
         // Pad to 4-byte boundary if needed
-        while attr.len() % 4 != 0 {
+        while !attr.len().is_multiple_of(4) {
             attr.push(0);
         }
         attr

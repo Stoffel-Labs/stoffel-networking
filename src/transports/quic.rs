@@ -167,10 +167,7 @@ type SharedPeerConnectionFuture<'a> =
 // ============================================================================
 
 pub trait NetworkManager: Send + Sync {
-    fn connect<'a>(
-        &'a mut self,
-        address: SocketAddr,
-    ) -> SharedPeerConnectionFuture<'a>;
+    fn connect<'a>(&'a mut self, address: SocketAddr) -> SharedPeerConnectionFuture<'a>;
 
     fn accept<'a>(&'a mut self) -> SharedPeerConnectionFuture<'a>;
 
@@ -284,10 +281,7 @@ async fn recv_framed_message(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, Co
                             re
                         ))
                     } else {
-                        ConnectionError::ReceiveFailed(format!(
-                            "Failed to read payload: {}",
-                            re
-                        ))
+                        ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re))
                     }
                 }
             })?;
@@ -1123,6 +1117,28 @@ impl QuicNetworkManager {
         manager
     }
 
+    /// Install stable local certificate material before listen/connect.
+    ///
+    /// By default the manager generates an ephemeral self-signed certificate on
+    /// first use. MPC runtimes that persist program-side keys should call this
+    /// so the authenticated transport identity remains stable across runs.
+    pub fn set_local_certificate_der(
+        &mut self,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+    ) -> Result<(), String> {
+        if self.endpoint.is_some() {
+            return Err(
+                "cannot replace local certificate after endpoint initialization".to_string(),
+            );
+        }
+        let public_key = Self::extract_public_key_from_cert(&cert_der)?;
+        self.local_cert_der = Some(cert_der);
+        self.local_key_der = Some(key_der);
+        self.local_public_key = Some(public_key);
+        Ok(())
+    }
+
     /// Creates a network manager with the given configuration.
     ///
     /// # Panics
@@ -1167,12 +1183,12 @@ impl QuicNetworkManager {
         };
 
         // Gate starts as Pending if consensus is required, NotRequired otherwise
-        let initial_gate =
-            if config.expected_parties.is_some() || config.expected_clients.is_some() {
-                ConsensusGate::Pending
-            } else {
-                ConsensusGate::NotRequired
-            };
+        let initial_gate = if config.expected_parties.is_some() || config.expected_clients.is_some()
+        {
+            ConsensusGate::Pending
+        } else {
+            ConsensusGate::NotRequired
+        };
 
         let (consensus_gate_tx, consensus_gate_rx) = tokio::sync::watch::channel(initial_gate);
         let (client_connected_tx, _) = tokio::sync::broadcast::channel(64);
@@ -1271,16 +1287,31 @@ impl QuicNetworkManager {
 
     /// Gets all client connections (external clients connected to this server)
     pub fn get_all_client_connections(&self) -> Vec<(ClientId, Arc<dyn PeerConnection>)> {
-        self.client_connections
+        let sorted = self.get_sorted_client_keys();
+        if sorted.is_empty() {
+            return self
+                .client_connections
+                .iter()
+                .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+                .collect();
+        }
+
+        sorted
             .iter()
-            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .enumerate()
+            .filter_map(|(logical_id, key)| {
+                let transport_id = key.derive_id();
+                self.client_connections
+                    .get(&transport_id)
+                    .map(|entry| (logical_id, Arc::clone(entry.value())))
+            })
             .collect()
     }
 
     /// Gets a specific client connection by ID
     pub fn get_client_connection(&self, client_id: ClientId) -> Option<Arc<dyn PeerConnection>> {
-        self.client_connections
-            .get(&client_id)
+        self.resolve_client_transport_id(client_id)
+            .and_then(|transport_id| self.client_connections.get(&transport_id))
             .map(|entry| Arc::clone(entry.value()))
     }
 
@@ -1665,6 +1696,47 @@ impl QuicNetworkManager {
     /// Returns a reference to this node's public key
     pub fn get_public_key(&self) -> Option<&NodePublicKey> {
         self.local_public_key.as_ref()
+    }
+
+    /// Returns this node's DER-encoded SubjectPublicKeyInfo bytes.
+    pub fn local_public_key_bytes(&self) -> Option<Vec<u8>> {
+        self.local_public_key.as_ref().map(|pk| pk.0.clone())
+    }
+
+    /// Returns a connected peer's DER-encoded SubjectPublicKeyInfo bytes.
+    pub fn peer_public_key_bytes(&self, peer_id: PartyId) -> Option<Vec<u8>> {
+        self.peer_public_keys
+            .get(&peer_id)
+            .map(|entry| entry.value().0.clone())
+    }
+
+    /// Returns a connected client's DER-encoded SubjectPublicKeyInfo bytes.
+    pub fn client_public_key_bytes(&self, client_id: ClientId) -> Option<Vec<u8>> {
+        self.resolve_client_transport_id(client_id)
+            .and_then(|id| self.client_public_keys.get(&id))
+            .map(|entry| entry.value().0.clone())
+    }
+
+    fn resolve_client_transport_id(&self, client_id: ClientId) -> Option<ClientId> {
+        let sorted = self.get_sorted_client_keys();
+        if let Some(key) = sorted.get(client_id) {
+            let derived_id = key.derive_id();
+            if self.client_connections.contains_key(&derived_id) {
+                return Some(derived_id);
+            }
+        }
+
+        self.client_connections
+            .contains_key(&client_id)
+            .then_some(client_id)
+    }
+
+    /// Returns a connected client's DER-encoded SubjectPublicKeyInfo bytes by
+    /// TLS-derived transport ID without applying logical client-id mapping.
+    pub fn client_public_key_bytes_by_transport_id(&self, client_id: ClientId) -> Option<Vec<u8>> {
+        self.client_public_keys
+            .get(&client_id)
+            .map(|entry| entry.value().0.clone())
     }
 
     /// Returns the node_id (legacy ID, used as fallback)
@@ -2205,7 +2277,8 @@ impl QuicNetworkManager {
 
         // Extract peer's public key from TLS certificate
         let peer_public_key = Self::extract_peer_public_key(&connection).ok();
-        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), target_party_id)
+        if let Err(err) =
+            Self::verify_expected_p2p_identity(peer_public_key.as_ref(), target_party_id)
         {
             connection.close(0u32.into(), b"p2p identity mismatch");
             self.pending_ice_agents.remove(&target_party_id);
@@ -2352,7 +2425,8 @@ impl QuicNetworkManager {
 
         // Extract peer's public key from TLS certificate
         let peer_public_key = Self::extract_peer_public_key(&connection).ok();
-        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), from_party_id)
+        if let Err(err) =
+            Self::verify_expected_p2p_identity(peer_public_key.as_ref(), from_party_id)
         {
             connection.close(0u32.into(), b"p2p identity mismatch");
             return Err(err);
@@ -2366,7 +2440,12 @@ impl QuicNetworkManager {
 
         let (send, recv) = tokio::time::timeout(accept_timeout, connection.accept_bi())
             .await
-            .map_err(|_| format!("Timed out waiting for peer to open stream ({}ms)", self.network_config.timeout_ms))?
+            .map_err(|_| {
+                format!(
+                    "Timed out waiting for peer to open stream ({}ms)",
+                    self.network_config.timeout_ms
+                )
+            })?
             .map_err(|e| format!("Failed to accept stream: {}", e))?;
 
         let conn = Arc::new(QuicPeerConnection::new(
@@ -2549,7 +2628,10 @@ impl QuicNetworkManager {
         tokio::spawn(async move {
             match manager.execute_consensus(timeout).await {
                 Ok(ordering) => {
-                    *manager.verified_ordering.lock().expect("verified_ordering lock poisoned") = Some(ordering);
+                    *manager
+                        .verified_ordering
+                        .lock()
+                        .expect("verified_ordering lock poisoned") = Some(ordering);
                     let _ = manager.consensus_gate_tx.send(ConsensusGate::Ready);
                     info!("Consensus completed successfully");
                 }
@@ -2575,12 +2657,13 @@ impl QuicNetworkManager {
             .local_public_key
             .as_ref()
             .ok_or(ConsensusError::Aborted("No local public key".into()))?;
-        let local_party_id = node_keys
-            .iter()
-            .position(|k| k == local_pk)
-            .ok_or(ConsensusError::Aborted(
-                "Local key not found in sorted keys".into(),
-            ))? as PartyId;
+        let local_party_id =
+            node_keys
+                .iter()
+                .position(|k| k == local_pk)
+                .ok_or(ConsensusError::Aborted(
+                    "Local key not found in sorted keys".into(),
+                ))? as PartyId;
         let client_keys = self.get_sorted_client_keys();
         if let Some(expected_parties) = self.network_config.expected_parties {
             if party_count != expected_parties {
@@ -2762,17 +2845,11 @@ impl QuicNetworkManager {
             let data = conn.receive().await.map_err(|e| {
                 ConsensusError::QueryFailed(format!("Failed to receive node list: {}", e))
             })?;
-            let envelope = NetEnvelope::try_deserialize(&data).map_err(|e| {
-                ConsensusError::QueryFailed(format!("Invalid response: {}", e))
-            })?;
+            let envelope = NetEnvelope::try_deserialize(&data)
+                .map_err(|e| ConsensusError::QueryFailed(format!("Invalid response: {}", e)))?;
             match envelope {
                 NetEnvelope::NodeListResponse { node_keys } => {
-                    orderings.push(
-                        node_keys
-                            .into_iter()
-                            .map(NodePublicKey)
-                            .collect::<Vec<_>>(),
-                    );
+                    orderings.push(node_keys.into_iter().map(NodePublicKey).collect::<Vec<_>>());
                 }
                 _ => {
                     return Err(ConsensusError::QueryFailed(
@@ -2800,10 +2877,7 @@ impl QuicNetworkManager {
 }
 
 impl NetworkManager for QuicNetworkManager {
-    fn connect<'a>(
-        &'a mut self,
-        address: SocketAddr,
-    ) -> SharedPeerConnectionFuture<'a> {
+    fn connect<'a>(&'a mut self, address: SocketAddr) -> SharedPeerConnectionFuture<'a> {
         Box::pin(async move { self.connect_as_server(address).await })
     }
 
@@ -2843,12 +2917,22 @@ impl NetworkManager for QuicNetworkManager {
 
             let (send, mut recv) = tokio::time::timeout(accept_timeout, connection.accept_bi())
                 .await
-                .map_err(|_| format!("Timed out waiting for peer to open stream ({}ms)", self.network_config.timeout_ms))?
+                .map_err(|_| {
+                    format!(
+                        "Timed out waiting for peer to open stream ({}ms)",
+                        self.network_config.timeout_ms
+                    )
+                })?
                 .map_err(|e| format!("Failed to accept stream: {}", e))?;
 
             let recv_result = tokio::time::timeout(accept_timeout, recv_stream_sync(&mut recv))
                 .await
-                .map_err(|_| format!("Timed out waiting for stream sync byte ({}ms)", self.network_config.timeout_ms))?;
+                .map_err(|_| {
+                    format!(
+                        "Timed out waiting for stream sync byte ({}ms)",
+                        self.network_config.timeout_ms
+                    )
+                })?;
             recv_result.map_err(|e| format!("Failed to sync stream: {}", e))?;
 
             // Derive peer ID from public key, or fallback to address-based lookup
@@ -3125,7 +3209,12 @@ impl Network for QuicNetworkManager {
     ) -> Result<usize, NetworkError> {
         self.await_consensus_gate().await?;
 
-        if let Some(connection) = self.get_client_connection(client) {
+        if let Some(transport_id) = self.resolve_client_transport_id(client) {
+            let Some(conn_ref) = self.client_connections.get(&transport_id) else {
+                return Err(NetworkError::ClientNotFound(client));
+            };
+            let connection = conn_ref.value();
+
             // Send directly without pre-checking is_connected() to avoid
             // check-then-act race (STO-478).
             match connection.send(message).await {
@@ -3138,11 +3227,15 @@ impl Network for QuicNetworkManager {
     }
 
     fn clients(&self) -> Vec<ClientId> {
-        self.client_ids.iter().map(|entry| *entry.key()).collect()
+        let sorted = self.get_sorted_client_keys();
+        if sorted.is_empty() {
+            return self.client_ids.iter().map(|entry| *entry.key()).collect();
+        }
+        (0..sorted.len()).collect()
     }
 
     fn is_client_connected(&self, client: ClientId) -> bool {
-        self.client_ids.contains(&client)
+        self.resolve_client_transport_id(client).is_some()
     }
 
     fn local_party_id(&self) -> PartyId {
@@ -3159,7 +3252,10 @@ impl Network for QuicNetworkManager {
     }
 
     fn verified_ordering(&self) -> Option<VerifiedOrdering> {
-        self.verified_ordering.lock().expect("verified_ordering lock poisoned").clone()
+        self.verified_ordering
+            .lock()
+            .expect("verified_ordering lock poisoned")
+            .clone()
     }
 }
 
@@ -3702,8 +3798,9 @@ mod tests {
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.signing_key.serialize_der();
 
-        let config =
-            QuicNetworkManager::create_self_signed_server_config(&cert_der, &key_der, 300_000, false);
+        let config = QuicNetworkManager::create_self_signed_server_config(
+            &cert_der, &key_der, 300_000, false,
+        );
         assert!(config.is_ok());
     }
 
@@ -3723,10 +3820,7 @@ mod tests {
             idle_timeout_ms: 0,
             ..Default::default()
         };
-        assert_eq!(
-            config.validate(),
-            Err(QuicConfigError::InvalidIdleTimeout)
-        );
+        assert_eq!(config.validate(), Err(QuicConfigError::InvalidIdleTimeout));
     }
 
     #[test]
@@ -4059,7 +4153,10 @@ mod tests {
             .await
             .expect("Unknown peer connect task should not panic");
 
-        assert!(accept_result.is_err(), "accept() should reject unknown peer");
+        assert!(
+            accept_result.is_err(),
+            "accept() should reject unknown peer"
+        );
         let err = accept_result.unwrap_err();
         assert!(
             err.contains("Unauthorized peer ID"),
@@ -4557,7 +4654,10 @@ mod tests {
         let mut spoofed_frame = Vec::with_capacity(4);
         spoofed_frame.extend_from_slice(&oversized.to_be_bytes());
         let result = LoopbackPeerConnection::unframe_message(spoofed_frame);
-        assert!(result.is_err(), "Frames claiming > MAX_MESSAGE_SIZE must be rejected");
+        assert!(
+            result.is_err(),
+            "Frames claiming > MAX_MESSAGE_SIZE must be rejected"
+        );
     }
 
     // ========================================================================
@@ -4587,8 +4687,7 @@ mod tests {
     #[test]
     fn test_server_config_with_use_tls_true_requires_client_cert() {
         ensure_crypto_provider();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .expect("cert gen");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert gen");
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.signing_key.serialize_der();
 
@@ -4596,21 +4695,26 @@ mod tests {
         let config = QuicNetworkManager::create_self_signed_server_config(
             &cert_der, &key_der, 300_000, true,
         );
-        assert!(config.is_ok(), "Server config with use_tls=true must succeed");
+        assert!(
+            config.is_ok(),
+            "Server config with use_tls=true must succeed"
+        );
     }
 
     #[test]
     fn test_server_config_with_use_tls_false_allows_no_client_cert() {
         ensure_crypto_provider();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .expect("cert gen");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert gen");
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.signing_key.serialize_der();
 
         let config = QuicNetworkManager::create_self_signed_server_config(
             &cert_der, &key_der, 300_000, false,
         );
-        assert!(config.is_ok(), "Server config with use_tls=false must succeed");
+        assert!(
+            config.is_ok(),
+            "Server config with use_tls=false must succeed"
+        );
     }
 
     #[test]
@@ -4883,8 +4987,14 @@ mod tests {
         // Both listen
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        server1.listen(addr1).await.expect("Failed to start server1");
-        server2.listen(addr2).await.expect("Failed to start server2");
+        server1
+            .listen(addr1)
+            .await
+            .expect("Failed to start server1");
+        server2
+            .listen(addr2)
+            .await
+            .expect("Failed to start server2");
 
         let bound_addr1 = server1.endpoint.as_ref().unwrap().local_addr().unwrap();
         let bound_addr2 = server2.endpoint.as_ref().unwrap().local_addr().unwrap();
@@ -4904,13 +5014,11 @@ mod tests {
         // Server1 connects outbound to server2, server2 accepts
         // Server2 connects outbound to server1, server1 accepts
         // All four happen concurrently via clones.
-        let s1_connect = tokio::spawn(async move {
-            s1_connector.connect_as_server(bound_addr2).await
-        });
+        let s1_connect =
+            tokio::spawn(async move { s1_connector.connect_as_server(bound_addr2).await });
         let s2_accept = tokio::spawn(async move { server2.accept().await });
-        let s2_connect = tokio::spawn(async move {
-            s2_connector.connect_as_server(bound_addr1).await
-        });
+        let s2_connect =
+            tokio::spawn(async move { s2_connector.connect_as_server(bound_addr1).await });
         let s1_accept = tokio::spawn(async move { server1.accept().await });
 
         let s1_connect_result = s1_connect.await.unwrap();
@@ -5000,7 +5108,10 @@ mod tests {
             let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
 
             let mut bad_peer = QuicNetworkManager::with_node_id(2);
-            bad_peer.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            bad_peer
+                .listen("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
             let bad_ep = bad_peer.endpoint.as_ref().unwrap().clone();
 
             // The QUIC handshake requires the server to poll accept() while
@@ -5029,7 +5140,10 @@ mod tests {
 
         rt.shutdown_timeout(Duration::from_secs(1));
 
-        assert!(result.is_err(), "accept() should return an error on timeout");
+        assert!(
+            result.is_err(),
+            "accept() should return an error on timeout"
+        );
         let err_msg = result.unwrap_err();
         assert!(
             err_msg.contains("Timed out"),
@@ -5174,11 +5288,9 @@ mod tests {
         manager.maybe_start_consensus();
 
         // consensus_started should remain false
-        assert!(
-            !manager
-                .consensus_started
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
+        assert!(!manager
+            .consensus_started
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -5196,11 +5308,9 @@ mod tests {
 
         // First call should set the flag
         manager.maybe_start_consensus();
-        assert!(
-            manager
-                .consensus_started
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
+        assert!(manager
+            .consensus_started
+            .load(std::sync::atomic::Ordering::SeqCst));
 
         // Second call should be a no-op (already started)
         manager.maybe_start_consensus();
@@ -5371,13 +5481,14 @@ mod tests {
             .await
             .expect("failed to preload signaling message");
 
-        let result = victim.connect_p2p(target_party_id, Arc::clone(&signaling)).await;
+        let result = victim
+            .connect_p2p(target_party_id, Arc::clone(&signaling))
+            .await;
         let _ = stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), accept_task).await;
 
-        let err = result.expect_err(
-            "connect_p2p should reject mismatched peer identity, but it succeeded",
-        );
+        let err = result
+            .expect_err("connect_p2p should reject mismatched peer identity, but it succeeded");
         assert!(
             err.to_lowercase().contains("identity mismatch"),
             "expected identity mismatch error, got: {}",
@@ -5399,10 +5510,7 @@ mod tests {
         );
 
         // Simulate consensus completing by writing directly to the field
-        *manager
-            .verified_ordering
-            .lock()
-            .expect("lock poisoned") = Some(ordering.clone());
+        *manager.verified_ordering.lock().expect("lock poisoned") = Some(ordering.clone());
 
         // Must reliably return the stored value on every call
         for _ in 0..100 {
@@ -5515,8 +5623,12 @@ mod tests {
         // Add some peer public keys
         let pk_a = NodePublicKey(vec![1, 0, 0]);
         let pk_b = NodePublicKey(vec![2, 0, 0]);
-        manager.peer_public_keys.insert(pk_a.derive_id(), pk_a.clone());
-        manager.peer_public_keys.insert(pk_b.derive_id(), pk_b.clone());
+        manager
+            .peer_public_keys
+            .insert(pk_a.derive_id(), pk_a.clone());
+        manager
+            .peer_public_keys
+            .insert(pk_b.derive_id(), pk_b.clone());
 
         // Snapshot the sorted keys
         let sorted = manager.get_sorted_public_keys();
@@ -5571,7 +5683,9 @@ mod tests {
         let local_pk = NodePublicKey(vec![1]);
         let peer_pk = NodePublicKey(vec![2]);
         manager.local_public_key = Some(local_pk);
-        manager.peer_public_keys.insert(peer_pk.derive_id(), peer_pk.clone());
+        manager
+            .peer_public_keys
+            .insert(peer_pk.derive_id(), peer_pk.clone());
         manager
             .client_public_keys
             .insert(1, NodePublicKey(vec![10, 20, 30]));

@@ -1,11 +1,13 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 use stoffelnet::network_utils::NodePublicKey;
 use stoffelnet::transports::ice::{CandidatePair, CandidateType, IceCandidate, LocalCandidates};
 use stoffelnet::transports::net_envelope::NetEnvelope;
 use stoffelnet::transports::quic::{LoopbackPeerConnection, PeerConnection};
-use stoffelnet::transports::stun::{detect_symmetric_nat, StunBindingResult, StunClient, StunServerConfig};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use stoffelnet::transports::stun::{
+    detect_symmetric_nat, StunBindingResult, StunClient, StunServerConfig,
+};
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -114,21 +116,17 @@ fn bench_loopback(c: &mut Criterion) {
     for size in [64, 1024, 65536, 1_048_576] {
         let data = vec![0xABu8; size];
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("send_receive", size),
-            &data,
-            |b, data| {
-                // Create connection outside the hot loop to measure only send/receive
-                let conn = LoopbackPeerConnection::new(addr(9999), Some(0));
-                b.iter(|| {
-                    rt.block_on(async {
-                        conn.send(black_box(data)).await.unwrap();
-                        let received = conn.receive().await.unwrap();
-                        black_box(received);
-                    });
+        group.bench_with_input(BenchmarkId::new("send_receive", size), &data, |b, data| {
+            // Create connection outside the hot loop to measure only send/receive
+            let conn = LoopbackPeerConnection::new(addr(9999), Some(0));
+            b.iter(|| {
+                rt.block_on(async {
+                    conn.send(black_box(data)).await.unwrap();
+                    let received = conn.receive().await.unwrap();
+                    black_box(received);
                 });
-            },
-        );
+            });
+        });
     }
 
     // 13. loopback_throughput_1000_msgs
@@ -197,10 +195,7 @@ fn bench_ice(c: &mut Criterion) {
         let locals: Vec<IceCandidate> = (0..10)
             .map(|i| {
                 IceCandidate::host(
-                    SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(192, 168, 1, i as u8)),
-                        5000 + i,
-                    ),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, i as u8)), 5000 + i),
                     1,
                 )
             })
@@ -208,10 +203,7 @@ fn bench_ice(c: &mut Criterion) {
         let remotes: Vec<IceCandidate> = (0..10)
             .map(|i| {
                 IceCandidate::host(
-                    SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8)),
-                        6000 + i,
-                    ),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8)), 6000 + i),
                     1,
                 )
             })
@@ -307,10 +299,7 @@ fn bench_stun(c: &mut Criterion) {
                     IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
                     12345 + i,
                 ),
-                server_address: SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, i as u8)),
-                    3478,
-                ),
+                server_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, i as u8)), 3478),
                 rtt: Duration::from_millis(50),
             })
             .collect();

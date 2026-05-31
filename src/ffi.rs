@@ -1334,12 +1334,10 @@ pub extern "C" fn stoffelnet_manager_set_expected_parties(
     }
 
     let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
-    handle
-        .runtime
-        .block_on(async {
-            let mut mgr = handle.manager.lock().await;
-            mgr.set_expected_parties(count);
-        });
+    handle.runtime.block_on(async {
+        let mut mgr = handle.manager.lock().await;
+        mgr.set_expected_parties(count);
+    });
 
     STOFFELNET_OK
 }
@@ -1362,12 +1360,10 @@ pub extern "C" fn stoffelnet_manager_set_expected_clients(
     }
 
     let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
-    handle
-        .runtime
-        .block_on(async {
-            let mut mgr = handle.manager.lock().await;
-            mgr.set_expected_clients(count);
-        });
+    handle.runtime.block_on(async {
+        let mut mgr = handle.manager.lock().await;
+        mgr.set_expected_clients(count);
+    });
 
     STOFFELNET_OK
 }
@@ -1395,10 +1391,8 @@ pub extern "C" fn stoffelnet_manager_get_verified_ordering(
     });
 
     match ordering {
-        Some(o) => {
-            Box::into_raw(Box::new(VerifiedOrderingHandle { ordering: o }))
-                as StoffelVerifiedOrderingHandle
-        }
+        Some(o) => Box::into_raw(Box::new(VerifiedOrderingHandle { ordering: o }))
+            as StoffelVerifiedOrderingHandle,
         None => std::ptr::null_mut(),
     }
 }
@@ -1409,9 +1403,7 @@ pub extern "C" fn stoffelnet_manager_get_verified_ordering(
 ///
 /// The ordering handle must be a valid, non-null pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn stoffelnet_ordering_node_count(
-    ordering: StoffelVerifiedOrderingHandle,
-) -> usize {
+pub extern "C" fn stoffelnet_ordering_node_count(ordering: StoffelVerifiedOrderingHandle) -> usize {
     if ordering.is_null() {
         set_last_error("Null ordering handle");
         return 0;
@@ -1567,10 +1559,8 @@ pub extern "C" fn stoffelnet_verify_node_ordering(
         .collect();
 
     match rt.block_on(QuicNetworkManager::verify_node_ordering(&connections)) {
-        Ok(ordering) => {
-            Box::into_raw(Box::new(VerifiedOrderingHandle { ordering }))
-                as StoffelVerifiedOrderingHandle
-        }
+        Ok(ordering) => Box::into_raw(Box::new(VerifiedOrderingHandle { ordering }))
+            as StoffelVerifiedOrderingHandle,
         Err(e) => {
             set_last_error(format!("Consensus verification failed: {}", e));
             std::ptr::null_mut()
@@ -1934,8 +1924,7 @@ mod tests {
 
     #[test]
     fn test_verify_node_ordering_null() {
-        let result =
-            stoffelnet_verify_node_ordering(std::ptr::null(), 1, std::ptr::null_mut());
+        let result = stoffelnet_verify_node_ordering(std::ptr::null(), 1, std::ptr::null_mut());
         assert!(result.is_null());
     }
 }

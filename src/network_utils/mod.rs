@@ -331,10 +331,7 @@ mod tests {
 
     #[test]
     fn test_verified_ordering_new() {
-        let node_keys = vec![
-            NodePublicKey(vec![1, 2, 3]),
-            NodePublicKey(vec![4, 5, 6]),
-        ];
+        let node_keys = vec![NodePublicKey(vec![1, 2, 3]), NodePublicKey(vec![4, 5, 6])];
         let client_keys = vec![NodePublicKey(vec![7, 8, 9])];
         let ordering = VerifiedOrdering::new(node_keys.clone(), client_keys.clone());
 

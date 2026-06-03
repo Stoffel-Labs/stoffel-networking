@@ -9,7 +9,7 @@ use crate::network_utils::{
     ClientId, ClientType, ConsensusError, ConsensusGate, Message, Network, NetworkError, Node,
     NodePublicKey, PartyId, VerifiedOrdering,
 };
-use crate::transports::ice::LocalCandidates;
+use crate::transports::ice::{CandidatePair, IceCandidate, LocalCandidates};
 use crate::transports::ice_agent::IceAgent;
 use crate::transports::net_envelope::NetEnvelope;
 use crate::transports::stun::StunClient;
@@ -2143,11 +2143,212 @@ impl QuicNetworkManager {
     pub async fn create_ice_candidates_message(&self) -> Result<NetEnvelope, String> {
         let candidates = self.gather_ice_candidates().await?;
 
-        Ok(NetEnvelope::IceCandidates {
+        Ok(Self::ice_candidates_envelope(&candidates))
+    }
+
+    fn ice_candidates_envelope(candidates: &LocalCandidates) -> NetEnvelope {
+        NetEnvelope::IceCandidates {
             ufrag: candidates.ufrag.clone(),
             pwd: candidates.pwd.clone(),
             candidates: candidates.candidates.clone(),
+        }
+    }
+
+    async fn send_ice_candidates(
+        signaling_connection: &Arc<dyn PeerConnection>,
+        local_candidates: &LocalCandidates,
+    ) -> Result<(), String> {
+        let candidates_msg = Self::ice_candidates_envelope(local_candidates);
+        signaling_connection
+            .send(&candidates_msg.serialize())
+            .await
+            .map_err(|e| format!("Failed to send ICE candidates: {}", e))
+    }
+
+    async fn receive_ice_candidates(
+        signaling_connection: &Arc<dyn PeerConnection>,
+    ) -> Result<(String, String, Vec<IceCandidate>), String> {
+        let remote_data = signaling_connection
+            .receive()
+            .await
+            .map_err(|e| format!("Failed to receive remote candidates: {}", e))?;
+
+        let remote_envelope = NetEnvelope::try_deserialize(&remote_data)
+            .map_err(|e| format!("Failed to deserialize remote candidates: {}", e))?;
+
+        match remote_envelope {
+            NetEnvelope::IceCandidates {
+                ufrag,
+                pwd,
+                candidates,
+            } => Ok((ufrag, pwd, candidates)),
+            _ => Err("Expected IceCandidates message".to_string()),
+        }
+    }
+
+    async fn configured_ice_agent(
+        &self,
+        local_candidates: &LocalCandidates,
+        remote_party_id: PartyId,
+        remote_ufrag: String,
+        remote_pwd: String,
+        remote_candidates: Vec<IceCandidate>,
+    ) -> Result<IceAgent, String> {
+        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
+            .map_err(|e| format!("Failed to create ICE agent: {}", e))?;
+
+        let host_addresses: Vec<_> = local_candidates
+            .candidates
+            .iter()
+            .map(|c| c.address)
+            .collect();
+
+        if host_addresses.is_empty() {
+            return Err("No local candidates".to_string());
+        }
+
+        // TODO: Consider reusing the QUIC endpoint's socket for accurate NAT mappings
+        let stun_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("Failed to create STUN socket: {}", e))?;
+
+        ice_agent
+            .gather_candidates(&host_addresses, &stun_socket)
+            .await
+            .map_err(|e| format!("ICE gathering failed: {}", e))?;
+
+        ice_agent
+            .set_remote_candidates(remote_party_id, remote_ufrag, remote_pwd, remote_candidates)
+            .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
+
+        Ok(ice_agent)
+    }
+
+    async fn run_p2p_ice_checks(
+        &mut self,
+        ice_agent: &mut IceAgent,
+    ) -> Result<CandidatePair, String> {
+        self.ensure_client_endpoint(ClientType::Server).await?;
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| "QUIC endpoint was not initialized".to_string())?;
+
+        ice_agent
+            .run_connectivity_checks(endpoint)
+            .await
+            .map_err(|e| format!("ICE connectivity checks failed: {}", e))
+    }
+
+    async fn connect_to_nominated_peer(
+        endpoint: &Endpoint,
+        nominated_pair: &CandidatePair,
+    ) -> Result<Connection, String> {
+        endpoint
+            .connect(nominated_pair.remote.address, "localhost")
+            .map_err(|e| format!("Failed to initiate connection: {}", e))?
+            .await
+            .map_err(|e| format!("Failed to establish connection: {}", e))
+    }
+
+    async fn accept_nominated_p2p_connection(
+        endpoint: &Endpoint,
+        nominated_pair: &CandidatePair,
+    ) -> Result<Connection, String> {
+        let incoming = endpoint.accept().await.ok_or("No incoming connection")?;
+        let connection = incoming
+            .await
+            .map_err(|e| format!("Failed to accept connection: {}", e))?;
+
+        let remote_addr = connection.remote_address();
+        if remote_addr.ip() != nominated_pair.remote.address.ip() {
+            connection.close(0u32.into(), b"unexpected p2p remote address");
+            return Err(format!(
+                "Rejected unexpected P2P remote address {} (expected IP {})",
+                remote_addr,
+                nominated_pair.remote.address.ip()
+            ));
+        }
+
+        Ok(connection)
+    }
+
+    fn negotiated_p2p_role(connection: &Connection) -> ClientType {
+        extract_alpn_role(connection).unwrap_or_else(|e| {
+            warn!("ALPN extraction failed: {}, defaulting to Server", e);
+            ClientType::Server
         })
+    }
+
+    fn verify_and_store_p2p_identity(
+        &self,
+        connection: &Connection,
+        party_id: PartyId,
+    ) -> Result<Option<NodePublicKey>, String> {
+        let peer_public_key = Self::extract_peer_public_key(connection).ok();
+        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), party_id) {
+            connection.close(0u32.into(), b"p2p identity mismatch");
+            return Err(err);
+        }
+
+        if let Some(ref pk) = peer_public_key {
+            self.peer_public_keys.insert(party_id, pk.clone());
+        }
+
+        Ok(peer_public_key)
+    }
+
+    async fn open_synced_p2p_stream(
+        connection: &Connection,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| format!("Failed to open stream: {}", e))?;
+
+        send_stream_sync(&mut send)
+            .await
+            .map_err(|e| format!("Failed to sync stream: {}", e))?;
+
+        Ok((send, recv))
+    }
+
+    async fn accept_p2p_stream(
+        connection: &Connection,
+        timeout_ms: u64,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        let accept_timeout = Duration::from_millis(timeout_ms);
+
+        tokio::time::timeout(accept_timeout, connection.accept_bi())
+            .await
+            .map_err(|_| {
+                format!(
+                    "Timed out waiting for peer to open stream ({}ms)",
+                    timeout_ms
+                )
+            })?
+            .map_err(|e| format!("Failed to accept stream: {}", e))
+    }
+
+    fn store_p2p_connection(
+        &self,
+        party_id: PartyId,
+        connection: Connection,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        connection_role: ClientType,
+        peer_public_key: Option<NodePublicKey>,
+    ) -> Arc<dyn PeerConnection> {
+        let conn = Arc::new(QuicPeerConnection::new(
+            connection,
+            send,
+            recv,
+            connection_role,
+            peer_public_key,
+        )) as Arc<dyn PeerConnection>;
+
+        self.server_connections.insert(party_id, Arc::clone(&conn));
+        conn
     }
 
     /// Initiates a peer-to-peer connection with NAT traversal
@@ -2163,8 +2364,6 @@ impl QuicNetworkManager {
         target_party_id: PartyId,
         signaling_connection: Arc<dyn PeerConnection>,
     ) -> Result<Arc<dyn PeerConnection>, String> {
-        use crate::transports::ice_agent::IceAgent;
-
         if !self.network_config.enable_nat_traversal {
             return Err("NAT traversal not enabled".to_string());
         }
@@ -2174,86 +2373,24 @@ impl QuicNetworkManager {
             target_party_id
         );
 
-        // 1. Gather local candidates
         let local_candidates = self.gather_ice_candidates().await?;
-
-        // 2. Send our candidates to the peer
-        let candidates_msg = NetEnvelope::IceCandidates {
-            ufrag: local_candidates.ufrag.clone(),
-            pwd: local_candidates.pwd.clone(),
-            candidates: local_candidates.candidates.clone(),
-        };
-
-        signaling_connection
-            .send(&candidates_msg.serialize())
-            .await
-            .map_err(|e| format!("Failed to send ICE candidates: {}", e))?;
-
+        Self::send_ice_candidates(&signaling_connection, &local_candidates).await?;
         debug!("Sent {} ICE candidates to peer", local_candidates.len());
 
-        // 3. Wait for remote candidates
-        let remote_data = signaling_connection
-            .receive()
-            .await
-            .map_err(|e| format!("Failed to receive remote candidates: {}", e))?;
-
-        let remote_envelope = NetEnvelope::try_deserialize(&remote_data)
-            .map_err(|e| format!("Failed to deserialize remote candidates: {}", e))?;
-
-        let (remote_ufrag, remote_pwd, remote_candidates) = match remote_envelope {
-            NetEnvelope::IceCandidates {
-                ufrag,
-                pwd,
-                candidates,
-            } => (ufrag, pwd, candidates),
-            _ => {
-                return Err("Expected IceCandidates message".to_string());
-            }
-        };
-
+        let (remote_ufrag, remote_pwd, remote_candidates) =
+            Self::receive_ice_candidates(&signaling_connection).await?;
         debug!("Received {} remote ICE candidates", remote_candidates.len());
 
-        // 4. Create and configure ICE agent
-        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
-            .map_err(|e| format!("Failed to create ICE agent: {}", e))?;
-
-        // Gather candidates using our local addresses
-        let host_addresses: Vec<_> = local_candidates
-            .candidates
-            .iter()
-            .map(|c| c.address)
-            .collect();
-
-        if host_addresses.is_empty() {
-            return Err("No local candidates".to_string());
-        }
-
-        // Create a temporary socket for STUN queries
-        // TODO: Consider reusing the QUIC endpoint's socket for accurate NAT mappings
-        let stun_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("Failed to create STUN socket: {}", e))?;
-
-        ice_agent
-            .gather_candidates(&host_addresses, &stun_socket)
-            .await
-            .map_err(|e| format!("ICE gathering failed: {}", e))?;
-
-        // Set remote candidates
-        ice_agent
-            .set_remote_candidates(target_party_id, remote_ufrag, remote_pwd, remote_candidates)
-            .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
-
-        // 5. Ensure endpoint exists
-        self.ensure_client_endpoint(ClientType::Server).await?;
-        let endpoint = self.endpoint.as_ref().unwrap();
-
-        // 6. Run connectivity checks
-        let nominated_pair = ice_agent
-            .run_connectivity_checks(endpoint)
-            .await
-            .map_err(|e| format!("ICE connectivity checks failed: {}", e))?;
-
+        let mut ice_agent = self
+            .configured_ice_agent(
+                &local_candidates,
+                target_party_id,
+                remote_ufrag,
+                remote_pwd,
+                remote_candidates,
+            )
+            .await?;
+        let nominated_pair = self.run_p2p_ice_checks(&mut ice_agent).await?;
         info!(
             "ICE completed: {} -> {} (RTT: {:?}ms)",
             nominated_pair.local.address, nominated_pair.remote.address, nominated_pair.rtt_ms
@@ -2262,58 +2399,31 @@ impl QuicNetworkManager {
         // Store agent for potential later use
         self.pending_ice_agents.insert(target_party_id, ice_agent);
 
-        // 7. Establish QUIC connection on the successful pair
-        let connection = endpoint
-            .connect(nominated_pair.remote.address, "localhost")
-            .map_err(|e| format!("Failed to initiate connection: {}", e))?
-            .await
-            .map_err(|e| format!("Failed to establish connection: {}", e))?;
-
-        // Get connection role from ALPN negotiation
-        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
-            warn!("ALPN extraction failed: {}, defaulting to Server", e);
-            ClientType::Server
-        });
-
-        // Extract peer's public key from TLS certificate
-        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
-        if let Err(err) =
-            Self::verify_expected_p2p_identity(peer_public_key.as_ref(), target_party_id)
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| "QUIC endpoint was not initialized".to_string())?;
+        let connection = Self::connect_to_nominated_peer(endpoint, &nominated_pair).await?;
+        let connection_role = Self::negotiated_p2p_role(&connection);
+        let peer_public_key = match self.verify_and_store_p2p_identity(&connection, target_party_id)
         {
-            connection.close(0u32.into(), b"p2p identity mismatch");
-            self.pending_ice_agents.remove(&target_party_id);
-            return Err(err);
-        }
-
-        if let Some(ref pk) = peer_public_key {
-            self.peer_public_keys.insert(target_party_id, pk.clone());
-        }
-
-        // Open stream and sync
-        let (mut send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| format!("Failed to open stream: {}", e))?;
-
-        send_stream_sync(&mut send)
-            .await
-            .map_err(|e| format!("Failed to sync stream: {}", e))?;
-
-        let conn = Arc::new(QuicPeerConnection::new(
+            Ok(peer_public_key) => peer_public_key,
+            Err(err) => {
+                self.pending_ice_agents.remove(&target_party_id);
+                return Err(err);
+            }
+        };
+        let (send, recv) = Self::open_synced_p2p_stream(&connection).await?;
+        let conn = self.store_p2p_connection(
+            target_party_id,
             connection,
             send,
             recv,
             connection_role,
             peer_public_key,
-        )) as Arc<dyn PeerConnection>;
+        );
 
-        // Store connection
-        self.server_connections
-            .insert(target_party_id, Arc::clone(&conn));
-
-        // Cleanup ICE agent
         self.pending_ice_agents.remove(&target_party_id);
-
         Ok(conn)
     }
 
@@ -2328,8 +2438,6 @@ impl QuicNetworkManager {
         remote_candidates: Vec<crate::transports::ice::IceCandidate>,
         signaling_connection: Arc<dyn PeerConnection>,
     ) -> Result<Arc<dyn PeerConnection>, String> {
-        use crate::transports::ice_agent::IceAgent;
-
         if !self.network_config.enable_nat_traversal {
             return Err("NAT traversal not enabled".to_string());
         }
@@ -2340,126 +2448,42 @@ impl QuicNetworkManager {
             remote_candidates.len()
         );
 
-        // 1. Gather our candidates
         let local_candidates = self.gather_ice_candidates().await?;
+        Self::send_ice_candidates(&signaling_connection, &local_candidates).await?;
 
-        // 2. Send our candidates back
-        let candidates_msg = NetEnvelope::IceCandidates {
-            ufrag: local_candidates.ufrag.clone(),
-            pwd: local_candidates.pwd.clone(),
-            candidates: local_candidates.candidates.clone(),
-        };
-
-        signaling_connection
-            .send(&candidates_msg.serialize())
-            .await
-            .map_err(|e| format!("Failed to send ICE candidates: {}", e))?;
-
-        // 3. Create ICE agent
-        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
-            .map_err(|e| format!("Failed to create ICE agent: {}", e))?;
-
-        // Gather candidates using our local addresses
-        let host_addresses: Vec<_> = local_candidates
-            .candidates
-            .iter()
-            .map(|c| c.address)
-            .collect();
-
-        if host_addresses.is_empty() {
-            return Err("No local candidates".to_string());
-        }
-
-        // Create a temporary socket for STUN queries
-        // TODO: Consider reusing the QUIC endpoint's socket for accurate NAT mappings
-        let stun_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("Failed to create STUN socket: {}", e))?;
-
-        ice_agent
-            .gather_candidates(&host_addresses, &stun_socket)
-            .await
-            .map_err(|e| format!("ICE gathering failed: {}", e))?;
-
-        ice_agent
-            .set_remote_candidates(from_party_id, remote_ufrag, remote_pwd, remote_candidates)
-            .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
-
-        // 4. Run connectivity checks
-        self.ensure_client_endpoint(ClientType::Server).await?;
-        let endpoint = self.endpoint.as_ref().unwrap();
-
-        let nominated_pair = ice_agent
-            .run_connectivity_checks(endpoint)
-            .await
-            .map_err(|e| format!("ICE connectivity checks failed: {}", e))?;
-
+        let mut ice_agent = self
+            .configured_ice_agent(
+                &local_candidates,
+                from_party_id,
+                remote_ufrag,
+                remote_pwd,
+                remote_candidates,
+            )
+            .await?;
+        let nominated_pair = self.run_p2p_ice_checks(&mut ice_agent).await?;
         info!(
             "ICE completed (responder): {} -> {}",
             nominated_pair.local.address, nominated_pair.remote.address
         );
 
-        // 5. The controlling agent will establish the final connection
-        // We wait to accept it
-        let incoming = endpoint.accept().await.ok_or("No incoming connection")?;
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| "QUIC endpoint was not initialized".to_string())?;
+        let connection = Self::accept_nominated_p2p_connection(endpoint, &nominated_pair).await?;
+        let connection_role = Self::negotiated_p2p_role(&connection);
+        let peer_public_key = self.verify_and_store_p2p_identity(&connection, from_party_id)?;
+        let (send, recv) =
+            Self::accept_p2p_stream(&connection, self.network_config.timeout_ms).await?;
 
-        let connection = incoming
-            .await
-            .map_err(|e| format!("Failed to accept connection: {}", e))?;
-
-        let remote_addr = connection.remote_address();
-        if remote_addr.ip() != nominated_pair.remote.address.ip() {
-            connection.close(0u32.into(), b"unexpected p2p remote address");
-            return Err(format!(
-                "Rejected unexpected P2P remote address {} (expected IP {})",
-                remote_addr,
-                nominated_pair.remote.address.ip()
-            ));
-        }
-
-        // Get connection role from ALPN negotiation
-        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
-            warn!("ALPN extraction failed: {}, defaulting to Server", e);
-            ClientType::Server
-        });
-
-        // Extract peer's public key from TLS certificate
-        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
-        if let Err(err) =
-            Self::verify_expected_p2p_identity(peer_public_key.as_ref(), from_party_id)
-        {
-            connection.close(0u32.into(), b"p2p identity mismatch");
-            return Err(err);
-        }
-
-        if let Some(ref pk) = peer_public_key {
-            self.peer_public_keys.insert(from_party_id, pk.clone());
-        }
-
-        let accept_timeout = Duration::from_millis(self.network_config.timeout_ms);
-
-        let (send, recv) = tokio::time::timeout(accept_timeout, connection.accept_bi())
-            .await
-            .map_err(|_| {
-                format!(
-                    "Timed out waiting for peer to open stream ({}ms)",
-                    self.network_config.timeout_ms
-                )
-            })?
-            .map_err(|e| format!("Failed to accept stream: {}", e))?;
-
-        let conn = Arc::new(QuicPeerConnection::new(
+        Ok(self.store_p2p_connection(
+            from_party_id,
             connection,
             send,
             recv,
             connection_role,
             peer_public_key,
-        )) as Arc<dyn PeerConnection>;
-
-        self.server_connections
-            .insert(from_party_id, Arc::clone(&conn));
-
-        Ok(conn)
+        ))
     }
 
     /// Connects with automatic fallback strategies

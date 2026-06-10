@@ -32,7 +32,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
-use crate::network_utils::{Network, Node, PartyId, VerifiedOrdering};
+use crate::network_utils::{Network, Node, NodePublicKey, PartyId, VerifiedOrdering};
 use crate::transports::quic::{ConnectionState, PeerConnection, QuicNetworkManager, QuicNode};
 
 // ============================================================================
@@ -592,6 +592,65 @@ pub extern "C" fn stoffelnet_manager_add_node(
     handle.runtime.block_on(async {
         let mut manager = handle.manager.lock().await;
         manager.add_node_with_party_id(party_id as PartyId, socket_addr);
+    });
+
+    STOFFELNET_OK
+}
+
+/// Adds a DER-encoded SubjectPublicKeyInfo key to the certificate public key allowlist.
+///
+/// When at least one key is configured, connections whose peer certificate public key
+/// is not in the allowlist are rejected.
+///
+/// # Safety
+///
+/// - The manager handle must be valid
+/// - key must point to at least key_len bytes
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_add_allowed_certificate_public_key(
+    manager: StoffelNetworkManagerHandle,
+    key: *const u8,
+    key_len: usize,
+) -> c_int {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    if key.is_null() || key_len == 0 {
+        set_last_error("Null or empty certificate public key");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len).to_vec() };
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+
+    handle.runtime.block_on(async {
+        let mut manager = handle.manager.lock().await;
+        manager.add_allowed_certificate_public_key(NodePublicKey(key_bytes));
+    });
+
+    STOFFELNET_OK
+}
+
+/// Clears the certificate public key allowlist, disabling this check.
+///
+/// # Safety
+///
+/// The manager handle must be valid.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_clear_allowed_certificate_public_keys(
+    manager: StoffelNetworkManagerHandle,
+) -> c_int {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+    handle.runtime.block_on(async {
+        let mut manager = handle.manager.lock().await;
+        manager.clear_allowed_certificate_public_keys();
     });
 
     STOFFELNET_OK
@@ -1334,12 +1393,10 @@ pub extern "C" fn stoffelnet_manager_set_expected_parties(
     }
 
     let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
-    handle
-        .runtime
-        .block_on(async {
-            let mut mgr = handle.manager.lock().await;
-            mgr.set_expected_parties(count);
-        });
+    handle.runtime.block_on(async {
+        let mut mgr = handle.manager.lock().await;
+        mgr.set_expected_parties(count);
+    });
 
     STOFFELNET_OK
 }
@@ -1362,12 +1419,10 @@ pub extern "C" fn stoffelnet_manager_set_expected_clients(
     }
 
     let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
-    handle
-        .runtime
-        .block_on(async {
-            let mut mgr = handle.manager.lock().await;
-            mgr.set_expected_clients(count);
-        });
+    handle.runtime.block_on(async {
+        let mut mgr = handle.manager.lock().await;
+        mgr.set_expected_clients(count);
+    });
 
     STOFFELNET_OK
 }
@@ -1395,10 +1450,8 @@ pub extern "C" fn stoffelnet_manager_get_verified_ordering(
     });
 
     match ordering {
-        Some(o) => {
-            Box::into_raw(Box::new(VerifiedOrderingHandle { ordering: o }))
-                as StoffelVerifiedOrderingHandle
-        }
+        Some(o) => Box::into_raw(Box::new(VerifiedOrderingHandle { ordering: o }))
+            as StoffelVerifiedOrderingHandle,
         None => std::ptr::null_mut(),
     }
 }
@@ -1409,9 +1462,7 @@ pub extern "C" fn stoffelnet_manager_get_verified_ordering(
 ///
 /// The ordering handle must be a valid, non-null pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn stoffelnet_ordering_node_count(
-    ordering: StoffelVerifiedOrderingHandle,
-) -> usize {
+pub extern "C" fn stoffelnet_ordering_node_count(ordering: StoffelVerifiedOrderingHandle) -> usize {
     if ordering.is_null() {
         set_last_error("Null ordering handle");
         return 0;
@@ -1567,10 +1618,8 @@ pub extern "C" fn stoffelnet_verify_node_ordering(
         .collect();
 
     match rt.block_on(QuicNetworkManager::verify_node_ordering(&connections)) {
-        Ok(ordering) => {
-            Box::into_raw(Box::new(VerifiedOrderingHandle { ordering }))
-                as StoffelVerifiedOrderingHandle
-        }
+        Ok(ordering) => Box::into_raw(Box::new(VerifiedOrderingHandle { ordering }))
+            as StoffelVerifiedOrderingHandle,
         Err(e) => {
             set_last_error(format!("Consensus verification failed: {}", e));
             std::ptr::null_mut()
@@ -1934,8 +1983,7 @@ mod tests {
 
     #[test]
     fn test_verify_node_ordering_null() {
-        let result =
-            stoffelnet_verify_node_ordering(std::ptr::null(), 1, std::ptr::null_mut());
+        let result = stoffelnet_verify_node_ordering(std::ptr::null(), 1, std::ptr::null_mut());
         assert!(result.is_null());
     }
 }

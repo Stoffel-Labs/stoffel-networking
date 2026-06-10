@@ -129,7 +129,6 @@ pub enum NetEnvelope {
     //      every connected client.  Clients may also request it explicitly via
     //      `NodeListRequest` as a defensive fallback (e.g. if they connected
     //      after the initial push or missed it due to a transient error).
-
     /// Client requests the node's canonical node list.
     ///
     /// This is a defensive/optional request: nodes auto-push `NodeListResponse`
@@ -395,9 +394,7 @@ mod tests {
 
     #[test]
     fn test_node_list_response_empty_keys() {
-        let envelope = NetEnvelope::NodeListResponse {
-            node_keys: vec![],
-        };
+        let envelope = NetEnvelope::NodeListResponse { node_keys: vec![] };
         let bytes = envelope.serialize();
         let deserialized = NetEnvelope::try_deserialize(&bytes).unwrap();
         if let NetEnvelope::NodeListResponse { node_keys } = deserialized {
@@ -673,9 +670,7 @@ mod tests {
                 source_party_id: 2,
                 payload: vec![1],
             },
-            NetEnvelope::Heartbeat {
-                timestamp_ms: 1000,
-            },
+            NetEnvelope::Heartbeat { timestamp_ms: 1000 },
             NetEnvelope::NodeListRequest,
             NetEnvelope::NodeListResponse {
                 node_keys: vec![vec![1, 2, 3]],

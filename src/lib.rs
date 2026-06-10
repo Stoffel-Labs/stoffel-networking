@@ -260,10 +260,7 @@ pub trait NetworkManager: Send + Sync {
     /// - TLS handshake fails (certificate validation, protocol mismatch)
     /// - Connection timeout is exceeded
     /// - Stream initialization fails
-    fn connect<'a>(
-        &'a mut self,
-        address: SocketAddr,
-    ) -> BoxPeerConnectionFuture<'a>;
+    fn connect<'a>(&'a mut self, address: SocketAddr) -> BoxPeerConnectionFuture<'a>;
 
     /// Accepts an incoming connection.
     ///

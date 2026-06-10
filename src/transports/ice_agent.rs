@@ -327,7 +327,11 @@ fn is_safe_remote_candidate(ip: std::net::IpAddr, allow_loopback: bool) -> bool 
         debug!(
             "Rejected remote candidate: {} ({})",
             ip,
-            if ip.is_unspecified() { "unspecified" } else { "multicast" }
+            if ip.is_unspecified() {
+                "unspecified"
+            } else {
+                "multicast"
+            }
         );
         return false;
     }
@@ -2196,8 +2200,7 @@ mod integration_tests {
         agent.state = IceState::GatheringComplete;
 
         // Attacker sends loopback as a remote candidate
-        let loopback_candidate =
-            IceCandidate::host("127.0.0.1:9999".parse().unwrap(), 1);
+        let loopback_candidate = IceCandidate::host("127.0.0.1:9999".parse().unwrap(), 1);
 
         let result = agent.set_remote_candidates(
             2,
@@ -2229,8 +2232,7 @@ mod integration_tests {
         agent.state = IceState::GatheringComplete;
 
         // Attacker sends link-local (169.254.169.254 — cloud metadata service)
-        let link_local_candidate =
-            IceCandidate::host("169.254.169.254:80".parse().unwrap(), 1);
+        let link_local_candidate = IceCandidate::host("169.254.169.254:80".parse().unwrap(), 1);
 
         let result = agent.set_remote_candidates(
             2,
@@ -2258,8 +2260,7 @@ mod integration_tests {
         };
         agent.state = IceState::GatheringComplete;
 
-        let multicast_candidate =
-            IceCandidate::host("224.0.0.1:5000".parse().unwrap(), 1);
+        let multicast_candidate = IceCandidate::host("224.0.0.1:5000".parse().unwrap(), 1);
 
         let result = agent.set_remote_candidates(
             2,
@@ -2287,8 +2288,7 @@ mod integration_tests {
         };
         agent.state = IceState::GatheringComplete;
 
-        let unspecified_candidate =
-            IceCandidate::host("0.0.0.0:5000".parse().unwrap(), 1);
+        let unspecified_candidate = IceCandidate::host("0.0.0.0:5000".parse().unwrap(), 1);
 
         let result = agent.set_remote_candidates(
             2,
@@ -2316,8 +2316,7 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let remote_loopback =
-            IceCandidate::host("127.0.0.1:6000".parse().unwrap(), 1);
+        let remote_loopback = IceCandidate::host("127.0.0.1:6000".parse().unwrap(), 1);
 
         let result = agent.set_remote_candidates(
             2,

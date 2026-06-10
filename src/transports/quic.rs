@@ -9,7 +9,7 @@ use crate::network_utils::{
     ClientId, ClientType, ConsensusError, ConsensusGate, Message, Network, NetworkError, Node,
     NodePublicKey, PartyId, VerifiedOrdering,
 };
-use crate::transports::ice::LocalCandidates;
+use crate::transports::ice::{CandidatePair, IceCandidate, LocalCandidates};
 use crate::transports::ice_agent::IceAgent;
 use crate::transports::net_envelope::NetEnvelope;
 use crate::transports::stun::StunClient;
@@ -167,10 +167,7 @@ type SharedPeerConnectionFuture<'a> =
 // ============================================================================
 
 pub trait NetworkManager: Send + Sync {
-    fn connect<'a>(
-        &'a mut self,
-        address: SocketAddr,
-    ) -> SharedPeerConnectionFuture<'a>;
+    fn connect<'a>(&'a mut self, address: SocketAddr) -> SharedPeerConnectionFuture<'a>;
 
     fn accept<'a>(&'a mut self) -> SharedPeerConnectionFuture<'a>;
 
@@ -284,10 +281,7 @@ async fn recv_framed_message(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, Co
                             re
                         ))
                     } else {
-                        ConnectionError::ReceiveFailed(format!(
-                            "Failed to read payload: {}",
-                            re
-                        ))
+                        ConnectionError::ReceiveFailed(format!("Failed to read payload: {}", re))
                     }
                 }
             })?;
@@ -1038,6 +1032,9 @@ pub struct QuicNetworkManager {
     local_public_key: Option<NodePublicKey>,
     /// Connected peers' public keys (for sender_id computation)
     peer_public_keys: Arc<DashMap<PartyId, NodePublicKey>>,
+    /// Optional allowlist of peer certificate public keys.
+    /// Empty means certificate public key allowlisting is disabled.
+    allowed_peer_public_keys: Arc<DashSet<NodePublicKey>>,
     /// STUN client for NAT traversal
     stun_client: Option<Arc<StunClient>>,
     /// Cached local ICE candidates
@@ -1104,6 +1101,7 @@ impl QuicNetworkManager {
             local_key_der: None,
             local_public_key: None,
             peer_public_keys: Arc::new(DashMap::new()),
+            allowed_peer_public_keys: Arc::new(DashSet::new()),
             stun_client: None,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -1121,6 +1119,28 @@ impl QuicNetworkManager {
         let mut manager = Self::new();
         manager.node_id = node_id;
         manager
+    }
+
+    /// Install stable local certificate material before listen/connect.
+    ///
+    /// By default the manager generates an ephemeral self-signed certificate on
+    /// first use. MPC runtimes that persist program-side keys should call this
+    /// so the authenticated transport identity remains stable across runs.
+    pub fn set_local_certificate_der(
+        &mut self,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+    ) -> Result<(), String> {
+        if self.endpoint.is_some() {
+            return Err(
+                "cannot replace local certificate after endpoint initialization".to_string(),
+            );
+        }
+        let public_key = Self::extract_public_key_from_cert(&cert_der)?;
+        self.local_cert_der = Some(cert_der);
+        self.local_key_der = Some(key_der);
+        self.local_public_key = Some(public_key);
+        Ok(())
     }
 
     /// Creates a network manager with the given configuration.
@@ -1167,12 +1187,12 @@ impl QuicNetworkManager {
         };
 
         // Gate starts as Pending if consensus is required, NotRequired otherwise
-        let initial_gate =
-            if config.expected_parties.is_some() || config.expected_clients.is_some() {
-                ConsensusGate::Pending
-            } else {
-                ConsensusGate::NotRequired
-            };
+        let initial_gate = if config.expected_parties.is_some() || config.expected_clients.is_some()
+        {
+            ConsensusGate::Pending
+        } else {
+            ConsensusGate::NotRequired
+        };
 
         let (consensus_gate_tx, consensus_gate_rx) = tokio::sync::watch::channel(initial_gate);
         let (client_connected_tx, _) = tokio::sync::broadcast::channel(64);
@@ -1190,6 +1210,7 @@ impl QuicNetworkManager {
             local_key_der: None,
             local_public_key: None,
             peer_public_keys: Arc::new(DashMap::new()),
+            allowed_peer_public_keys: Arc::new(DashSet::new()),
             stun_client,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -1233,6 +1254,32 @@ impl QuicNetworkManager {
         }
     }
 
+    /// Replaces the certificate public key allowlist.
+    ///
+    /// Keys must be DER-encoded SubjectPublicKeyInfo bytes, matching
+    /// [`NodePublicKey`]. When the allowlist is empty, this check is disabled.
+    pub fn set_allowed_certificate_public_keys(&mut self, keys: Vec<NodePublicKey>) {
+        self.allowed_peer_public_keys.clear();
+        for key in keys {
+            self.allowed_peer_public_keys.insert(key);
+        }
+    }
+
+    /// Adds a DER-encoded SubjectPublicKeyInfo key to the certificate public key allowlist.
+    pub fn add_allowed_certificate_public_key(&mut self, key: NodePublicKey) {
+        self.allowed_peer_public_keys.insert(key);
+    }
+
+    /// Clears the certificate public key allowlist, disabling this check.
+    pub fn clear_allowed_certificate_public_keys(&mut self) {
+        self.allowed_peer_public_keys.clear();
+    }
+
+    /// Returns true when certificate public key allowlisting is enabled.
+    pub fn has_certificate_public_key_allowlist(&self) -> bool {
+        !self.allowed_peer_public_keys.is_empty()
+    }
+
     pub fn add_node(&mut self, node: QuicNode) {
         self.nodes.push(node);
     }
@@ -1271,16 +1318,31 @@ impl QuicNetworkManager {
 
     /// Gets all client connections (external clients connected to this server)
     pub fn get_all_client_connections(&self) -> Vec<(ClientId, Arc<dyn PeerConnection>)> {
-        self.client_connections
+        let sorted = self.get_sorted_client_keys();
+        if sorted.is_empty() {
+            return self
+                .client_connections
+                .iter()
+                .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+                .collect();
+        }
+
+        sorted
             .iter()
-            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .enumerate()
+            .filter_map(|(logical_id, key)| {
+                let transport_id = key.derive_id();
+                self.client_connections
+                    .get(&transport_id)
+                    .map(|entry| (logical_id, Arc::clone(entry.value())))
+            })
             .collect()
     }
 
     /// Gets a specific client connection by ID
     pub fn get_client_connection(&self, client_id: ClientId) -> Option<Arc<dyn PeerConnection>> {
-        self.client_connections
-            .get(&client_id)
+        self.resolve_client_transport_id(client_id)
+            .and_then(|transport_id| self.client_connections.get(&transport_id))
             .map(|entry| Arc::clone(entry.value()))
     }
 
@@ -1509,6 +1571,42 @@ impl QuicNetworkManager {
         Self::extract_public_key_from_cert(&certs[0])
     }
 
+    fn verify_peer_public_key_allowed(
+        &self,
+        peer_public_key: Option<&NodePublicKey>,
+        context: &str,
+    ) -> Result<(), String> {
+        if self.allowed_peer_public_keys.is_empty() {
+            return Ok(());
+        }
+
+        let peer_public_key = peer_public_key.ok_or_else(|| {
+            format!(
+                "{} rejected: no peer certificate public key available while allowlist is enabled",
+                context
+            )
+        })?;
+
+        if !self.allowed_peer_public_keys.contains(peer_public_key) {
+            return Err(format!(
+                "{} rejected: peer certificate public key is not in allowlist",
+                context
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn extract_and_verify_peer_public_key(
+        &self,
+        connection: &Connection,
+        context: &str,
+    ) -> Result<Option<NodePublicKey>, String> {
+        let peer_public_key = Self::extract_peer_public_key(connection).ok();
+        self.verify_peer_public_key_allowed(peer_public_key.as_ref(), context)?;
+        Ok(peer_public_key)
+    }
+
     /// Verifies that the peer certificate-derived identity matches the expected party.
     ///
     /// P2P NAT traversal paths must bind the established QUIC connection to the
@@ -1667,6 +1765,47 @@ impl QuicNetworkManager {
         self.local_public_key.as_ref()
     }
 
+    /// Returns this node's DER-encoded SubjectPublicKeyInfo bytes.
+    pub fn local_public_key_bytes(&self) -> Option<Vec<u8>> {
+        self.local_public_key.as_ref().map(|pk| pk.0.clone())
+    }
+
+    /// Returns a connected peer's DER-encoded SubjectPublicKeyInfo bytes.
+    pub fn peer_public_key_bytes(&self, peer_id: PartyId) -> Option<Vec<u8>> {
+        self.peer_public_keys
+            .get(&peer_id)
+            .map(|entry| entry.value().0.clone())
+    }
+
+    /// Returns a connected client's DER-encoded SubjectPublicKeyInfo bytes.
+    pub fn client_public_key_bytes(&self, client_id: ClientId) -> Option<Vec<u8>> {
+        self.resolve_client_transport_id(client_id)
+            .and_then(|id| self.client_public_keys.get(&id))
+            .map(|entry| entry.value().0.clone())
+    }
+
+    fn resolve_client_transport_id(&self, client_id: ClientId) -> Option<ClientId> {
+        let sorted = self.get_sorted_client_keys();
+        if let Some(key) = sorted.get(client_id) {
+            let derived_id = key.derive_id();
+            if self.client_connections.contains_key(&derived_id) {
+                return Some(derived_id);
+            }
+        }
+
+        self.client_connections
+            .contains_key(&client_id)
+            .then_some(client_id)
+    }
+
+    /// Returns a connected client's DER-encoded SubjectPublicKeyInfo bytes by
+    /// TLS-derived transport ID without applying logical client-id mapping.
+    pub fn client_public_key_bytes_by_transport_id(&self, client_id: ClientId) -> Option<Vec<u8>> {
+        self.client_public_keys
+            .get(&client_id)
+            .map(|entry| entry.value().0.clone())
+    }
+
     /// Returns the node_id (legacy ID, used as fallback)
     pub fn get_node_id(&self) -> PartyId {
         self.node_id
@@ -1704,8 +1843,15 @@ impl QuicNetworkManager {
             ClientType::Server
         });
 
-        // Extract peer's public key from TLS certificate
-        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+        // Extract and authorize peer's public key from TLS certificate.
+        let peer_public_key =
+            match self.extract_and_verify_peer_public_key(&connection, "client connection") {
+                Ok(peer_public_key) => peer_public_key,
+                Err(err) => {
+                    connection.close(0u32.into(), b"certificate public key not allowed");
+                    return Err(err);
+                }
+            };
 
         // Open persistent stream and send sync byte to establish it
         let (mut send, recv) = connection
@@ -1806,8 +1952,15 @@ impl QuicNetworkManager {
             ClientType::Server
         });
 
-        // Extract peer's public key from TLS certificate
-        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+        // Extract and authorize peer's public key from TLS certificate.
+        let peer_public_key =
+            match self.extract_and_verify_peer_public_key(&connection, "server connection") {
+                Ok(peer_public_key) => peer_public_key,
+                Err(err) => {
+                    connection.close(0u32.into(), b"certificate public key not allowed");
+                    return Err(err);
+                }
+            };
 
         // Open persistent stream and send sync byte to establish it
         let (mut send, recv) = connection
@@ -2071,11 +2224,219 @@ impl QuicNetworkManager {
     pub async fn create_ice_candidates_message(&self) -> Result<NetEnvelope, String> {
         let candidates = self.gather_ice_candidates().await?;
 
-        Ok(NetEnvelope::IceCandidates {
+        Ok(Self::ice_candidates_envelope(&candidates))
+    }
+
+    fn ice_candidates_envelope(candidates: &LocalCandidates) -> NetEnvelope {
+        NetEnvelope::IceCandidates {
             ufrag: candidates.ufrag.clone(),
             pwd: candidates.pwd.clone(),
             candidates: candidates.candidates.clone(),
+        }
+    }
+
+    async fn send_ice_candidates(
+        signaling_connection: &Arc<dyn PeerConnection>,
+        local_candidates: &LocalCandidates,
+    ) -> Result<(), String> {
+        let candidates_msg = Self::ice_candidates_envelope(local_candidates);
+        signaling_connection
+            .send(&candidates_msg.serialize())
+            .await
+            .map_err(|e| format!("Failed to send ICE candidates: {}", e))
+    }
+
+    async fn receive_ice_candidates(
+        signaling_connection: &Arc<dyn PeerConnection>,
+    ) -> Result<(String, String, Vec<IceCandidate>), String> {
+        let remote_data = signaling_connection
+            .receive()
+            .await
+            .map_err(|e| format!("Failed to receive remote candidates: {}", e))?;
+
+        let remote_envelope = NetEnvelope::try_deserialize(&remote_data)
+            .map_err(|e| format!("Failed to deserialize remote candidates: {}", e))?;
+
+        match remote_envelope {
+            NetEnvelope::IceCandidates {
+                ufrag,
+                pwd,
+                candidates,
+            } => Ok((ufrag, pwd, candidates)),
+            _ => Err("Expected IceCandidates message".to_string()),
+        }
+    }
+
+    async fn configured_ice_agent(
+        &self,
+        local_candidates: &LocalCandidates,
+        remote_party_id: PartyId,
+        remote_ufrag: String,
+        remote_pwd: String,
+        remote_candidates: Vec<IceCandidate>,
+    ) -> Result<IceAgent, String> {
+        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
+            .map_err(|e| format!("Failed to create ICE agent: {}", e))?;
+
+        let host_addresses: Vec<_> = local_candidates
+            .candidates
+            .iter()
+            .map(|c| c.address)
+            .collect();
+
+        if host_addresses.is_empty() {
+            return Err("No local candidates".to_string());
+        }
+
+        // TODO: Consider reusing the QUIC endpoint's socket for accurate NAT mappings
+        let stun_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("Failed to create STUN socket: {}", e))?;
+
+        ice_agent
+            .gather_candidates(&host_addresses, &stun_socket)
+            .await
+            .map_err(|e| format!("ICE gathering failed: {}", e))?;
+
+        ice_agent
+            .set_remote_candidates(remote_party_id, remote_ufrag, remote_pwd, remote_candidates)
+            .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
+
+        Ok(ice_agent)
+    }
+
+    async fn run_p2p_ice_checks(
+        &mut self,
+        ice_agent: &mut IceAgent,
+    ) -> Result<CandidatePair, String> {
+        self.ensure_client_endpoint(ClientType::Server).await?;
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| "QUIC endpoint was not initialized".to_string())?;
+
+        ice_agent
+            .run_connectivity_checks(endpoint)
+            .await
+            .map_err(|e| format!("ICE connectivity checks failed: {}", e))
+    }
+
+    async fn connect_to_nominated_peer(
+        endpoint: &Endpoint,
+        nominated_pair: &CandidatePair,
+    ) -> Result<Connection, String> {
+        endpoint
+            .connect(nominated_pair.remote.address, "localhost")
+            .map_err(|e| format!("Failed to initiate connection: {}", e))?
+            .await
+            .map_err(|e| format!("Failed to establish connection: {}", e))
+    }
+
+    async fn accept_nominated_p2p_connection(
+        endpoint: &Endpoint,
+        nominated_pair: &CandidatePair,
+    ) -> Result<Connection, String> {
+        let incoming = endpoint.accept().await.ok_or("No incoming connection")?;
+        let connection = incoming
+            .await
+            .map_err(|e| format!("Failed to accept connection: {}", e))?;
+
+        let remote_addr = connection.remote_address();
+        if remote_addr.ip() != nominated_pair.remote.address.ip() {
+            connection.close(0u32.into(), b"unexpected p2p remote address");
+            return Err(format!(
+                "Rejected unexpected P2P remote address {} (expected IP {})",
+                remote_addr,
+                nominated_pair.remote.address.ip()
+            ));
+        }
+
+        Ok(connection)
+    }
+
+    fn negotiated_p2p_role(connection: &Connection) -> ClientType {
+        extract_alpn_role(connection).unwrap_or_else(|e| {
+            warn!("ALPN extraction failed: {}, defaulting to Server", e);
+            ClientType::Server
         })
+    }
+
+    fn verify_and_store_p2p_identity(
+        &self,
+        connection: &Connection,
+        party_id: PartyId,
+    ) -> Result<Option<NodePublicKey>, String> {
+        let peer_public_key =
+            match self.extract_and_verify_peer_public_key(connection, "p2p connection") {
+                Ok(peer_public_key) => peer_public_key,
+                Err(err) => {
+                    connection.close(0u32.into(), b"certificate public key not allowed");
+                    return Err(err);
+                }
+            };
+        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), party_id) {
+            connection.close(0u32.into(), b"p2p identity mismatch");
+            return Err(err);
+        }
+
+        if let Some(ref pk) = peer_public_key {
+            self.peer_public_keys.insert(party_id, pk.clone());
+        }
+
+        Ok(peer_public_key)
+    }
+
+    async fn open_synced_p2p_stream(
+        connection: &Connection,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| format!("Failed to open stream: {}", e))?;
+
+        send_stream_sync(&mut send)
+            .await
+            .map_err(|e| format!("Failed to sync stream: {}", e))?;
+
+        Ok((send, recv))
+    }
+
+    async fn accept_p2p_stream(
+        connection: &Connection,
+        timeout_ms: u64,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        let accept_timeout = Duration::from_millis(timeout_ms);
+
+        tokio::time::timeout(accept_timeout, connection.accept_bi())
+            .await
+            .map_err(|_| {
+                format!(
+                    "Timed out waiting for peer to open stream ({}ms)",
+                    timeout_ms
+                )
+            })?
+            .map_err(|e| format!("Failed to accept stream: {}", e))
+    }
+
+    fn store_p2p_connection(
+        &self,
+        party_id: PartyId,
+        connection: Connection,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        connection_role: ClientType,
+        peer_public_key: Option<NodePublicKey>,
+    ) -> Arc<dyn PeerConnection> {
+        let conn = Arc::new(QuicPeerConnection::new(
+            connection,
+            send,
+            recv,
+            connection_role,
+            peer_public_key,
+        )) as Arc<dyn PeerConnection>;
+
+        self.server_connections.insert(party_id, Arc::clone(&conn));
+        conn
     }
 
     /// Initiates a peer-to-peer connection with NAT traversal
@@ -2091,8 +2452,6 @@ impl QuicNetworkManager {
         target_party_id: PartyId,
         signaling_connection: Arc<dyn PeerConnection>,
     ) -> Result<Arc<dyn PeerConnection>, String> {
-        use crate::transports::ice_agent::IceAgent;
-
         if !self.network_config.enable_nat_traversal {
             return Err("NAT traversal not enabled".to_string());
         }
@@ -2102,86 +2461,24 @@ impl QuicNetworkManager {
             target_party_id
         );
 
-        // 1. Gather local candidates
         let local_candidates = self.gather_ice_candidates().await?;
-
-        // 2. Send our candidates to the peer
-        let candidates_msg = NetEnvelope::IceCandidates {
-            ufrag: local_candidates.ufrag.clone(),
-            pwd: local_candidates.pwd.clone(),
-            candidates: local_candidates.candidates.clone(),
-        };
-
-        signaling_connection
-            .send(&candidates_msg.serialize())
-            .await
-            .map_err(|e| format!("Failed to send ICE candidates: {}", e))?;
-
+        Self::send_ice_candidates(&signaling_connection, &local_candidates).await?;
         debug!("Sent {} ICE candidates to peer", local_candidates.len());
 
-        // 3. Wait for remote candidates
-        let remote_data = signaling_connection
-            .receive()
-            .await
-            .map_err(|e| format!("Failed to receive remote candidates: {}", e))?;
-
-        let remote_envelope = NetEnvelope::try_deserialize(&remote_data)
-            .map_err(|e| format!("Failed to deserialize remote candidates: {}", e))?;
-
-        let (remote_ufrag, remote_pwd, remote_candidates) = match remote_envelope {
-            NetEnvelope::IceCandidates {
-                ufrag,
-                pwd,
-                candidates,
-            } => (ufrag, pwd, candidates),
-            _ => {
-                return Err("Expected IceCandidates message".to_string());
-            }
-        };
-
+        let (remote_ufrag, remote_pwd, remote_candidates) =
+            Self::receive_ice_candidates(&signaling_connection).await?;
         debug!("Received {} remote ICE candidates", remote_candidates.len());
 
-        // 4. Create and configure ICE agent
-        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
-            .map_err(|e| format!("Failed to create ICE agent: {}", e))?;
-
-        // Gather candidates using our local addresses
-        let host_addresses: Vec<_> = local_candidates
-            .candidates
-            .iter()
-            .map(|c| c.address)
-            .collect();
-
-        if host_addresses.is_empty() {
-            return Err("No local candidates".to_string());
-        }
-
-        // Create a temporary socket for STUN queries
-        // TODO: Consider reusing the QUIC endpoint's socket for accurate NAT mappings
-        let stun_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("Failed to create STUN socket: {}", e))?;
-
-        ice_agent
-            .gather_candidates(&host_addresses, &stun_socket)
-            .await
-            .map_err(|e| format!("ICE gathering failed: {}", e))?;
-
-        // Set remote candidates
-        ice_agent
-            .set_remote_candidates(target_party_id, remote_ufrag, remote_pwd, remote_candidates)
-            .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
-
-        // 5. Ensure endpoint exists
-        self.ensure_client_endpoint(ClientType::Server).await?;
-        let endpoint = self.endpoint.as_ref().unwrap();
-
-        // 6. Run connectivity checks
-        let nominated_pair = ice_agent
-            .run_connectivity_checks(endpoint)
-            .await
-            .map_err(|e| format!("ICE connectivity checks failed: {}", e))?;
-
+        let mut ice_agent = self
+            .configured_ice_agent(
+                &local_candidates,
+                target_party_id,
+                remote_ufrag,
+                remote_pwd,
+                remote_candidates,
+            )
+            .await?;
+        let nominated_pair = self.run_p2p_ice_checks(&mut ice_agent).await?;
         info!(
             "ICE completed: {} -> {} (RTT: {:?}ms)",
             nominated_pair.local.address, nominated_pair.remote.address, nominated_pair.rtt_ms
@@ -2190,57 +2487,31 @@ impl QuicNetworkManager {
         // Store agent for potential later use
         self.pending_ice_agents.insert(target_party_id, ice_agent);
 
-        // 7. Establish QUIC connection on the successful pair
-        let connection = endpoint
-            .connect(nominated_pair.remote.address, "localhost")
-            .map_err(|e| format!("Failed to initiate connection: {}", e))?
-            .await
-            .map_err(|e| format!("Failed to establish connection: {}", e))?;
-
-        // Get connection role from ALPN negotiation
-        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
-            warn!("ALPN extraction failed: {}, defaulting to Server", e);
-            ClientType::Server
-        });
-
-        // Extract peer's public key from TLS certificate
-        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
-        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), target_party_id)
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| "QUIC endpoint was not initialized".to_string())?;
+        let connection = Self::connect_to_nominated_peer(endpoint, &nominated_pair).await?;
+        let connection_role = Self::negotiated_p2p_role(&connection);
+        let peer_public_key = match self.verify_and_store_p2p_identity(&connection, target_party_id)
         {
-            connection.close(0u32.into(), b"p2p identity mismatch");
-            self.pending_ice_agents.remove(&target_party_id);
-            return Err(err);
-        }
-
-        if let Some(ref pk) = peer_public_key {
-            self.peer_public_keys.insert(target_party_id, pk.clone());
-        }
-
-        // Open stream and sync
-        let (mut send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| format!("Failed to open stream: {}", e))?;
-
-        send_stream_sync(&mut send)
-            .await
-            .map_err(|e| format!("Failed to sync stream: {}", e))?;
-
-        let conn = Arc::new(QuicPeerConnection::new(
+            Ok(peer_public_key) => peer_public_key,
+            Err(err) => {
+                self.pending_ice_agents.remove(&target_party_id);
+                return Err(err);
+            }
+        };
+        let (send, recv) = Self::open_synced_p2p_stream(&connection).await?;
+        let conn = self.store_p2p_connection(
+            target_party_id,
             connection,
             send,
             recv,
             connection_role,
             peer_public_key,
-        )) as Arc<dyn PeerConnection>;
+        );
 
-        // Store connection
-        self.server_connections
-            .insert(target_party_id, Arc::clone(&conn));
-
-        // Cleanup ICE agent
         self.pending_ice_agents.remove(&target_party_id);
-
         Ok(conn)
     }
 
@@ -2255,8 +2526,6 @@ impl QuicNetworkManager {
         remote_candidates: Vec<crate::transports::ice::IceCandidate>,
         signaling_connection: Arc<dyn PeerConnection>,
     ) -> Result<Arc<dyn PeerConnection>, String> {
-        use crate::transports::ice_agent::IceAgent;
-
         if !self.network_config.enable_nat_traversal {
             return Err("NAT traversal not enabled".to_string());
         }
@@ -2267,120 +2536,42 @@ impl QuicNetworkManager {
             remote_candidates.len()
         );
 
-        // 1. Gather our candidates
         let local_candidates = self.gather_ice_candidates().await?;
+        Self::send_ice_candidates(&signaling_connection, &local_candidates).await?;
 
-        // 2. Send our candidates back
-        let candidates_msg = NetEnvelope::IceCandidates {
-            ufrag: local_candidates.ufrag.clone(),
-            pwd: local_candidates.pwd.clone(),
-            candidates: local_candidates.candidates.clone(),
-        };
-
-        signaling_connection
-            .send(&candidates_msg.serialize())
-            .await
-            .map_err(|e| format!("Failed to send ICE candidates: {}", e))?;
-
-        // 3. Create ICE agent
-        let mut ice_agent = IceAgent::new(self.network_config.ice_config.clone(), self.node_id)
-            .map_err(|e| format!("Failed to create ICE agent: {}", e))?;
-
-        // Gather candidates using our local addresses
-        let host_addresses: Vec<_> = local_candidates
-            .candidates
-            .iter()
-            .map(|c| c.address)
-            .collect();
-
-        if host_addresses.is_empty() {
-            return Err("No local candidates".to_string());
-        }
-
-        // Create a temporary socket for STUN queries
-        // TODO: Consider reusing the QUIC endpoint's socket for accurate NAT mappings
-        let stun_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("Failed to create STUN socket: {}", e))?;
-
-        ice_agent
-            .gather_candidates(&host_addresses, &stun_socket)
-            .await
-            .map_err(|e| format!("ICE gathering failed: {}", e))?;
-
-        ice_agent
-            .set_remote_candidates(from_party_id, remote_ufrag, remote_pwd, remote_candidates)
-            .map_err(|e| format!("Failed to set remote candidates: {}", e))?;
-
-        // 4. Run connectivity checks
-        self.ensure_client_endpoint(ClientType::Server).await?;
-        let endpoint = self.endpoint.as_ref().unwrap();
-
-        let nominated_pair = ice_agent
-            .run_connectivity_checks(endpoint)
-            .await
-            .map_err(|e| format!("ICE connectivity checks failed: {}", e))?;
-
+        let mut ice_agent = self
+            .configured_ice_agent(
+                &local_candidates,
+                from_party_id,
+                remote_ufrag,
+                remote_pwd,
+                remote_candidates,
+            )
+            .await?;
+        let nominated_pair = self.run_p2p_ice_checks(&mut ice_agent).await?;
         info!(
             "ICE completed (responder): {} -> {}",
             nominated_pair.local.address, nominated_pair.remote.address
         );
 
-        // 5. The controlling agent will establish the final connection
-        // We wait to accept it
-        let incoming = endpoint.accept().await.ok_or("No incoming connection")?;
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| "QUIC endpoint was not initialized".to_string())?;
+        let connection = Self::accept_nominated_p2p_connection(endpoint, &nominated_pair).await?;
+        let connection_role = Self::negotiated_p2p_role(&connection);
+        let peer_public_key = self.verify_and_store_p2p_identity(&connection, from_party_id)?;
+        let (send, recv) =
+            Self::accept_p2p_stream(&connection, self.network_config.timeout_ms).await?;
 
-        let connection = incoming
-            .await
-            .map_err(|e| format!("Failed to accept connection: {}", e))?;
-
-        let remote_addr = connection.remote_address();
-        if remote_addr.ip() != nominated_pair.remote.address.ip() {
-            connection.close(0u32.into(), b"unexpected p2p remote address");
-            return Err(format!(
-                "Rejected unexpected P2P remote address {} (expected IP {})",
-                remote_addr,
-                nominated_pair.remote.address.ip()
-            ));
-        }
-
-        // Get connection role from ALPN negotiation
-        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
-            warn!("ALPN extraction failed: {}, defaulting to Server", e);
-            ClientType::Server
-        });
-
-        // Extract peer's public key from TLS certificate
-        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
-        if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), from_party_id)
-        {
-            connection.close(0u32.into(), b"p2p identity mismatch");
-            return Err(err);
-        }
-
-        if let Some(ref pk) = peer_public_key {
-            self.peer_public_keys.insert(from_party_id, pk.clone());
-        }
-
-        let accept_timeout = Duration::from_millis(self.network_config.timeout_ms);
-
-        let (send, recv) = tokio::time::timeout(accept_timeout, connection.accept_bi())
-            .await
-            .map_err(|_| format!("Timed out waiting for peer to open stream ({}ms)", self.network_config.timeout_ms))?
-            .map_err(|e| format!("Failed to accept stream: {}", e))?;
-
-        let conn = Arc::new(QuicPeerConnection::new(
+        Ok(self.store_p2p_connection(
+            from_party_id,
             connection,
             send,
             recv,
             connection_role,
             peer_public_key,
-        )) as Arc<dyn PeerConnection>;
-
-        self.server_connections
-            .insert(from_party_id, Arc::clone(&conn));
-
-        Ok(conn)
+        ))
     }
 
     /// Connects with automatic fallback strategies
@@ -2549,7 +2740,10 @@ impl QuicNetworkManager {
         tokio::spawn(async move {
             match manager.execute_consensus(timeout).await {
                 Ok(ordering) => {
-                    *manager.verified_ordering.lock().expect("verified_ordering lock poisoned") = Some(ordering);
+                    *manager
+                        .verified_ordering
+                        .lock()
+                        .expect("verified_ordering lock poisoned") = Some(ordering);
                     let _ = manager.consensus_gate_tx.send(ConsensusGate::Ready);
                     info!("Consensus completed successfully");
                 }
@@ -2575,12 +2769,13 @@ impl QuicNetworkManager {
             .local_public_key
             .as_ref()
             .ok_or(ConsensusError::Aborted("No local public key".into()))?;
-        let local_party_id = node_keys
-            .iter()
-            .position(|k| k == local_pk)
-            .ok_or(ConsensusError::Aborted(
-                "Local key not found in sorted keys".into(),
-            ))? as PartyId;
+        let local_party_id =
+            node_keys
+                .iter()
+                .position(|k| k == local_pk)
+                .ok_or(ConsensusError::Aborted(
+                    "Local key not found in sorted keys".into(),
+                ))? as PartyId;
         let client_keys = self.get_sorted_client_keys();
         if let Some(expected_parties) = self.network_config.expected_parties {
             if party_count != expected_parties {
@@ -2762,17 +2957,11 @@ impl QuicNetworkManager {
             let data = conn.receive().await.map_err(|e| {
                 ConsensusError::QueryFailed(format!("Failed to receive node list: {}", e))
             })?;
-            let envelope = NetEnvelope::try_deserialize(&data).map_err(|e| {
-                ConsensusError::QueryFailed(format!("Invalid response: {}", e))
-            })?;
+            let envelope = NetEnvelope::try_deserialize(&data)
+                .map_err(|e| ConsensusError::QueryFailed(format!("Invalid response: {}", e)))?;
             match envelope {
                 NetEnvelope::NodeListResponse { node_keys } => {
-                    orderings.push(
-                        node_keys
-                            .into_iter()
-                            .map(NodePublicKey)
-                            .collect::<Vec<_>>(),
-                    );
+                    orderings.push(node_keys.into_iter().map(NodePublicKey).collect::<Vec<_>>());
                 }
                 _ => {
                     return Err(ConsensusError::QueryFailed(
@@ -2800,10 +2989,7 @@ impl QuicNetworkManager {
 }
 
 impl NetworkManager for QuicNetworkManager {
-    fn connect<'a>(
-        &'a mut self,
-        address: SocketAddr,
-    ) -> SharedPeerConnectionFuture<'a> {
+    fn connect<'a>(&'a mut self, address: SocketAddr) -> SharedPeerConnectionFuture<'a> {
         Box::pin(async move { self.connect_as_server(address).await })
     }
 
@@ -2834,8 +3020,15 @@ impl NetworkManager for QuicNetworkManager {
                 ClientType::Server
             });
 
-            // Extract peer's public key from TLS certificate (mTLS)
-            let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+            // Extract and authorize peer's public key from TLS certificate (mTLS).
+            let peer_public_key =
+                match self.extract_and_verify_peer_public_key(&connection, "incoming connection") {
+                    Ok(peer_public_key) => peer_public_key,
+                    Err(err) => {
+                        connection.close(0u32.into(), b"certificate public key not allowed");
+                        return Err(err);
+                    }
+                };
 
             // Accept persistent stream and receive sync byte (with timeout to
             // prevent indefinite hang if peer connects but never opens a stream)
@@ -2843,12 +3036,22 @@ impl NetworkManager for QuicNetworkManager {
 
             let (send, mut recv) = tokio::time::timeout(accept_timeout, connection.accept_bi())
                 .await
-                .map_err(|_| format!("Timed out waiting for peer to open stream ({}ms)", self.network_config.timeout_ms))?
+                .map_err(|_| {
+                    format!(
+                        "Timed out waiting for peer to open stream ({}ms)",
+                        self.network_config.timeout_ms
+                    )
+                })?
                 .map_err(|e| format!("Failed to accept stream: {}", e))?;
 
             let recv_result = tokio::time::timeout(accept_timeout, recv_stream_sync(&mut recv))
                 .await
-                .map_err(|_| format!("Timed out waiting for stream sync byte ({}ms)", self.network_config.timeout_ms))?;
+                .map_err(|_| {
+                    format!(
+                        "Timed out waiting for stream sync byte ({}ms)",
+                        self.network_config.timeout_ms
+                    )
+                })?;
             recv_result.map_err(|e| format!("Failed to sync stream: {}", e))?;
 
             // Derive peer ID from public key, or fallback to address-based lookup
@@ -2907,10 +3110,14 @@ impl NetworkManager for QuicNetworkManager {
                         remote_addr, peer_id
                     );
 
-                    // Validate peer is known when TLS is enforced; otherwise
-                    // allow auto-discovery for development/test environments.
+                    // Validate peer is known when TLS is enforced and no
+                    // certificate public key allowlist is configured. When an
+                    // allowlist is configured, the key allowlist is the
+                    // authorization source.
                     if !self.nodes.iter().any(|n| n.id() == peer_id) {
-                        if self.network_config.use_tls {
+                        if self.network_config.use_tls
+                            && !self.has_certificate_public_key_allowlist()
+                        {
                             warn!(
                                 "Rejected unknown server peer {} from {} (use_tls=true)",
                                 peer_id, remote_addr
@@ -3125,7 +3332,12 @@ impl Network for QuicNetworkManager {
     ) -> Result<usize, NetworkError> {
         self.await_consensus_gate().await?;
 
-        if let Some(connection) = self.get_client_connection(client) {
+        if let Some(transport_id) = self.resolve_client_transport_id(client) {
+            let Some(conn_ref) = self.client_connections.get(&transport_id) else {
+                return Err(NetworkError::ClientNotFound(client));
+            };
+            let connection = conn_ref.value();
+
             // Send directly without pre-checking is_connected() to avoid
             // check-then-act race (STO-478).
             match connection.send(message).await {
@@ -3138,11 +3350,15 @@ impl Network for QuicNetworkManager {
     }
 
     fn clients(&self) -> Vec<ClientId> {
-        self.client_ids.iter().map(|entry| *entry.key()).collect()
+        let sorted = self.get_sorted_client_keys();
+        if sorted.is_empty() {
+            return self.client_ids.iter().map(|entry| *entry.key()).collect();
+        }
+        (0..sorted.len()).collect()
     }
 
     fn is_client_connected(&self, client: ClientId) -> bool {
-        self.client_ids.contains(&client)
+        self.resolve_client_transport_id(client).is_some()
     }
 
     fn local_party_id(&self) -> PartyId {
@@ -3159,7 +3375,10 @@ impl Network for QuicNetworkManager {
     }
 
     fn verified_ordering(&self) -> Option<VerifiedOrdering> {
-        self.verified_ordering.lock().expect("verified_ordering lock poisoned").clone()
+        self.verified_ordering
+            .lock()
+            .expect("verified_ordering lock poisoned")
+            .clone()
     }
 }
 
@@ -3702,8 +3921,9 @@ mod tests {
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.signing_key.serialize_der();
 
-        let config =
-            QuicNetworkManager::create_self_signed_server_config(&cert_der, &key_der, 300_000, false);
+        let config = QuicNetworkManager::create_self_signed_server_config(
+            &cert_der, &key_der, 300_000, false,
+        );
         assert!(config.is_ok());
     }
 
@@ -3723,10 +3943,7 @@ mod tests {
             idle_timeout_ms: 0,
             ..Default::default()
         };
-        assert_eq!(
-            config.validate(),
-            Err(QuicConfigError::InvalidIdleTimeout)
-        );
+        assert_eq!(config.validate(), Err(QuicConfigError::InvalidIdleTimeout));
     }
 
     #[test]
@@ -4059,7 +4276,10 @@ mod tests {
             .await
             .expect("Unknown peer connect task should not panic");
 
-        assert!(accept_result.is_err(), "accept() should reject unknown peer");
+        assert!(
+            accept_result.is_err(),
+            "accept() should reject unknown peer"
+        );
         let err = accept_result.unwrap_err();
         assert!(
             err.contains("Unauthorized peer ID"),
@@ -4077,6 +4297,133 @@ mod tests {
             leaked_peer_ids.is_empty(),
             "Rejected peer keys leaked into map: {:?}",
             leaked_peer_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn test_certificate_public_key_allowlist_accepts_allowed_peer() {
+        ensure_crypto_provider();
+
+        let mut server = QuicNetworkManager::with_node_id(1);
+        let mut client = QuicNetworkManager::with_node_id(2);
+        client
+            .ensure_local_certificate()
+            .expect("client certificate generation should succeed");
+        let client_key = client
+            .get_public_key()
+            .expect("client should have a public key")
+            .clone();
+
+        server.add_allowed_certificate_public_key(client_key.clone());
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("server listen should succeed");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let connect_task = tokio::spawn(async move {
+            let result = client.connect_as_server(server_addr).await;
+            (client, result)
+        });
+
+        let accept_result = server.accept().await;
+        let (client, connect_result) = connect_task
+            .await
+            .expect("allowed peer connect task should not panic");
+
+        assert!(
+            accept_result.is_ok(),
+            "allowed peer should be accepted: {:?}",
+            accept_result.err()
+        );
+        assert!(
+            connect_result.is_ok(),
+            "allowed peer should connect: {:?}",
+            connect_result.err()
+        );
+        assert!(
+            server
+                .peer_public_keys
+                .contains_key(&client.local_derived_id()),
+            "allowed peer key should be stored"
+        );
+        assert_eq!(
+            server
+                .peer_public_keys
+                .get(&client.local_derived_id())
+                .map(|entry| entry.clone()),
+            Some(client_key)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_certificate_public_key_allowlist_rejects_unlisted_peer() {
+        ensure_crypto_provider();
+
+        let mut server = QuicNetworkManager::with_node_id(1);
+        server.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("server listen should succeed");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let connect_task = tokio::spawn(async move {
+            let mut unlisted_peer = QuicNetworkManager::with_node_id(2);
+            unlisted_peer.connect_as_server(server_addr).await
+        });
+
+        let accept_result = server.accept().await;
+        let _connect_result = connect_task
+            .await
+            .expect("unlisted peer connect task should not panic");
+
+        assert!(accept_result.is_err(), "unlisted peer should be rejected");
+        let err = accept_result.unwrap_err();
+        assert!(
+            err.contains("not in allowlist"),
+            "Expected allowlist rejection, got: {}",
+            err
+        );
+        assert!(
+            server.peer_public_keys.is_empty(),
+            "rejected peer key should not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_certificate_public_key_allowlist_rejects_unlisted_server_on_connect() {
+        ensure_crypto_provider();
+
+        let mut server = QuicNetworkManager::with_node_id(1);
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("server listen should succeed");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let mut client = QuicNetworkManager::with_node_id(2);
+        client.add_allowed_certificate_public_key(NodePublicKey(vec![0x11, 0x22, 0x33]));
+
+        let accept_task = tokio::spawn(async move { server.accept().await });
+        let connect_result = client.connect_as_client(server_addr).await;
+        let _accept_result = accept_task
+            .await
+            .expect("server accept task should not panic");
+
+        assert!(
+            connect_result.is_err(),
+            "client should reject unlisted server certificate public key"
+        );
+        let err = connect_result.unwrap_err();
+        assert!(
+            err.contains("not in allowlist"),
+            "Expected allowlist rejection, got: {}",
+            err
+        );
+        assert!(
+            client.peer_public_keys.is_empty(),
+            "rejected server key should not be stored"
         );
     }
 
@@ -4557,7 +4904,10 @@ mod tests {
         let mut spoofed_frame = Vec::with_capacity(4);
         spoofed_frame.extend_from_slice(&oversized.to_be_bytes());
         let result = LoopbackPeerConnection::unframe_message(spoofed_frame);
-        assert!(result.is_err(), "Frames claiming > MAX_MESSAGE_SIZE must be rejected");
+        assert!(
+            result.is_err(),
+            "Frames claiming > MAX_MESSAGE_SIZE must be rejected"
+        );
     }
 
     // ========================================================================
@@ -4587,8 +4937,7 @@ mod tests {
     #[test]
     fn test_server_config_with_use_tls_true_requires_client_cert() {
         ensure_crypto_provider();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .expect("cert gen");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert gen");
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.signing_key.serialize_der();
 
@@ -4596,21 +4945,26 @@ mod tests {
         let config = QuicNetworkManager::create_self_signed_server_config(
             &cert_der, &key_der, 300_000, true,
         );
-        assert!(config.is_ok(), "Server config with use_tls=true must succeed");
+        assert!(
+            config.is_ok(),
+            "Server config with use_tls=true must succeed"
+        );
     }
 
     #[test]
     fn test_server_config_with_use_tls_false_allows_no_client_cert() {
         ensure_crypto_provider();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .expect("cert gen");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert gen");
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.signing_key.serialize_der();
 
         let config = QuicNetworkManager::create_self_signed_server_config(
             &cert_der, &key_der, 300_000, false,
         );
-        assert!(config.is_ok(), "Server config with use_tls=false must succeed");
+        assert!(
+            config.is_ok(),
+            "Server config with use_tls=false must succeed"
+        );
     }
 
     #[test]
@@ -4883,8 +5237,14 @@ mod tests {
         // Both listen
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        server1.listen(addr1).await.expect("Failed to start server1");
-        server2.listen(addr2).await.expect("Failed to start server2");
+        server1
+            .listen(addr1)
+            .await
+            .expect("Failed to start server1");
+        server2
+            .listen(addr2)
+            .await
+            .expect("Failed to start server2");
 
         let bound_addr1 = server1.endpoint.as_ref().unwrap().local_addr().unwrap();
         let bound_addr2 = server2.endpoint.as_ref().unwrap().local_addr().unwrap();
@@ -4904,13 +5264,11 @@ mod tests {
         // Server1 connects outbound to server2, server2 accepts
         // Server2 connects outbound to server1, server1 accepts
         // All four happen concurrently via clones.
-        let s1_connect = tokio::spawn(async move {
-            s1_connector.connect_as_server(bound_addr2).await
-        });
+        let s1_connect =
+            tokio::spawn(async move { s1_connector.connect_as_server(bound_addr2).await });
         let s2_accept = tokio::spawn(async move { server2.accept().await });
-        let s2_connect = tokio::spawn(async move {
-            s2_connector.connect_as_server(bound_addr1).await
-        });
+        let s2_connect =
+            tokio::spawn(async move { s2_connector.connect_as_server(bound_addr1).await });
         let s1_accept = tokio::spawn(async move { server1.accept().await });
 
         let s1_connect_result = s1_connect.await.unwrap();
@@ -5000,7 +5358,10 @@ mod tests {
             let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
 
             let mut bad_peer = QuicNetworkManager::with_node_id(2);
-            bad_peer.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            bad_peer
+                .listen("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
             let bad_ep = bad_peer.endpoint.as_ref().unwrap().clone();
 
             // The QUIC handshake requires the server to poll accept() while
@@ -5029,7 +5390,10 @@ mod tests {
 
         rt.shutdown_timeout(Duration::from_secs(1));
 
-        assert!(result.is_err(), "accept() should return an error on timeout");
+        assert!(
+            result.is_err(),
+            "accept() should return an error on timeout"
+        );
         let err_msg = result.unwrap_err();
         assert!(
             err_msg.contains("Timed out"),
@@ -5174,11 +5538,9 @@ mod tests {
         manager.maybe_start_consensus();
 
         // consensus_started should remain false
-        assert!(
-            !manager
-                .consensus_started
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
+        assert!(!manager
+            .consensus_started
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -5196,11 +5558,9 @@ mod tests {
 
         // First call should set the flag
         manager.maybe_start_consensus();
-        assert!(
-            manager
-                .consensus_started
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
+        assert!(manager
+            .consensus_started
+            .load(std::sync::atomic::Ordering::SeqCst));
 
         // Second call should be a no-op (already started)
         manager.maybe_start_consensus();
@@ -5371,13 +5731,14 @@ mod tests {
             .await
             .expect("failed to preload signaling message");
 
-        let result = victim.connect_p2p(target_party_id, Arc::clone(&signaling)).await;
+        let result = victim
+            .connect_p2p(target_party_id, Arc::clone(&signaling))
+            .await;
         let _ = stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), accept_task).await;
 
-        let err = result.expect_err(
-            "connect_p2p should reject mismatched peer identity, but it succeeded",
-        );
+        let err = result
+            .expect_err("connect_p2p should reject mismatched peer identity, but it succeeded");
         assert!(
             err.to_lowercase().contains("identity mismatch"),
             "expected identity mismatch error, got: {}",
@@ -5399,10 +5760,7 @@ mod tests {
         );
 
         // Simulate consensus completing by writing directly to the field
-        *manager
-            .verified_ordering
-            .lock()
-            .expect("lock poisoned") = Some(ordering.clone());
+        *manager.verified_ordering.lock().expect("lock poisoned") = Some(ordering.clone());
 
         // Must reliably return the stored value on every call
         for _ in 0..100 {
@@ -5515,8 +5873,12 @@ mod tests {
         // Add some peer public keys
         let pk_a = NodePublicKey(vec![1, 0, 0]);
         let pk_b = NodePublicKey(vec![2, 0, 0]);
-        manager.peer_public_keys.insert(pk_a.derive_id(), pk_a.clone());
-        manager.peer_public_keys.insert(pk_b.derive_id(), pk_b.clone());
+        manager
+            .peer_public_keys
+            .insert(pk_a.derive_id(), pk_a.clone());
+        manager
+            .peer_public_keys
+            .insert(pk_b.derive_id(), pk_b.clone());
 
         // Snapshot the sorted keys
         let sorted = manager.get_sorted_public_keys();
@@ -5571,7 +5933,9 @@ mod tests {
         let local_pk = NodePublicKey(vec![1]);
         let peer_pk = NodePublicKey(vec![2]);
         manager.local_public_key = Some(local_pk);
-        manager.peer_public_keys.insert(peer_pk.derive_id(), peer_pk.clone());
+        manager
+            .peer_public_keys
+            .insert(peer_pk.derive_id(), peer_pk.clone());
         manager
             .client_public_keys
             .insert(1, NodePublicKey(vec![10, 20, 30]));

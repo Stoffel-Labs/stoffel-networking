@@ -1032,6 +1032,9 @@ pub struct QuicNetworkManager {
     local_public_key: Option<NodePublicKey>,
     /// Connected peers' public keys (for sender_id computation)
     peer_public_keys: Arc<DashMap<PartyId, NodePublicKey>>,
+    /// Optional allowlist of peer certificate public keys.
+    /// Empty means certificate public key allowlisting is disabled.
+    allowed_peer_public_keys: Arc<DashSet<NodePublicKey>>,
     /// STUN client for NAT traversal
     stun_client: Option<Arc<StunClient>>,
     /// Cached local ICE candidates
@@ -1098,6 +1101,7 @@ impl QuicNetworkManager {
             local_key_der: None,
             local_public_key: None,
             peer_public_keys: Arc::new(DashMap::new()),
+            allowed_peer_public_keys: Arc::new(DashSet::new()),
             stun_client: None,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -1206,6 +1210,7 @@ impl QuicNetworkManager {
             local_key_der: None,
             local_public_key: None,
             peer_public_keys: Arc::new(DashMap::new()),
+            allowed_peer_public_keys: Arc::new(DashSet::new()),
             stun_client,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -1247,6 +1252,32 @@ impl QuicNetworkManager {
         {
             let _ = self.consensus_gate_tx.send(ConsensusGate::Pending);
         }
+    }
+
+    /// Replaces the certificate public key allowlist.
+    ///
+    /// Keys must be DER-encoded SubjectPublicKeyInfo bytes, matching
+    /// [`NodePublicKey`]. When the allowlist is empty, this check is disabled.
+    pub fn set_allowed_certificate_public_keys(&mut self, keys: Vec<NodePublicKey>) {
+        self.allowed_peer_public_keys.clear();
+        for key in keys {
+            self.allowed_peer_public_keys.insert(key);
+        }
+    }
+
+    /// Adds a DER-encoded SubjectPublicKeyInfo key to the certificate public key allowlist.
+    pub fn add_allowed_certificate_public_key(&mut self, key: NodePublicKey) {
+        self.allowed_peer_public_keys.insert(key);
+    }
+
+    /// Clears the certificate public key allowlist, disabling this check.
+    pub fn clear_allowed_certificate_public_keys(&mut self) {
+        self.allowed_peer_public_keys.clear();
+    }
+
+    /// Returns true when certificate public key allowlisting is enabled.
+    pub fn has_certificate_public_key_allowlist(&self) -> bool {
+        !self.allowed_peer_public_keys.is_empty()
     }
 
     pub fn add_node(&mut self, node: QuicNode) {
@@ -1540,6 +1571,42 @@ impl QuicNetworkManager {
         Self::extract_public_key_from_cert(&certs[0])
     }
 
+    fn verify_peer_public_key_allowed(
+        &self,
+        peer_public_key: Option<&NodePublicKey>,
+        context: &str,
+    ) -> Result<(), String> {
+        if self.allowed_peer_public_keys.is_empty() {
+            return Ok(());
+        }
+
+        let peer_public_key = peer_public_key.ok_or_else(|| {
+            format!(
+                "{} rejected: no peer certificate public key available while allowlist is enabled",
+                context
+            )
+        })?;
+
+        if !self.allowed_peer_public_keys.contains(peer_public_key) {
+            return Err(format!(
+                "{} rejected: peer certificate public key is not in allowlist",
+                context
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn extract_and_verify_peer_public_key(
+        &self,
+        connection: &Connection,
+        context: &str,
+    ) -> Result<Option<NodePublicKey>, String> {
+        let peer_public_key = Self::extract_peer_public_key(connection).ok();
+        self.verify_peer_public_key_allowed(peer_public_key.as_ref(), context)?;
+        Ok(peer_public_key)
+    }
+
     /// Verifies that the peer certificate-derived identity matches the expected party.
     ///
     /// P2P NAT traversal paths must bind the established QUIC connection to the
@@ -1776,8 +1843,15 @@ impl QuicNetworkManager {
             ClientType::Server
         });
 
-        // Extract peer's public key from TLS certificate
-        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+        // Extract and authorize peer's public key from TLS certificate.
+        let peer_public_key =
+            match self.extract_and_verify_peer_public_key(&connection, "client connection") {
+                Ok(peer_public_key) => peer_public_key,
+                Err(err) => {
+                    connection.close(0u32.into(), b"certificate public key not allowed");
+                    return Err(err);
+                }
+            };
 
         // Open persistent stream and send sync byte to establish it
         let (mut send, recv) = connection
@@ -1878,8 +1952,15 @@ impl QuicNetworkManager {
             ClientType::Server
         });
 
-        // Extract peer's public key from TLS certificate
-        let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+        // Extract and authorize peer's public key from TLS certificate.
+        let peer_public_key =
+            match self.extract_and_verify_peer_public_key(&connection, "server connection") {
+                Ok(peer_public_key) => peer_public_key,
+                Err(err) => {
+                    connection.close(0u32.into(), b"certificate public key not allowed");
+                    return Err(err);
+                }
+            };
 
         // Open persistent stream and send sync byte to establish it
         let (mut send, recv) = connection
@@ -2285,7 +2366,14 @@ impl QuicNetworkManager {
         connection: &Connection,
         party_id: PartyId,
     ) -> Result<Option<NodePublicKey>, String> {
-        let peer_public_key = Self::extract_peer_public_key(connection).ok();
+        let peer_public_key =
+            match self.extract_and_verify_peer_public_key(connection, "p2p connection") {
+                Ok(peer_public_key) => peer_public_key,
+                Err(err) => {
+                    connection.close(0u32.into(), b"certificate public key not allowed");
+                    return Err(err);
+                }
+            };
         if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), party_id) {
             connection.close(0u32.into(), b"p2p identity mismatch");
             return Err(err);
@@ -2932,8 +3020,15 @@ impl NetworkManager for QuicNetworkManager {
                 ClientType::Server
             });
 
-            // Extract peer's public key from TLS certificate (mTLS)
-            let peer_public_key = Self::extract_peer_public_key(&connection).ok();
+            // Extract and authorize peer's public key from TLS certificate (mTLS).
+            let peer_public_key =
+                match self.extract_and_verify_peer_public_key(&connection, "incoming connection") {
+                    Ok(peer_public_key) => peer_public_key,
+                    Err(err) => {
+                        connection.close(0u32.into(), b"certificate public key not allowed");
+                        return Err(err);
+                    }
+                };
 
             // Accept persistent stream and receive sync byte (with timeout to
             // prevent indefinite hang if peer connects but never opens a stream)
@@ -3015,10 +3110,14 @@ impl NetworkManager for QuicNetworkManager {
                         remote_addr, peer_id
                     );
 
-                    // Validate peer is known when TLS is enforced; otherwise
-                    // allow auto-discovery for development/test environments.
+                    // Validate peer is known when TLS is enforced and no
+                    // certificate public key allowlist is configured. When an
+                    // allowlist is configured, the key allowlist is the
+                    // authorization source.
                     if !self.nodes.iter().any(|n| n.id() == peer_id) {
-                        if self.network_config.use_tls {
+                        if self.network_config.use_tls
+                            && !self.has_certificate_public_key_allowlist()
+                        {
                             warn!(
                                 "Rejected unknown server peer {} from {} (use_tls=true)",
                                 peer_id, remote_addr
@@ -4198,6 +4297,133 @@ mod tests {
             leaked_peer_ids.is_empty(),
             "Rejected peer keys leaked into map: {:?}",
             leaked_peer_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn test_certificate_public_key_allowlist_accepts_allowed_peer() {
+        ensure_crypto_provider();
+
+        let mut server = QuicNetworkManager::with_node_id(1);
+        let mut client = QuicNetworkManager::with_node_id(2);
+        client
+            .ensure_local_certificate()
+            .expect("client certificate generation should succeed");
+        let client_key = client
+            .get_public_key()
+            .expect("client should have a public key")
+            .clone();
+
+        server.add_allowed_certificate_public_key(client_key.clone());
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("server listen should succeed");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let connect_task = tokio::spawn(async move {
+            let result = client.connect_as_server(server_addr).await;
+            (client, result)
+        });
+
+        let accept_result = server.accept().await;
+        let (client, connect_result) = connect_task
+            .await
+            .expect("allowed peer connect task should not panic");
+
+        assert!(
+            accept_result.is_ok(),
+            "allowed peer should be accepted: {:?}",
+            accept_result.err()
+        );
+        assert!(
+            connect_result.is_ok(),
+            "allowed peer should connect: {:?}",
+            connect_result.err()
+        );
+        assert!(
+            server
+                .peer_public_keys
+                .contains_key(&client.local_derived_id()),
+            "allowed peer key should be stored"
+        );
+        assert_eq!(
+            server
+                .peer_public_keys
+                .get(&client.local_derived_id())
+                .map(|entry| entry.clone()),
+            Some(client_key)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_certificate_public_key_allowlist_rejects_unlisted_peer() {
+        ensure_crypto_provider();
+
+        let mut server = QuicNetworkManager::with_node_id(1);
+        server.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("server listen should succeed");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let connect_task = tokio::spawn(async move {
+            let mut unlisted_peer = QuicNetworkManager::with_node_id(2);
+            unlisted_peer.connect_as_server(server_addr).await
+        });
+
+        let accept_result = server.accept().await;
+        let _connect_result = connect_task
+            .await
+            .expect("unlisted peer connect task should not panic");
+
+        assert!(accept_result.is_err(), "unlisted peer should be rejected");
+        let err = accept_result.unwrap_err();
+        assert!(
+            err.contains("not in allowlist"),
+            "Expected allowlist rejection, got: {}",
+            err
+        );
+        assert!(
+            server.peer_public_keys.is_empty(),
+            "rejected peer key should not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_certificate_public_key_allowlist_rejects_unlisted_server_on_connect() {
+        ensure_crypto_provider();
+
+        let mut server = QuicNetworkManager::with_node_id(1);
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("server listen should succeed");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let mut client = QuicNetworkManager::with_node_id(2);
+        client.add_allowed_certificate_public_key(NodePublicKey(vec![0x11, 0x22, 0x33]));
+
+        let accept_task = tokio::spawn(async move { server.accept().await });
+        let connect_result = client.connect_as_client(server_addr).await;
+        let _accept_result = accept_task
+            .await
+            .expect("server accept task should not panic");
+
+        assert!(
+            connect_result.is_err(),
+            "client should reject unlisted server certificate public key"
+        );
+        let err = connect_result.unwrap_err();
+        assert!(
+            err.contains("not in allowlist"),
+            "Expected allowlist rejection, got: {}",
+            err
+        );
+        assert!(
+            client.peer_public_keys.is_empty(),
+            "rejected server key should not be stored"
         );
     }
 

@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Once;
-use stoffelnet::network_utils::{Message, NetworkError, Node};
+use stoffelnet::network_utils::{Message, NetworkError, Node, NodePublicKey};
 use stoffelnet::transports::quic::{
     ConnectionState, LoopbackPeerConnection, NetworkManager, PeerConnection, QuicMessage,
     QuicNetworkConfig, QuicNetworkManager, QuicNode,
@@ -17,6 +17,13 @@ fn init_crypto() {
 
 fn localhost(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+fn unused_localhost_addr() -> SocketAddr {
+    let listener = std::net::TcpListener::bind(localhost(0)).expect("should allocate local port");
+    listener
+        .local_addr()
+        .expect("listener should expose local address")
 }
 
 // ============================================================================
@@ -189,6 +196,137 @@ async fn test_manager_certificate_generation() {
     assert_eq!(
         public_key, public_key_again,
         "public key should remain stable across calls"
+    );
+}
+
+#[tokio::test]
+async fn test_certificate_public_key_allowlist_accepts_expected_server_peer() {
+    init_crypto();
+
+    let mut listener = QuicNetworkManager::with_node_id(1);
+    let mut connector = QuicNetworkManager::with_node_id(2);
+    let listener_addr = unused_localhost_addr();
+    let connector_addr = unused_localhost_addr();
+
+    listener
+        .listen(listener_addr)
+        .await
+        .expect("listener should start");
+    connector
+        .listen(connector_addr)
+        .await
+        .expect("connector should start so its certificate key is available");
+
+    let connector_key = connector
+        .get_public_key()
+        .expect("connector should expose a certificate public key")
+        .clone();
+
+    listener.set_allowed_certificate_public_keys(vec![connector_key.clone()]);
+
+    let connect_task = tokio::spawn(async move {
+        let result = connector.connect_as_server(listener_addr).await;
+        (connector, result)
+    });
+
+    let accept_result = listener.accept().await;
+    let (connector, connect_result) = connect_task.await.expect("connect task should not panic");
+
+    assert!(
+        accept_result.is_ok(),
+        "listener should accept an allowlisted certificate public key: {:?}",
+        accept_result.err()
+    );
+    assert!(
+        connect_result.is_ok(),
+        "connector should establish the server-role connection: {:?}",
+        connect_result.err()
+    );
+
+    let connector_id = connector
+        .get_public_key()
+        .expect("connector key should still be available")
+        .derive_id();
+    assert_eq!(
+        listener.peer_public_key_bytes(connector_id),
+        Some(connector_key.0),
+        "listener should store the accepted peer key under its derived transport ID"
+    );
+}
+
+#[tokio::test]
+async fn test_certificate_public_key_allowlist_rejects_unexpected_server_peer() {
+    init_crypto();
+
+    let mut listener = QuicNetworkManager::with_node_id(1);
+    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    let listener_addr = unused_localhost_addr();
+    listener
+        .listen(listener_addr)
+        .await
+        .expect("listener should start");
+
+    let connect_task = tokio::spawn(async move {
+        let mut unexpected_peer = QuicNetworkManager::with_node_id(2);
+        unexpected_peer.connect_as_server(listener_addr).await
+    });
+
+    let accept_result = listener.accept().await;
+    let _connect_result = connect_task.await.expect("connect task should not panic");
+
+    assert!(
+        accept_result.is_err(),
+        "listener should reject a certificate public key outside the allowlist"
+    );
+    assert!(
+        accept_result.unwrap_err().contains("not in allowlist"),
+        "rejection should report the allowlist failure"
+    );
+    assert!(
+        listener.get_all_server_connections().len() <= 1,
+        "rejected peer should not be retained as a server connection"
+    );
+}
+
+#[tokio::test]
+async fn test_certificate_public_key_allowlist_clear_disables_rejection() {
+    init_crypto();
+
+    let mut listener = QuicNetworkManager::with_node_id(1);
+    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    assert!(listener.has_certificate_public_key_allowlist());
+    listener.clear_allowed_certificate_public_keys();
+    assert!(!listener.has_certificate_public_key_allowlist());
+
+    let mut config = QuicNetworkConfig::default();
+    config.use_tls = false;
+    let mut listener = QuicNetworkManager::with_config(config.clone());
+    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    listener.clear_allowed_certificate_public_keys();
+    let listener_addr = unused_localhost_addr();
+    listener
+        .listen(listener_addr)
+        .await
+        .expect("listener should start");
+
+    let connect_task = tokio::spawn(async move {
+        let mut connector = QuicNetworkManager::with_config(config);
+        let result = connector.connect_as_server(listener_addr).await;
+        (connector, result)
+    });
+
+    let accept_result = listener.accept().await;
+    let (_connector, connect_result) = connect_task.await.expect("connect task should not panic");
+
+    assert!(
+        accept_result.is_ok(),
+        "clearing the allowlist should disable certificate public key rejection: {:?}",
+        accept_result.err()
+    );
+    assert!(
+        connect_result.is_ok(),
+        "connector should succeed once the allowlist is cleared: {:?}",
+        connect_result.err()
     );
 }
 

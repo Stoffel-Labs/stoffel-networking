@@ -222,6 +222,30 @@ int32_t stoffelnet_manager_add_node(
 );
 
 /**
+ * Adds a DER-encoded SubjectPublicKeyInfo key to the certificate public key allowlist.
+ * When at least one key is configured, connections from peers whose certificate public
+ * key is not in the allowlist are rejected.
+ * @param manager Handle to the network manager
+ * @param key Pointer to DER-encoded SubjectPublicKeyInfo bytes
+ * @param key_len Length of key in bytes
+ * @return STOFFELNET_OK on success, or an error code
+ */
+int32_t stoffelnet_manager_add_allowed_certificate_public_key(
+    StoffelNetworkManagerHandle manager,
+    const uint8_t* key,
+    size_t key_len
+);
+
+/**
+ * Clears the certificate public key allowlist, disabling this check.
+ * @param manager Handle to the network manager
+ * @return STOFFELNET_OK on success, or an error code
+ */
+int32_t stoffelnet_manager_clear_allowed_certificate_public_keys(
+    StoffelNetworkManagerHandle manager
+);
+
+/**
  * Connects to a party (blocking)
  * @param manager Handle to the network manager
  * @param party_id Party ID to connect to

@@ -32,7 +32,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
-use crate::network_utils::{Network, Node, PartyId, VerifiedOrdering};
+use crate::network_utils::{Network, Node, NodePublicKey, PartyId, VerifiedOrdering};
 use crate::transports::quic::{ConnectionState, PeerConnection, QuicNetworkManager, QuicNode};
 
 // ============================================================================
@@ -592,6 +592,65 @@ pub extern "C" fn stoffelnet_manager_add_node(
     handle.runtime.block_on(async {
         let mut manager = handle.manager.lock().await;
         manager.add_node_with_party_id(party_id as PartyId, socket_addr);
+    });
+
+    STOFFELNET_OK
+}
+
+/// Adds a DER-encoded SubjectPublicKeyInfo key to the certificate public key allowlist.
+///
+/// When at least one key is configured, connections whose peer certificate public key
+/// is not in the allowlist are rejected.
+///
+/// # Safety
+///
+/// - The manager handle must be valid
+/// - key must point to at least key_len bytes
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_add_allowed_certificate_public_key(
+    manager: StoffelNetworkManagerHandle,
+    key: *const u8,
+    key_len: usize,
+) -> c_int {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    if key.is_null() || key_len == 0 {
+        set_last_error("Null or empty certificate public key");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len).to_vec() };
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+
+    handle.runtime.block_on(async {
+        let mut manager = handle.manager.lock().await;
+        manager.add_allowed_certificate_public_key(NodePublicKey(key_bytes));
+    });
+
+    STOFFELNET_OK
+}
+
+/// Clears the certificate public key allowlist, disabling this check.
+///
+/// # Safety
+///
+/// The manager handle must be valid.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_clear_allowed_certificate_public_keys(
+    manager: StoffelNetworkManagerHandle,
+) -> c_int {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+    handle.runtime.block_on(async {
+        let mut manager = handle.manager.lock().await;
+        manager.clear_allowed_certificate_public_keys();
     });
 
     STOFFELNET_OK

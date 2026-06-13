@@ -1057,6 +1057,12 @@ pub struct QuicNetworkManager {
     client_connected_tx: tokio::sync::broadcast::Sender<ClientId>,
     /// Broadcast channel: notifies when a new peer connects
     peer_connected_tx: tokio::sync::broadcast::Sender<PartyId>,
+    /// Per-peer unbounded outbound queues. `send`/`broadcast` resolve the target
+    /// connection and enqueue `(connection, bytes)` here without ever awaiting the
+    /// QUIC write, so a caller driven from a single message-processing loop can
+    /// never block the receive path on transport backpressure. One drainer task
+    /// per peer performs the actual writes in FIFO order.
+    outbound: Arc<DashMap<PartyId, mpsc::UnboundedSender<(Arc<dyn PeerConnection>, Vec<u8>)>>>,
 }
 
 impl std::fmt::Debug for QuicNetworkManager {
@@ -1112,6 +1118,7 @@ impl QuicNetworkManager {
             consensus_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_connected_tx,
             peer_connected_tx,
+            outbound: Arc::new(DashMap::new()),
         }
     }
 
@@ -1119,6 +1126,38 @@ impl QuicNetworkManager {
         let mut manager = Self::new();
         manager.node_id = node_id;
         manager
+    }
+
+    /// Returns the unbounded outbound sender for `recipient`, lazily spawning a
+    /// dedicated drainer task on first use. The drainer owns the receive half and
+    /// performs the actual QUIC writes, so callers never block on transport
+    /// backpressure — they only enqueue. Per-peer FIFO order is preserved because
+    /// exactly one task drains each peer's queue. The connection to write to is
+    /// carried with each message (resolved by the caller), so the drainer holds
+    /// no back-reference to the manager and creates no reference cycle — when the
+    /// manager drops, the senders drop, the receivers close, and the drainers exit.
+    fn outbound_sender(
+        &self,
+        recipient: PartyId,
+    ) -> mpsc::UnboundedSender<(Arc<dyn PeerConnection>, Vec<u8>)> {
+        let node_id = self.node_id;
+        self.outbound
+            .entry(recipient)
+            .or_insert_with(|| {
+                let (tx, mut rx) =
+                    mpsc::unbounded_channel::<(Arc<dyn PeerConnection>, Vec<u8>)>();
+                tokio::spawn(async move {
+                    while let Some((connection, msg)) = rx.recv().await {
+                        if let Err(e) = connection.send(&msg).await {
+                            debug!("[outbound {node_id}->{recipient}] send failed: {e}");
+                        }
+                    }
+                    debug!("[outbound {node_id}->{recipient}] drainer stopped");
+                });
+                tx
+            })
+            .value()
+            .clone()
     }
 
     /// Install stable local certificate material before listen/connect.
@@ -1221,6 +1260,7 @@ impl QuicNetworkManager {
             consensus_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_connected_tx,
             peer_connected_tx,
+            outbound: Arc::new(DashMap::new()),
         }
     }
 
@@ -3234,20 +3274,15 @@ impl Network for QuicNetworkManager {
             .get_connection_by_party_id(recipient)
             .ok_or(NetworkError::PartyNotFound(recipient))?;
 
-        // Send directly without pre-checking is_connected() to avoid
-        // check-then-act race (STO-478). PeerConnection::send() handles
-        // state checking internally and returns the appropriate error.
-        match connection.send(message).await {
-            Ok(_) => {
-                debug!("Successfully sent message to recipient {}", recipient);
-                Ok(message.len())
-            }
-            Err(e) => {
-                debug!("Failed to send message to recipient {}: {}", recipient, e);
-                self.cleanup_dead_connections().await;
-                Err(NetworkError::SendError)
-            }
-        }
+        // Enqueue onto the peer's outbound queue instead of awaiting the QUIC
+        // write here. This never blocks on transport backpressure, so a caller
+        // driven from a single message-processing loop cannot wedge the receive
+        // path. The dedicated drainer performs the write in FIFO order.
+        self.outbound_sender(recipient)
+            .send((connection, message.to_vec()))
+            .map_err(|_| NetworkError::SendError)?;
+        debug!("Queued message to recipient {}", recipient);
+        Ok(message.len())
     }
 
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
@@ -3259,20 +3294,20 @@ impl Network for QuicNetworkManager {
         // Broadcast to all parties using party_id (0..N-1).
         // Send directly without pre-checking is_connected() to avoid
         // check-then-act race (STO-478).
-        let mut had_failures = false;
+        // Enqueue to each party's outbound queue (non-blocking); the dedicated
+        // drainers perform the writes in FIFO order.
         for party_id in 0..party_count {
             if let Some(connection) = self.get_connection_by_party_id(party_id) {
-                match connection.send(message).await {
-                    Ok(_) => {
-                        debug!("Successfully broadcasted message to party_id {}", party_id);
+                match self
+                    .outbound_sender(party_id)
+                    .send((connection, message.to_vec()))
+                {
+                    Ok(()) => {
+                        debug!("Queued broadcast message to party_id {}", party_id);
                         total_bytes += message.len();
                     }
-                    Err(e) => {
-                        debug!(
-                            "Failed to broadcast message to party_id {}: {}",
-                            party_id, e
-                        );
-                        had_failures = true;
+                    Err(_) => {
+                        debug!("Failed to queue broadcast to party_id {}", party_id);
                     }
                 }
             } else {
@@ -3290,16 +3325,15 @@ impl Network for QuicNetworkManager {
                 .get(&self.node_id)
                 .map(|entry| Arc::clone(entry.value()))
             {
-                if connection.send(message).await.is_ok() {
-                    debug!("Successfully broadcasted message to self (loopback fallback)");
+                if self
+                    .outbound_sender(self.node_id)
+                    .send((connection, message.to_vec()))
+                    .is_ok()
+                {
+                    debug!("Queued broadcast message to self (loopback fallback)");
                     total_bytes += message.len();
                 }
             }
-        }
-
-        // Cleanup dead connections only if there were send failures
-        if had_failures {
-            self.cleanup_dead_connections().await;
         }
 
         Ok(total_bytes)

@@ -3274,6 +3274,18 @@ impl Network for QuicNetworkManager {
             .get_connection_by_party_id(recipient)
             .ok_or(NetworkError::PartyNotFound(recipient))?;
 
+        // Detect an already-closed connection synchronously so callers observe
+        // SendError instead of a silent enqueue-then-drop in the drainer
+        // (STO-478 contract). This only locks the connection's state mutex — it
+        // never touches the transport, so it cannot block on backpressure and
+        // preserves the non-blocking enqueue the outbound drainer provides. A
+        // connection that closes between this check and the drainer's write is
+        // indistinguishable from any other send race and is logged by the drainer.
+        if !connection.is_connected().await {
+            debug!("Connection to recipient {} is closed; send rejected", recipient);
+            return Err(NetworkError::SendError);
+        }
+
         // Enqueue onto the peer's outbound queue instead of awaiting the QUIC
         // write here. This never blocks on transport backpressure, so a caller
         // driven from a single message-processing loop cannot wedge the receive
@@ -3292,12 +3304,16 @@ impl Network for QuicNetworkManager {
         let party_count = self.party_count();
 
         // Broadcast to all parties using party_id (0..N-1).
-        // Send directly without pre-checking is_connected() to avoid
-        // check-then-act race (STO-478).
-        // Enqueue to each party's outbound queue (non-blocking); the dedicated
-        // drainers perform the writes in FIFO order.
+        // Skip already-closed connections (STO-478 contract) so bytes are not
+        // counted for peers that can never receive them, then enqueue to each
+        // live peer's outbound queue (non-blocking); the dedicated drainers
+        // perform the writes in FIFO order.
         for party_id in 0..party_count {
             if let Some(connection) = self.get_connection_by_party_id(party_id) {
+                if !connection.is_connected().await {
+                    debug!("Skipping broadcast to closed party_id {}", party_id);
+                    continue;
+                }
                 match self
                     .outbound_sender(party_id)
                     .send((connection, message.to_vec()))
@@ -3325,7 +3341,9 @@ impl Network for QuicNetworkManager {
                 .get(&self.node_id)
                 .map(|entry| Arc::clone(entry.value()))
             {
-                if self
+                if !connection.is_connected().await {
+                    debug!("Skipping broadcast to self: loopback connection closed");
+                } else if self
                     .outbound_sender(self.node_id)
                     .send((connection, message.to_vec()))
                     .is_ok()

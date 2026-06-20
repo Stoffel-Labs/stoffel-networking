@@ -298,8 +298,10 @@ async fn test_certificate_public_key_allowlist_clear_disables_rejection() {
     listener.clear_allowed_certificate_public_keys();
     assert!(!listener.has_certificate_public_key_allowlist());
 
-    let mut config = QuicNetworkConfig::default();
-    config.use_tls = false;
+    let config = QuicNetworkConfig {
+        use_tls: false,
+        ..Default::default()
+    };
     let mut listener = QuicNetworkManager::with_config(config.clone());
     listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
     listener.clear_allowed_certificate_public_keys();

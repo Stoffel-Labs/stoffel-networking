@@ -125,7 +125,7 @@ pub trait PeerConnection: Send + Sync {
     ///
     /// Returns an error if:
     /// - The connection is closed, closing, or disconnected
-    /// - The message exceeds the maximum size (100MB for QUIC)
+    /// - The message exceeds the maximum size (1 GiB for QUIC)
     /// - A network error occurs during transmission
     /// - The peer resets the stream
     fn send<'a>(

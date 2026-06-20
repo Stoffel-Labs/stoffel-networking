@@ -994,6 +994,10 @@ impl Message for QuicMessage {
 // QUIC NETWORK MANAGER (Actor-Compatible)
 // ============================================================================
 
+type OutboundMessage = (Arc<dyn PeerConnection>, Vec<u8>);
+type OutboundSender = mpsc::UnboundedSender<OutboundMessage>;
+type OutboundQueues = Arc<DashMap<PartyId, OutboundSender>>;
+
 /// QUIC-based network manager for MPC peer-to-peer communication.
 ///
 /// `QuicNetworkManager` is the primary entry point for establishing and managing
@@ -1074,7 +1078,7 @@ pub struct QuicNetworkManager {
     /// QUIC write, so a caller driven from a single message-processing loop can
     /// never block the receive path on transport backpressure. One drainer task
     /// per peer performs the actual writes in FIFO order.
-    outbound: Arc<DashMap<PartyId, mpsc::UnboundedSender<(Arc<dyn PeerConnection>, Vec<u8>)>>>,
+    outbound: OutboundQueues,
 }
 
 impl std::fmt::Debug for QuicNetworkManager {
@@ -1148,16 +1152,12 @@ impl QuicNetworkManager {
     /// carried with each message (resolved by the caller), so the drainer holds
     /// no back-reference to the manager and creates no reference cycle — when the
     /// manager drops, the senders drop, the receivers close, and the drainers exit.
-    fn outbound_sender(
-        &self,
-        recipient: PartyId,
-    ) -> mpsc::UnboundedSender<(Arc<dyn PeerConnection>, Vec<u8>)> {
+    fn outbound_sender(&self, recipient: PartyId) -> OutboundSender {
         let node_id = self.node_id;
         self.outbound
             .entry(recipient)
             .or_insert_with(|| {
-                let (tx, mut rx) =
-                    mpsc::unbounded_channel::<(Arc<dyn PeerConnection>, Vec<u8>)>();
+                let (tx, mut rx) = mpsc::unbounded_channel::<OutboundMessage>();
                 tokio::spawn(async move {
                     while let Some((connection, msg)) = rx.recv().await {
                         if let Err(e) = connection.send(&msg).await {
@@ -3294,7 +3294,10 @@ impl Network for QuicNetworkManager {
         // connection that closes between this check and the drainer's write is
         // indistinguishable from any other send race and is logged by the drainer.
         if !connection.is_connected().await {
-            debug!("Connection to recipient {} is closed; send rejected", recipient);
+            debug!(
+                "Connection to recipient {} is closed; send rejected",
+                recipient
+            );
             return Err(NetworkError::SendError);
         }
 

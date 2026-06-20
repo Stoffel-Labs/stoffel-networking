@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-02-XX
+## [0.1.0] - 2026-06-19
 
 ### Added
 
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Blocking and async send/receive operations
   - Thread-local error handling (`stoffelnet_last_error`)
 - Actor model compatible design with `Arc<Mutex<>>` interior mutability
-- Length-prefixed message framing (4-byte big-endian, max 100MB)
+- Length-prefixed message framing (4-byte big-endian, max 1 GiB)
 - Self-delivery via `LoopbackPeerConnection`
 - Concurrent connection management with `DashMap`
 

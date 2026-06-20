@@ -181,8 +181,20 @@ pub trait NetworkManager: Send + Sync {
 // MESSAGE FRAMING HELPERS
 // ============================================================================
 
-/// Maximum message size: 10MB
-const MAX_MESSAGE_SIZE: usize = 10_000_000;
+/// Maximum declared length of a single framed message.
+///
+/// This is a sanity bound on the 4-byte length prefix, NOT the primary DoS
+/// control: `recv_framed_message` reads the payload in `RECV_CHUNK_SIZE`
+/// increments and seeds the buffer with only `len.min(RECV_CHUNK_SIZE)` of
+/// capacity, so a spoofed header cannot trigger a large up-front allocation —
+/// memory grows only as real bytes arrive. The earlier 10 MB limit existed to
+/// cap pre-allocation, which the chunked read has already eliminated.
+///
+/// 1 GiB is sized to clear any realistic framed payload — a fully-unrolled MPC
+/// circuit (e.g. AES-128 at -O3 with raised budgets) is ~40 MB — while still
+/// bounding the residual abuse vector of a peer that actually streams that much
+/// data. Well under `u32::MAX`, so the length prefix never truncates.
+const MAX_MESSAGE_SIZE: usize = 1 << 30; // 1 GiB
 
 /// Initial chunk size for incremental payload reads (64 KiB).
 /// Memory is only committed as data actually arrives from the network.
@@ -4918,20 +4930,33 @@ mod tests {
     }
 
     // ========================================================================
-    // Security Reproducer: Memory exhaustion via pre-allocation in recv
+    // Framing security: incremental receive bounds memory
     // ========================================================================
-    // recv_framed_message reads a 4-byte length header and immediately
-    // allocates `vec![0u8; len]` for up to MAX_MESSAGE_SIZE (100MB).
-    // An attacker sends a 4-byte header claiming a huge payload and
-    // never sends data — the server pre-allocates the full buffer.
+    // recv_framed_message reads a 4-byte length header then drains the payload
+    // in RECV_CHUNK_SIZE (64 KiB) increments, seeding the buffer with only
+    // `len.min(RECV_CHUNK_SIZE)` of capacity. A spoofed header claiming a huge
+    // payload therefore cannot trigger a large up-front allocation — memory
+    // grows only as real bytes arrive, and a peer that sends the header but no
+    // data pins at most ~64 KiB until the stream times out. MAX_MESSAGE_SIZE is
+    // now a generous sanity ceiling (not a tight DoS cap), sized to admit large
+    // legitimate payloads such as a fully-unrolled MPC program upload.
 
     #[test]
-    fn test_max_message_size_reduced_to_10mb() {
-        // MAX_MESSAGE_SIZE was 100MB — reduced to 10MB to limit DoS surface.
-        assert_eq!(
-            MAX_MESSAGE_SIZE, 10_000_000,
-            "MAX_MESSAGE_SIZE must be 10MB to limit pre-allocation DoS"
+    fn test_max_message_size_admits_large_programs() {
+        // MAX_MESSAGE_SIZE must comfortably exceed the largest framed payload we
+        // emit (a fully-unrolled MPC circuit is ~40 MB), while staying well
+        // under u32::MAX so the 4-byte length prefix never truncates.
+        assert!(
+            MAX_MESSAGE_SIZE >= 256 * 1024 * 1024,
+            "MAX_MESSAGE_SIZE must admit large program uploads (>=256 MiB), got {MAX_MESSAGE_SIZE}"
         );
+        assert!(
+            MAX_MESSAGE_SIZE < u32::MAX as usize,
+            "MAX_MESSAGE_SIZE must fit in the u32 length prefix"
+        );
+        // The real DoS bound is the incremental receive, not this ceiling:
+        // initial allocation is capped at RECV_CHUNK_SIZE regardless of len.
+        assert_eq!(RECV_CHUNK_SIZE, 64 * 1024);
     }
 
     #[test]

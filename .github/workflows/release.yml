@@ -1,0 +1,137 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish crate and create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve release ref
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "ref=refs/tags/${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Read crate metadata
+        id: meta
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import subprocess
+
+          metadata = json.loads(
+              subprocess.check_output([
+                  "cargo", "metadata", "--no-deps", "--format-version", "1"
+              ])
+          )
+          package = metadata["packages"][0]
+          print(f'name={package["name"]}')
+          print(f'version={package["version"]}')
+          PY
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag_version="${{ steps.ref.outputs.tag }}"
+          tag_version="${tag_version#v}"
+          crate_version="${{ steps.meta.outputs.version }}"
+
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "Tag ${{ steps.ref.outputs.tag }} does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+
+      - name: Check tag commit is contained in main
+        run: |
+          git fetch origin main
+          git branch -r --contains "$GITHUB_SHA" | grep -q 'origin/main'
+
+      - name: Validate release
+        run: |
+          cargo fmt --check
+          cargo check
+          cargo test --doc
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+          cargo package
+
+      - name: Compute packaged crate checksum
+        id: checksum
+        run: |
+          crate="target/package/${{ steps.meta.outputs.name }}-${{ steps.meta.outputs.version }}.crate"
+          sha256sum "$crate" | tee crate.sha256
+
+          echo "crate=$crate" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 crate.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether crates.io version already exists
+        id: crates_io
+        run: |
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/${{ steps.meta.outputs.name }}/${{ steps.meta.outputs.version }}")"
+
+          if [ "$code" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to crates.io
+        if: steps.crates_io.outputs.exists == 'false'
+        run: cargo publish --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes_file="$(mktemp)"
+          cat > "$notes_file" <<EOF
+          Published \${{ steps.meta.outputs.name }} ${{ steps.meta.outputs.version }}\ from GitHub tag \${{ steps.ref.outputs.tag }}\.
+
+          crates.io: https://crates.io/crates/${{ steps.meta.outputs.name }}/${{ steps.meta.outputs.version }}
+          commit: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
+          crate sha256: \${{ steps.checksum.outputs.sha256 }}\
+          EOF
+
+          if gh release view "${{ steps.ref.outputs.tag }}" >/dev/null 2>&1; then
+            gh release edit "${{ steps.ref.outputs.tag }}" \
+              --title "${{ steps.ref.outputs.tag }}" \
+              --notes-file "$notes_file"
+          else
+            gh release create "${{ steps.ref.outputs.tag }}" \
+              --title "${{ steps.ref.outputs.tag }}" \
+              --notes-file "$notes_file"
+          fi
+
+          gh release upload "${{ steps.ref.outputs.tag }}" \
+            "${{ steps.checksum.outputs.crate }}" \
+            crate.sha256 \
+            --clobber

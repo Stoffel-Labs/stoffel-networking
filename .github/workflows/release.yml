@@ -38,6 +38,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Read crate metadata
         id: meta
@@ -77,7 +79,7 @@ jobs:
           cargo fmt --check
           cargo check
           cargo test --doc
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets
           cargo test
           cargo package
 

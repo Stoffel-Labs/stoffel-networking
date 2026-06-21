@@ -86,16 +86,22 @@ jobs:
       - name: Compute packaged crate checksum
         id: checksum
         run: |
-          crate="target/package/${{ steps.meta.outputs.name }}-${{ steps.meta.outputs.version }}.crate"
-          sha256sum "$crate" | tee crate.sha256
+          base="${{ steps.meta.outputs.name }}-${{ steps.meta.outputs.version }}.crate"
+          crate="target/package/$base"
+          sha256="$(sha256sum "$crate" | cut -d' ' -f1)"
+
+          sha_file="$RUNNER_TEMP/$base.sha256"
+          printf '%s  %s\n' "$sha256" "$base" > "$sha_file"
 
           echo "crate=$crate" >> "$GITHUB_OUTPUT"
-          echo "sha256=$(cut -d' ' -f1 crate.sha256)" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "sha_file=$sha_file" >> "$GITHUB_OUTPUT"
 
       - name: Check whether crates.io version already exists
         id: crates_io
         run: |
           code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A "stoffelnet-release-ci (+https://github.com/${{ github.repository }})" \
             "https://crates.io/api/v1/crates/${{ steps.meta.outputs.name }}/${{ steps.meta.outputs.version }}")"
 
           if [ "$code" = "200" ]; then
@@ -116,11 +122,11 @@ jobs:
         run: |
           notes_file="$(mktemp)"
           cat > "$notes_file" <<EOF
-          Published \${{ steps.meta.outputs.name }} ${{ steps.meta.outputs.version }}\ from GitHub tag \${{ steps.ref.outputs.tag }}\.
+          Published ${{ steps.meta.outputs.name }} ${{ steps.meta.outputs.version }} from GitHub tag ${{ steps.ref.outputs.tag }}.
 
           crates.io: https://crates.io/crates/${{ steps.meta.outputs.name }}/${{ steps.meta.outputs.version }}
           commit: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
-          crate sha256: \${{ steps.checksum.outputs.sha256 }}\
+          crate sha256: ${{ steps.checksum.outputs.sha256 }}
           EOF
 
           if gh release view "${{ steps.ref.outputs.tag }}" >/dev/null 2>&1; then
@@ -135,5 +141,5 @@ jobs:
 
           gh release upload "${{ steps.ref.outputs.tag }}" \
             "${{ steps.checksum.outputs.crate }}" \
-            crate.sha256 \
+            "${{ steps.checksum.outputs.sha_file }}" \
             --clobber

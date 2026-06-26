@@ -1079,6 +1079,10 @@ pub struct QuicNetworkManager {
     /// never block the receive path on transport backpressure. One drainer task
     /// per peer performs the actual writes in FIFO order.
     outbound: OutboundQueues,
+    /// Optional type-erased hook invoked after each successful outbound enqueue.
+    /// Called with `(message_bytes, n_recipients)`. Arc<OnceLock<…>> so all
+    /// clones of QuicNetworkManager share the same hook (set once, read many).
+    send_hook: Arc<std::sync::OnceLock<Arc<dyn Fn(&[u8], usize) + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for QuicNetworkManager {
@@ -1135,6 +1139,7 @@ impl QuicNetworkManager {
             client_connected_tx,
             peer_connected_tx,
             outbound: Arc::new(DashMap::new()),
+            send_hook: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -1273,12 +1278,23 @@ impl QuicNetworkManager {
             client_connected_tx,
             peer_connected_tx,
             outbound: Arc::new(DashMap::new()),
+            send_hook: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     /// Creates a manager with NAT traversal enabled
     pub fn with_nat_traversal() -> Self {
         Self::with_config(QuicNetworkConfig::with_nat_traversal())
+    }
+
+    /// Registers a type-erased hook invoked after every successful outbound
+    /// enqueue.  The hook receives `(message_bytes, n_recipients)`.
+    ///
+    /// Because `QuicNetworkManager` derives `Clone` with all state behind `Arc`,
+    /// setting the hook on any clone is visible to all clones immediately.  The
+    /// hook can only be set once per manager (subsequent calls are no-ops).
+    pub fn set_send_hook(&self, hook: Arc<dyn Fn(&[u8], usize) + Send + Sync>) {
+        let _ = self.send_hook.set(hook);
     }
 
     /// Sets the expected number of parties for consensus gating.
@@ -3309,6 +3325,9 @@ impl Network for QuicNetworkManager {
             .send((connection, message.to_vec()))
             .map_err(|_| NetworkError::SendError)?;
         debug!("Queued message to recipient {}", recipient);
+        if let Some(hook) = self.send_hook.get() {
+            hook(message, 1);
+        }
         Ok(message.len())
     }
 
@@ -3316,6 +3335,7 @@ impl Network for QuicNetworkManager {
         self.await_consensus_gate().await?;
 
         let mut total_bytes = 0usize;
+        let mut n_queued = 0usize;
         let party_count = self.party_count();
 
         // Broadcast to all parties using party_id (0..N-1).
@@ -3336,6 +3356,7 @@ impl Network for QuicNetworkManager {
                     Ok(()) => {
                         debug!("Queued broadcast message to party_id {}", party_id);
                         total_bytes += message.len();
+                        n_queued += 1;
                     }
                     Err(_) => {
                         debug!("Failed to queue broadcast to party_id {}", party_id);
@@ -3365,7 +3386,14 @@ impl Network for QuicNetworkManager {
                 {
                     debug!("Queued broadcast message to self (loopback fallback)");
                     total_bytes += message.len();
+                    n_queued += 1;
                 }
+            }
+        }
+
+        if n_queued > 0 {
+            if let Some(hook) = self.send_hook.get() {
+                hook(message, n_queued);
             }
         }
 

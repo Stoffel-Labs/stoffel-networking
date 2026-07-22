@@ -23,6 +23,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -140,6 +141,12 @@ pub trait PeerConnection: Send + Sync {
 
     /// Returns how the remote peer identified itself in the handshake
     fn get_connection_role(&self) -> ClientType;
+
+    /// Returns the exact DER-encoded SubjectPublicKeyInfo authenticated by the
+    /// TLS handshake. Non-TLS test transports return `None` by default.
+    fn authenticated_peer_public_key(&self) -> Option<NodePublicKey> {
+        None
+    }
 
     /// Returns the party ID of the remote peer, if known.
     fn remote_party_id(&self) -> Option<PartyId>;
@@ -522,6 +529,10 @@ impl PeerConnection for QuicPeerConnection {
 
     fn get_connection_role(&self) -> ClientType {
         self.connection_role
+    }
+
+    fn authenticated_peer_public_key(&self) -> Option<NodePublicKey> {
+        self.peer_public_key.clone()
     }
 
     fn remote_party_id(&self) -> Option<PartyId> {
@@ -1028,6 +1039,24 @@ type OutboundQueues = Arc<DashMap<PartyId, OutboundSender>>;
 /// };
 /// let manager = QuicNetworkManager::with_config(config);
 /// ```
+struct ExecutionScannerReceiveOwnerLeaseInner {
+    claimed: Arc<AtomicBool>,
+}
+
+impl Drop for ExecutionScannerReceiveOwnerLeaseInner {
+    fn drop(&mut self) {
+        self.claimed.store(false, Ordering::Release);
+    }
+}
+
+/// Exclusive ownership token shared by one execution scanner and its receive
+/// loops. A new scanner can claim the manager after the final clone is dropped.
+#[derive(Clone)]
+#[must_use = "dropping the final token releases execution-scanner ownership"]
+pub struct ExecutionScannerReceiveOwnerLease {
+    _inner: Arc<ExecutionScannerReceiveOwnerLeaseInner>,
+}
+
 #[derive(Clone)]
 pub struct QuicNetworkManager {
     endpoint: Option<Endpoint>,
@@ -1079,6 +1108,7 @@ pub struct QuicNetworkManager {
     /// never block the receive path on transport backpressure. One drainer task
     /// per peer performs the actual writes in FIFO order.
     outbound: OutboundQueues,
+    execution_scanner_receive_owner_claimed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for QuicNetworkManager {
@@ -1135,6 +1165,7 @@ impl QuicNetworkManager {
             client_connected_tx,
             peer_connected_tx,
             outbound: Arc::new(DashMap::new()),
+            execution_scanner_receive_owner_claimed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1191,6 +1222,65 @@ impl QuicNetworkManager {
         self.local_cert_der = Some(cert_der);
         self.local_key_der = Some(key_der);
         self.local_public_key = Some(public_key);
+        Ok(())
+    }
+
+    /// Extract the exact DER-encoded SubjectPublicKeyInfo from a certificate.
+    pub fn public_key_from_certificate_der(cert_der: &[u8]) -> Result<NodePublicKey, String> {
+        Self::extract_public_key_from_cert(cert_der)
+    }
+
+    /// Install the immutable full-certificate roster used to admit MPC peers.
+    pub fn install_expected_server_public_keys<I>(&mut self, public_keys: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = NodePublicKey>,
+    {
+        let mut keys = Vec::new();
+        let mut compact_ids = std::collections::HashMap::new();
+        for key in public_keys {
+            let compact_id = key.derive_id();
+            if let Some(existing) = compact_ids.insert(compact_id, key.clone()) {
+                if existing != key {
+                    return Err(format!(
+                        "distinct server certificates collide at compact party ID {compact_id}"
+                    ));
+                }
+                continue;
+            }
+            keys.push(key);
+        }
+        if keys.is_empty() {
+            return Err("server certificate roster cannot be empty".to_string());
+        }
+        let local = self.local_public_key.as_ref().ok_or_else(|| {
+            "local certificate must be installed before the server certificate roster".to_string()
+        })?;
+        if !keys.contains(local) {
+            return Err(
+                "local certificate is absent from the server certificate roster".to_string(),
+            );
+        }
+        for peer in self.peer_public_keys.iter() {
+            if !keys.contains(peer.value()) {
+                return Err(format!(
+                    "already connected server peer {} is absent from the certificate roster",
+                    peer.key()
+                ));
+            }
+        }
+        let current = self
+            .allowed_peer_public_keys
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<std::collections::HashSet<_>>();
+        let requested = keys
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        if !current.is_empty() && current != requested {
+            return Err("server certificate roster is already frozen".to_string());
+        }
+        self.set_allowed_certificate_public_keys(keys);
         Ok(())
     }
 
@@ -1273,6 +1363,7 @@ impl QuicNetworkManager {
             client_connected_tx,
             peer_connected_tx,
             outbound: Arc::new(DashMap::new()),
+            execution_scanner_receive_owner_claimed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1358,6 +1449,20 @@ impl QuicNetworkManager {
         self.server_connections
             .get(&party_id)
             .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Claim this manager clone-set for one execution connection scanner.
+    pub fn try_acquire_execution_scanner_receive_owner(
+        &self,
+    ) -> Option<ExecutionScannerReceiveOwnerLease> {
+        self.execution_scanner_receive_owner_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(ExecutionScannerReceiveOwnerLease {
+            _inner: Arc::new(ExecutionScannerReceiveOwnerLeaseInner {
+                claimed: Arc::clone(&self.execution_scanner_receive_owner_claimed),
+            }),
+        })
     }
 
     /// Gets all server connections (peer-to-peer MPC party connections)
@@ -1988,6 +2093,25 @@ impl QuicNetworkManager {
         &mut self,
         address: SocketAddr,
     ) -> Result<Arc<dyn PeerConnection>, String> {
+        self.connect_as_server_inner(address, None).await
+    }
+
+    /// Connect to a server and require its TLS certificate to contain the exact
+    /// expected SubjectPublicKeyInfo before admitting the connection.
+    pub async fn connect_as_server_with_expected_public_key(
+        &mut self,
+        address: SocketAddr,
+        expected_public_key: &NodePublicKey,
+    ) -> Result<Arc<dyn PeerConnection>, String> {
+        self.connect_as_server_inner(address, Some(expected_public_key))
+            .await
+    }
+
+    async fn connect_as_server_inner(
+        &mut self,
+        address: SocketAddr,
+        expected_public_key: Option<&NodePublicKey>,
+    ) -> Result<Arc<dyn PeerConnection>, String> {
         self.ensure_client_endpoint(ClientType::Server).await?;
         self.ensure_loopback_installed().await;
 
@@ -2014,6 +2138,26 @@ impl QuicNetworkManager {
                 }
             };
 
+        if let Some(expected) = expected_public_key {
+            match peer_public_key.as_ref() {
+                Some(presented) if presented == expected => {}
+                Some(presented) => {
+                    connection.close(0u32.into(), b"server certificate mismatch");
+                    return Err(format!(
+                        "server certificate mismatch at {address}: expected compact ID {}, presented compact ID {}",
+                        expected.derive_id(),
+                        presented.derive_id()
+                    ));
+                }
+                None => {
+                    connection.close(0u32.into(), b"missing server certificate identity");
+                    return Err(format!(
+                        "server at {address} did not present an extractable certificate identity"
+                    ));
+                }
+            }
+        }
+
         // Open persistent stream and send sync byte to establish it
         let (mut send, recv) = connection
             .open_bi()
@@ -2037,6 +2181,14 @@ impl QuicNetworkManager {
 
         // Store peer's public key if available
         if let Some(ref pk) = peer_public_key {
+            if let Some(existing) = self.peer_public_keys.get(&peer_id) {
+                if existing.value() != pk {
+                    connection.close(0u32.into(), b"server certificate identity collision");
+                    return Err(format!(
+                        "server certificate identity collision for compact party ID {peer_id}"
+                    ));
+                }
+            }
             self.peer_public_keys.insert(peer_id, pk.clone());
             trace!("Stored public key for peer {}", peer_id);
         }
@@ -6038,5 +6190,52 @@ mod tests {
             result,
             Err(ConsensusError::ClientListDigestMismatch { party_id: 1 })
         );
+    }
+
+    #[test]
+    fn test_execution_scanner_receive_owner_is_clone_shared() {
+        let manager = QuicNetworkManager::new();
+        let clone = manager.clone();
+        let owner = manager
+            .try_acquire_execution_scanner_receive_owner()
+            .expect("first scanner claim succeeds");
+        let child = owner.clone();
+
+        assert!(clone
+            .try_acquire_execution_scanner_receive_owner()
+            .is_none());
+        drop(owner);
+        assert!(clone
+            .try_acquire_execution_scanner_receive_owner()
+            .is_none());
+        drop(child);
+        assert!(clone
+            .try_acquire_execution_scanner_receive_owner()
+            .is_some());
+    }
+
+    #[test]
+    fn test_server_certificate_roster_is_idempotent_and_frozen() {
+        let local = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let local_der = local.cert.der().to_vec();
+        let local_key = local.signing_key.serialize_der();
+        let local_public_key =
+            QuicNetworkManager::public_key_from_certificate_der(&local_der).unwrap();
+        let other_public_key =
+            QuicNetworkManager::public_key_from_certificate_der(other.cert.der()).unwrap();
+        let mut manager = QuicNetworkManager::new();
+        manager
+            .set_local_certificate_der(local_der, local_key)
+            .unwrap();
+
+        let roster = vec![local_public_key.clone(), other_public_key.clone()];
+        manager
+            .install_expected_server_public_keys(roster.clone())
+            .unwrap();
+        manager.install_expected_server_public_keys(roster).unwrap();
+        assert!(manager
+            .install_expected_server_public_keys([local_public_key])
+            .is_err());
     }
 }

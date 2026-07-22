@@ -101,28 +101,58 @@ impl VerifiedOrdering {
 pub type PartyId = usize;
 pub type ClientId = usize;
 
+/// Collision-resistant identity of a certificate's DER-encoded
+/// SubjectPublicKeyInfo.
+///
+/// [`ClientId`] remains the compact legacy protocol identifier. Authorization
+/// decisions must use this full digest so two distinct certificates can never
+/// become the same authenticated principal merely because their legacy IDs
+/// collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CertificateIdentity([u8; 32]);
+
+impl CertificateIdentity {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// Represents a node's public key (DER-encoded SubjectPublicKeyInfo).
 /// Used for deterministic sender_id computation across all participants.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodePublicKey(pub Vec<u8>);
 
 impl NodePublicKey {
-    /// Derives a stable ID from this public key.
-    /// Uses a simple hash-like computation over the public key bytes.
-    /// The result is deterministic and unique for different public keys.
+    /// Derives the collision-resistant identity used for certificate
+    /// authorization.
+    pub fn certificate_identity(&self) -> CertificateIdentity {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("stoffel-network-certificate-spki-identity-v1");
+        hasher.update(&self.0);
+        CertificateIdentity::from_bytes(*hasher.finalize().as_bytes())
+    }
+
+    /// Derives the compact legacy transport/bookkeeping ID for this key.
+    ///
+    /// This value is deliberately non-authoritative: certificate authorization
+    /// uses [`Self::certificate_identity`] at its full 256-bit width. Production
+    /// deployments require a 64-bit target; 32-bit targets further truncate the
+    /// bookkeeping value and are unsuitable for adversarial networking.
     pub fn derive_id(&self) -> usize {
-        // Use a simple FNV-1a-like hash for deterministic ID derivation
-        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
-
-        let mut hash = FNV_OFFSET_BASIS;
-        for byte in &self.0 {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-
-        // Convert to usize (truncate on 32-bit systems)
-        hash as usize
+        let mut hasher =
+            blake3::Hasher::new_derive_key("stoffel-network-legacy-spki-bookkeeping-id-v2");
+        hasher.update(&self.0);
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+        u64::from_le_bytes(bytes) as usize
     }
 }
 
@@ -169,11 +199,14 @@ pub trait Network {
     /// Returns a mutable reference of the node with the given ID.
     fn node_mut(&mut self, id: PartyId) -> Option<&mut Self::NodeType>;
     // --- server-to-client communication ---
-    /// Send a message to a client.
+    /// Send a message to a logical client. When several live physical
+    /// connections share that client's authenticated ID, implementations
+    /// broadcast to all of them and succeed if at least one delivery succeeds.
     async fn send_to_client(&self, client: ClientId, message: &[u8])
         -> Result<usize, NetworkError>;
 
-    /// Returns the connected clients.
+    /// Returns distinct logical connected client IDs. Multiple physical
+    /// connections authenticated as the same client appear once.
     fn clients(&self) -> Vec<ClientId>;
 
     /// Checks whether a client is connected.
@@ -223,6 +256,18 @@ mod tests {
             key_b.derive_id(),
             "derive_id should return different values for different key bytes"
         );
+    }
+
+    #[test]
+    fn test_certificate_identity_is_full_width_deterministic_and_distinct() {
+        let key_a = NodePublicKey(vec![1, 2, 3]);
+        let key_b = NodePublicKey(vec![1, 2, 4]);
+
+        let first = key_a.certificate_identity();
+        assert_eq!(first, key_a.certificate_identity());
+        assert_ne!(first, key_b.certificate_identity());
+        assert_eq!(first.as_bytes().len(), 32);
+        assert_eq!(CertificateIdentity::from_bytes(first.into_bytes()), first);
     }
 
     #[test]

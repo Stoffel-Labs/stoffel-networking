@@ -1066,7 +1066,7 @@ pub struct QuicNetworkManager {
     /// Server-role connections (peer-to-peer MPC party connections)
     server_connections: Arc<DashMap<PartyId, Arc<dyn PeerConnection>>>,
     /// Client-role connections (external clients connected to this server)
-    client_connections: Arc<DashMap<ClientId, Arc<dyn PeerConnection>>>,
+    client_connections: Arc<DashMap<ClientId, Vec<Arc<dyn PeerConnection>>>>,
     /// Replaced Mutex<HashSet> with DashSet for client IDs
     client_ids: Arc<DashSet<ClientId>>,
     /// Persistent certificate for this node (generated once)
@@ -1480,7 +1480,13 @@ impl QuicNetworkManager {
             return self
                 .client_connections
                 .iter()
-                .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+                .flat_map(|entry| {
+                    entry
+                        .value()
+                        .iter()
+                        .map(|connection| (*entry.key(), Arc::clone(connection)))
+                        .collect::<Vec<_>>()
+                })
                 .collect();
         }
 
@@ -1489,10 +1495,15 @@ impl QuicNetworkManager {
             .enumerate()
             .filter_map(|(logical_id, key)| {
                 let transport_id = key.derive_id();
-                self.client_connections
-                    .get(&transport_id)
-                    .map(|entry| (logical_id, Arc::clone(entry.value())))
+                self.client_connections.get(&transport_id).map(|entry| {
+                    entry
+                        .value()
+                        .iter()
+                        .map(|connection| (logical_id, Arc::clone(connection)))
+                        .collect::<Vec<_>>()
+                })
             })
+            .flatten()
             .collect()
     }
 
@@ -1500,7 +1511,7 @@ impl QuicNetworkManager {
     pub fn get_client_connection(&self, client_id: ClientId) -> Option<Arc<dyn PeerConnection>> {
         self.resolve_client_transport_id(client_id)
             .and_then(|transport_id| self.client_connections.get(&transport_id))
-            .map(|entry| Arc::clone(entry.value()))
+            .and_then(|entry| entry.value().first().cloned())
     }
 
     /// Removes dead connections from both server and client connection maps
@@ -1522,22 +1533,31 @@ impl QuicNetworkManager {
             self.server_connections.remove(&party_id);
         }
 
-        let client_entries: Vec<(ClientId, Arc<dyn PeerConnection>)> = self
-            .client_connections
-            .iter()
-            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
-            .collect();
-
-        let mut clients_to_remove = Vec::new();
-        for (client_id, conn) in client_entries {
-            if !conn.is_connected().await {
-                clients_to_remove.push(client_id);
+        let client_ids: Vec<ClientId> = self.client_connections.iter().map(|e| *e.key()).collect();
+        for client_id in client_ids {
+            let connections = self
+                .client_connections
+                .get(&client_id)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default();
+            let mut dead = Vec::new();
+            for connection in connections {
+                if !connection.is_connected().await {
+                    dead.push(connection);
+                }
             }
-        }
-
-        for client_id in clients_to_remove {
-            self.client_connections.remove(&client_id);
-            self.client_ids.remove(&client_id);
+            if let Some(mut entry) = self.client_connections.get_mut(&client_id) {
+                entry
+                    .value_mut()
+                    .retain(|connection| !dead.iter().any(|old| Arc::ptr_eq(old, connection)));
+            }
+            if self
+                .client_connections
+                .remove_if(&client_id, |_, connections| connections.is_empty())
+                .is_some()
+            {
+                self.client_ids.remove(&client_id);
+            }
         }
     }
 
@@ -1886,14 +1906,15 @@ impl QuicNetworkManager {
         // Assign party IDs to client connections
         for entry in self.client_connections.iter() {
             let derived_id = *entry.key();
-            let conn = entry.value();
 
             // Look up public key by derived_id
             if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
                 let peer_pk = pk_entry.value();
                 if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
-                    conn.set_remote_party_id(pos);
-                    assigned += 1;
+                    for connection in entry.value() {
+                        connection.set_remote_party_id(pos);
+                        assigned += 1;
+                    }
                 }
             }
         }
@@ -3117,11 +3138,13 @@ impl QuicNetworkManager {
         };
         let response_bytes = response.serialize();
         for entry in self.client_connections.iter() {
-            let conn = entry.value().clone();
-            let bytes = response_bytes.clone();
-            tokio::spawn(async move {
-                let _ = conn.send(&bytes).await;
-            });
+            for connection in entry.value() {
+                let connection = Arc::clone(connection);
+                let bytes = response_bytes.clone();
+                tokio::spawn(async move {
+                    let _ = connection.send(&bytes).await;
+                });
+            }
         }
 
         // 6. Return verified ordering
@@ -3297,7 +3320,10 @@ impl NetworkManager for QuicNetworkManager {
                     );
 
                     // Store as client connection
-                    self.client_connections.insert(peer_id, Arc::clone(&conn));
+                    self.client_connections
+                        .entry(peer_id)
+                        .or_default()
+                        .push(Arc::clone(&conn));
                     self.client_ids.insert(peer_id);
 
                     // Store client's public key for consensus
@@ -3555,13 +3581,20 @@ impl Network for QuicNetworkManager {
             let Some(conn_ref) = self.client_connections.get(&transport_id) else {
                 return Err(NetworkError::ClientNotFound(client));
             };
-            let connection = conn_ref.value();
+            let connections = conn_ref.value().clone();
+            drop(conn_ref);
 
-            // Send directly without pre-checking is_connected() to avoid
-            // check-then-act race (STO-478).
-            match connection.send(message).await {
-                Ok(_) => Ok(message.len()),
-                Err(_) => Err(NetworkError::SendError),
+            // A logical client certificate may be reused by concurrent
+            // physical executions. The execution envelope ensures only the
+            // intended connection accepts the payload.
+            let mut delivered = false;
+            for connection in connections {
+                delivered |= connection.send(message).await.is_ok();
+            }
+            if delivered {
+                Ok(message.len())
+            } else {
+                Err(NetworkError::SendError)
             }
         } else {
             Err(NetworkError::ClientNotFound(client))
@@ -4404,6 +4437,43 @@ mod tests {
             client_derived_id
         );
         assert!(server.client_ids.contains(&client_derived_id));
+    }
+
+    #[tokio::test]
+    async fn test_same_client_certificate_keeps_both_physical_connections() {
+        ensure_crypto_provider();
+        let mut server = QuicNetworkManager::with_node_id(1);
+        server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let address = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = identity.cert.der().to_vec();
+        let key = identity.signing_key.serialize_der();
+        let mut client_a = QuicNetworkManager::with_node_id(100);
+        client_a
+            .set_local_certificate_der(cert.clone(), key.clone())
+            .unwrap();
+        let mut client_b = QuicNetworkManager::with_node_id(101);
+        client_b.set_local_certificate_der(cert, key).unwrap();
+
+        let connect_a = tokio::spawn(async move {
+            client_a.connect_as_client(address).await.unwrap();
+            client_a
+        });
+        server.accept().await.unwrap();
+        let client_a = connect_a.await.unwrap();
+
+        let connect_b = tokio::spawn(async move {
+            client_b.connect_as_client(address).await.unwrap();
+            client_b
+        });
+        server.accept().await.unwrap();
+        let client_b = connect_b.await.unwrap();
+
+        let client_id = client_a.local_derived_id();
+        assert_eq!(client_id, client_b.local_derived_id());
+        assert_eq!(server.client_connections.get(&client_id).unwrap().len(), 2);
+        assert_eq!(server.get_all_client_connections().len(), 2);
     }
 
     #[tokio::test]

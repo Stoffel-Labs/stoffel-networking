@@ -1009,6 +1009,13 @@ type OutboundMessage = (Arc<dyn PeerConnection>, Vec<u8>);
 type OutboundSender = mpsc::UnboundedSender<OutboundMessage>;
 type OutboundQueues = Arc<DashMap<PartyId, OutboundSender>>;
 
+/// Callback invoked after an outbound MPC message has been queued.
+///
+/// The second argument is the number of recipients. Keeping the callback on
+/// the manager lets callers collect protocol statistics without adding work to
+/// the transport's write path.
+pub type SendHook = Arc<dyn Fn(&[u8], usize) + Send + Sync + 'static>;
+
 /// QUIC-based network manager for MPC peer-to-peer communication.
 ///
 /// `QuicNetworkManager` is the primary entry point for establishing and managing
@@ -1108,6 +1115,7 @@ pub struct QuicNetworkManager {
     /// never block the receive path on transport backpressure. One drainer task
     /// per peer performs the actual writes in FIFO order.
     outbound: OutboundQueues,
+    send_hook: Arc<std::sync::RwLock<Option<SendHook>>>,
     execution_scanner_receive_owner_claimed: Arc<AtomicBool>,
 }
 
@@ -1165,7 +1173,31 @@ impl QuicNetworkManager {
             client_connected_tx,
             peer_connected_tx,
             outbound: Arc::new(DashMap::new()),
+            send_hook: Arc::new(std::sync::RwLock::new(None)),
             execution_scanner_receive_owner_claimed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Installs a callback for successfully queued outbound MPC messages.
+    pub fn set_send_hook(&self, hook: SendHook) {
+        *self
+            .send_hook
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    fn record_outbound_send(&self, message: &[u8], recipients: usize) {
+        if recipients == 0 {
+            return;
+        }
+
+        let hook = self
+            .send_hook
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(message, recipients);
         }
     }
 
@@ -1363,6 +1395,7 @@ impl QuicNetworkManager {
             client_connected_tx,
             peer_connected_tx,
             outbound: Arc::new(DashMap::new()),
+            send_hook: Arc::new(std::sync::RwLock::new(None)),
             execution_scanner_receive_owner_claimed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -3486,6 +3519,7 @@ impl Network for QuicNetworkManager {
         self.outbound_sender(recipient)
             .send((connection, message.to_vec()))
             .map_err(|_| NetworkError::SendError)?;
+        self.record_outbound_send(message, 1);
         debug!("Queued message to recipient {}", recipient);
         Ok(message.len())
     }
@@ -3494,6 +3528,7 @@ impl Network for QuicNetworkManager {
         self.await_consensus_gate().await?;
 
         let mut total_bytes = 0usize;
+        let mut recipients = 0usize;
         let party_count = self.party_count();
 
         // Broadcast to all parties using party_id (0..N-1).
@@ -3514,6 +3549,7 @@ impl Network for QuicNetworkManager {
                     Ok(()) => {
                         debug!("Queued broadcast message to party_id {}", party_id);
                         total_bytes += message.len();
+                        recipients += 1;
                     }
                     Err(_) => {
                         debug!("Failed to queue broadcast to party_id {}", party_id);
@@ -3543,10 +3579,12 @@ impl Network for QuicNetworkManager {
                 {
                     debug!("Queued broadcast message to self (loopback fallback)");
                     total_bytes += message.len();
+                    recipients += 1;
                 }
             }
         }
 
+        self.record_outbound_send(message, recipients);
         Ok(total_bytes)
     }
 
@@ -4282,6 +4320,31 @@ mod tests {
         assert!(manager.local_key_der.is_none());
         assert!(manager.local_public_key.is_none());
         assert!(manager.peer_public_keys.is_empty());
+    }
+
+    #[test]
+    fn test_send_hook_records_message_and_recipient_count() {
+        let manager = QuicNetworkManager::new();
+        let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recipients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        manager.set_send_hook(Arc::new({
+            let bytes = Arc::clone(&bytes);
+            let recipients = Arc::clone(&recipients);
+            move |message, recipient_count| {
+                bytes.fetch_add(
+                    message.len() * recipient_count,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                recipients.fetch_add(recipient_count, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+
+        manager.record_outbound_send(b"hello", 3);
+        manager.record_outbound_send(b"ignored", 0);
+
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 15);
+        assert_eq!(recipients.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -5171,12 +5234,13 @@ mod tests {
         // MAX_MESSAGE_SIZE must comfortably exceed the largest framed payload we
         // emit (a fully-unrolled MPC circuit is ~40 MB), while staying well
         // under u32::MAX so the 4-byte length prefix never truncates.
+        let max_message_size = std::hint::black_box(MAX_MESSAGE_SIZE);
         assert!(
-            MAX_MESSAGE_SIZE >= 256 * 1024 * 1024,
-            "MAX_MESSAGE_SIZE must admit large program uploads (>=256 MiB), got {MAX_MESSAGE_SIZE}"
+            max_message_size >= 256 * 1024 * 1024,
+            "MAX_MESSAGE_SIZE must admit large program uploads (>=256 MiB), got {max_message_size}"
         );
         assert!(
-            MAX_MESSAGE_SIZE < u32::MAX as usize,
+            max_message_size < u32::MAX as usize,
             "MAX_MESSAGE_SIZE must fit in the u32 length prefix"
         );
         // The real DoS bound is the incremental receive, not this ceiling:

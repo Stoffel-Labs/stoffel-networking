@@ -1006,7 +1006,7 @@ impl Message for QuicMessage {
 // ============================================================================
 
 type OutboundMessage = (Arc<dyn PeerConnection>, Vec<u8>);
-type OutboundSender = mpsc::UnboundedSender<OutboundMessage>;
+type OutboundSender = mpsc::Sender<OutboundMessage>;
 type OutboundQueues = Arc<DashMap<PartyId, OutboundSender>>;
 
 /// Callback invoked after an outbound MPC message has been queued.
@@ -1015,6 +1015,11 @@ type OutboundQueues = Arc<DashMap<PartyId, OutboundSender>>;
 /// the manager lets callers collect protocol statistics without adding work to
 /// the transport's write path.
 pub type SendHook = Arc<dyn Fn(&[u8], usize) + Send + Sync + 'static>;
+
+/// Maximum number of messages retained for a peer whose QUIC stream is not
+/// writable. Producers use `try_send`, so saturation sheds the new message
+/// instead of blocking a receive loop or growing memory without bound.
+const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 
 /// QUIC-based network manager for MPC peer-to-peer communication.
 ///
@@ -1109,11 +1114,12 @@ pub struct QuicNetworkManager {
     client_connected_tx: tokio::sync::broadcast::Sender<ClientId>,
     /// Broadcast channel: notifies when a new peer connects
     peer_connected_tx: tokio::sync::broadcast::Sender<PartyId>,
-    /// Per-peer unbounded outbound queues. `send`/`broadcast` resolve the target
+    /// Per-peer bounded outbound queues. `send`/`broadcast` resolve the target
     /// connection and enqueue `(connection, bytes)` here without ever awaiting the
     /// QUIC write, so a caller driven from a single message-processing loop can
-    /// never block the receive path on transport backpressure. One drainer task
-    /// per peer performs the actual writes in FIFO order.
+    /// never block the receive path on transport backpressure or retain messages
+    /// without bound. One drainer task per peer performs the actual writes in FIFO
+    /// order.
     outbound: OutboundQueues,
     send_hook: Arc<std::sync::RwLock<Option<SendHook>>>,
     execution_scanner_receive_owner_claimed: Arc<AtomicBool>,
@@ -1207,20 +1213,21 @@ impl QuicNetworkManager {
         manager
     }
 
-    /// Returns the unbounded outbound sender for `recipient`, lazily spawning a
+    /// Returns the bounded outbound sender for `recipient`, lazily spawning a
     /// dedicated drainer task on first use. The drainer owns the receive half and
     /// performs the actual QUIC writes, so callers never block on transport
-    /// backpressure — they only enqueue. Per-peer FIFO order is preserved because
-    /// exactly one task drains each peer's queue. The connection to write to is
-    /// carried with each message (resolved by the caller), so the drainer holds
-    /// no back-reference to the manager and creates no reference cycle — when the
-    /// manager drops, the senders drop, the receivers close, and the drainers exit.
+    /// backpressure — they enqueue with `try_send` and fail fast when the queue is
+    /// full. Per-peer FIFO order is preserved because exactly one task drains each
+    /// peer's queue. The connection to write to is carried with each message
+    /// (resolved by the caller), so the drainer holds no back-reference to the
+    /// manager and creates no reference cycle — when the manager drops, the
+    /// senders drop, the receivers close, and the drainers exit.
     fn outbound_sender(&self, recipient: PartyId) -> OutboundSender {
         let node_id = self.node_id;
         self.outbound
             .entry(recipient)
             .or_insert_with(|| {
-                let (tx, mut rx) = mpsc::unbounded_channel::<OutboundMessage>();
+                let (tx, mut rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_QUEUE_CAPACITY);
                 tokio::spawn(async move {
                     while let Some((connection, msg)) = rx.recv().await {
                         if let Err(e) = connection.send(&msg).await {
@@ -3517,7 +3524,7 @@ impl Network for QuicNetworkManager {
         // driven from a single message-processing loop cannot wedge the receive
         // path. The dedicated drainer performs the write in FIFO order.
         self.outbound_sender(recipient)
-            .send((connection, message.to_vec()))
+            .try_send((connection, message.to_vec()))
             .map_err(|_| NetworkError::SendError)?;
         self.record_outbound_send(message, 1);
         debug!("Queued message to recipient {}", recipient);
@@ -3544,7 +3551,7 @@ impl Network for QuicNetworkManager {
                 }
                 match self
                     .outbound_sender(party_id)
-                    .send((connection, message.to_vec()))
+                    .try_send((connection, message.to_vec()))
                 {
                     Ok(()) => {
                         debug!("Queued broadcast message to party_id {}", party_id);
@@ -3574,7 +3581,7 @@ impl Network for QuicNetworkManager {
                     debug!("Skipping broadcast to self: loopback connection closed");
                 } else if self
                     .outbound_sender(self.node_id)
-                    .send((connection, message.to_vec()))
+                    .try_send((connection, message.to_vec()))
                     .is_ok()
                 {
                     debug!("Queued broadcast message to self (loopback fallback)");
@@ -3864,6 +3871,85 @@ mod tests {
             &'a self,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
             Box::pin(async move { Ok((*self.response).clone()) })
+        }
+
+        fn remote_address(&self) -> SocketAddr {
+            self.remote_addr
+        }
+
+        fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn state<'a>(&'a self) -> Pin<Box<dyn Future<Output = ConnectionState> + Send + 'a>> {
+            Box::pin(async move { ConnectionState::Connected })
+        }
+
+        fn is_connected<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move { true })
+        }
+
+        fn get_connection_role(&self) -> ClientType {
+            ClientType::Server
+        }
+
+        fn remote_party_id(&self) -> Option<PartyId> {
+            self.remote_party_id.lock().ok().and_then(|id| *id)
+        }
+
+        fn set_remote_party_id(&self, party_id: PartyId) {
+            if let Ok(mut id) = self.remote_party_id.lock() {
+                *id = Some(party_id);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct StalledPeerConnection {
+        send_started: Arc<tokio::sync::Semaphore>,
+        release_send: Arc<tokio::sync::Semaphore>,
+        block_sends: Arc<AtomicBool>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
+        remote_addr: SocketAddr,
+        remote_party_id: Arc<std::sync::Mutex<Option<PartyId>>>,
+    }
+
+    impl StalledPeerConnection {
+        fn new() -> Self {
+            Self {
+                send_started: Arc::new(tokio::sync::Semaphore::new(0)),
+                release_send: Arc::new(tokio::sync::Semaphore::new(0)),
+                block_sends: Arc::new(AtomicBool::new(true)),
+                sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                remote_addr: "127.0.0.1:0".parse().unwrap(),
+                remote_party_id: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+    }
+
+    impl PeerConnection for StalledPeerConnection {
+        fn send<'a>(
+            &'a self,
+            _data: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.send_started.add_permits(1);
+                if self.block_sends.load(Ordering::Acquire) {
+                    self.release_send
+                        .acquire()
+                        .await
+                        .map_err(|_| "release semaphore closed".to_string())?
+                        .forget();
+                }
+                self.sent.fetch_add(1, Ordering::Release);
+                Ok(())
+            })
+        }
+
+        fn receive<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+            Box::pin(async move { std::future::pending().await })
         }
 
         fn remote_address(&self) -> SocketAddr {
@@ -5462,6 +5548,73 @@ mod tests {
     // ========================================================================
     // Race Condition Reproduction Tests (STO-479, STO-478, STO-481)
     // ========================================================================
+
+    /// STO-768 regression: a peer that stops consuming QUIC writes must not be
+    /// able to make the per-peer outbound queue retain messages without bound.
+    /// Queue saturation must fail fast, and delivery must resume after the peer
+    /// becomes writable again.
+    #[tokio::test]
+    async fn test_sto_768_stalled_peer_has_bounded_outbound_queue() {
+        const EXPECTED_QUEUE_CAPACITY: usize = OUTBOUND_QUEUE_CAPACITY;
+
+        let mut manager = QuicNetworkManager::with_node_id(7);
+        let local_key = NodePublicKey(vec![0]);
+        let peer_key = NodePublicKey(vec![1]);
+        let peer_id = peer_key.derive_id();
+        manager.local_public_key = Some(local_key);
+        manager.peer_public_keys.insert(peer_id, peer_key);
+
+        let peer = Arc::new(StalledPeerConnection::new());
+        manager
+            .server_connections
+            .insert(peer_id, Arc::clone(&peer) as Arc<dyn PeerConnection>);
+
+        assert_eq!(manager.send(1, b"first").await, Ok(5));
+        tokio::time::timeout(Duration::from_secs(1), peer.send_started.acquire())
+            .await
+            .expect("outbound drainer did not start")
+            .expect("send-start semaphore closed")
+            .forget();
+
+        for _ in 0..EXPECTED_QUEUE_CAPACITY {
+            assert_eq!(manager.send(1, b"queued").await, Ok(6));
+        }
+
+        let overflow = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.send(1, b"must-not-be-retained"),
+        )
+        .await
+        .expect("queue saturation blocked the caller instead of failing fast");
+        assert_eq!(overflow, Err(NetworkError::SendError));
+
+        let broadcast_overflow = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.broadcast(b"broadcast-must-not-be-retained"),
+        )
+        .await
+        .expect("broadcast queue saturation blocked the caller instead of failing fast");
+        assert_eq!(broadcast_overflow, Ok(0));
+
+        peer.block_sends.store(false, Ordering::Release);
+        peer.release_send.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.sent.load(Ordering::Acquire) < EXPECTED_QUEUE_CAPACITY + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued messages did not drain after the peer resumed");
+
+        assert_eq!(manager.send(1, b"healthy").await, Ok(7));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.sent.load(Ordering::Acquire) < EXPECTED_QUEUE_CAPACITY + 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("healthy delivery did not resume after backpressure cleared");
+    }
 
     /// STO-479 stress test: Race send() and close() concurrently on a QUIC
     /// connection to verify state doesn't get corrupted.

@@ -23,6 +23,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -140,6 +141,12 @@ pub trait PeerConnection: Send + Sync {
 
     /// Returns how the remote peer identified itself in the handshake
     fn get_connection_role(&self) -> ClientType;
+
+    /// Returns the exact DER-encoded SubjectPublicKeyInfo authenticated by the
+    /// TLS handshake. Non-TLS test transports return `None` by default.
+    fn authenticated_peer_public_key(&self) -> Option<NodePublicKey> {
+        None
+    }
 
     /// Returns the party ID of the remote peer, if known.
     fn remote_party_id(&self) -> Option<PartyId>;
@@ -522,6 +529,10 @@ impl PeerConnection for QuicPeerConnection {
 
     fn get_connection_role(&self) -> ClientType {
         self.connection_role
+    }
+
+    fn authenticated_peer_public_key(&self) -> Option<NodePublicKey> {
+        self.peer_public_key.clone()
     }
 
     fn remote_party_id(&self) -> Option<PartyId> {
@@ -995,8 +1006,20 @@ impl Message for QuicMessage {
 // ============================================================================
 
 type OutboundMessage = (Arc<dyn PeerConnection>, Vec<u8>);
-type OutboundSender = mpsc::UnboundedSender<OutboundMessage>;
+type OutboundSender = mpsc::Sender<OutboundMessage>;
 type OutboundQueues = Arc<DashMap<PartyId, OutboundSender>>;
+
+/// Callback invoked after an outbound MPC message has been queued.
+///
+/// The second argument is the number of recipients. Keeping the callback on
+/// the manager lets callers collect protocol statistics without adding work to
+/// the transport's write path.
+pub type SendHook = Arc<dyn Fn(&[u8], usize) + Send + Sync + 'static>;
+
+/// Maximum number of messages retained for a peer whose QUIC stream is not
+/// writable. Producers use `try_send`, so saturation sheds the new message
+/// instead of blocking a receive loop or growing memory without bound.
+const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 
 /// QUIC-based network manager for MPC peer-to-peer communication.
 ///
@@ -1028,6 +1051,24 @@ type OutboundQueues = Arc<DashMap<PartyId, OutboundSender>>;
 /// };
 /// let manager = QuicNetworkManager::with_config(config);
 /// ```
+struct ExecutionScannerReceiveOwnerLeaseInner {
+    claimed: Arc<AtomicBool>,
+}
+
+impl Drop for ExecutionScannerReceiveOwnerLeaseInner {
+    fn drop(&mut self) {
+        self.claimed.store(false, Ordering::Release);
+    }
+}
+
+/// Exclusive ownership token shared by one execution scanner and its receive
+/// loops. A new scanner can claim the manager after the final clone is dropped.
+#[derive(Clone)]
+#[must_use = "dropping the final token releases execution-scanner ownership"]
+pub struct ExecutionScannerReceiveOwnerLease {
+    _inner: Arc<ExecutionScannerReceiveOwnerLeaseInner>,
+}
+
 #[derive(Clone)]
 pub struct QuicNetworkManager {
     endpoint: Option<Endpoint>,
@@ -1037,7 +1078,7 @@ pub struct QuicNetworkManager {
     /// Server-role connections (peer-to-peer MPC party connections)
     server_connections: Arc<DashMap<PartyId, Arc<dyn PeerConnection>>>,
     /// Client-role connections (external clients connected to this server)
-    client_connections: Arc<DashMap<ClientId, Arc<dyn PeerConnection>>>,
+    client_connections: Arc<DashMap<ClientId, Vec<Arc<dyn PeerConnection>>>>,
     /// Replaced Mutex<HashSet> with DashSet for client IDs
     client_ids: Arc<DashSet<ClientId>>,
     /// Persistent certificate for this node (generated once)
@@ -1073,12 +1114,15 @@ pub struct QuicNetworkManager {
     client_connected_tx: tokio::sync::broadcast::Sender<ClientId>,
     /// Broadcast channel: notifies when a new peer connects
     peer_connected_tx: tokio::sync::broadcast::Sender<PartyId>,
-    /// Per-peer unbounded outbound queues. `send`/`broadcast` resolve the target
+    /// Per-peer bounded outbound queues. `send`/`broadcast` resolve the target
     /// connection and enqueue `(connection, bytes)` here without ever awaiting the
     /// QUIC write, so a caller driven from a single message-processing loop can
-    /// never block the receive path on transport backpressure. One drainer task
-    /// per peer performs the actual writes in FIFO order.
+    /// never block the receive path on transport backpressure or retain messages
+    /// without bound. One drainer task per peer performs the actual writes in FIFO
+    /// order.
     outbound: OutboundQueues,
+    send_hook: Arc<std::sync::RwLock<Option<SendHook>>>,
+    execution_scanner_receive_owner_claimed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for QuicNetworkManager {
@@ -1135,6 +1179,31 @@ impl QuicNetworkManager {
             client_connected_tx,
             peer_connected_tx,
             outbound: Arc::new(DashMap::new()),
+            send_hook: Arc::new(std::sync::RwLock::new(None)),
+            execution_scanner_receive_owner_claimed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Installs a callback for successfully queued outbound MPC messages.
+    pub fn set_send_hook(&self, hook: SendHook) {
+        *self
+            .send_hook
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    fn record_outbound_send(&self, message: &[u8], recipients: usize) {
+        if recipients == 0 {
+            return;
+        }
+
+        let hook = self
+            .send_hook
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(message, recipients);
         }
     }
 
@@ -1144,20 +1213,21 @@ impl QuicNetworkManager {
         manager
     }
 
-    /// Returns the unbounded outbound sender for `recipient`, lazily spawning a
+    /// Returns the bounded outbound sender for `recipient`, lazily spawning a
     /// dedicated drainer task on first use. The drainer owns the receive half and
     /// performs the actual QUIC writes, so callers never block on transport
-    /// backpressure — they only enqueue. Per-peer FIFO order is preserved because
-    /// exactly one task drains each peer's queue. The connection to write to is
-    /// carried with each message (resolved by the caller), so the drainer holds
-    /// no back-reference to the manager and creates no reference cycle — when the
-    /// manager drops, the senders drop, the receivers close, and the drainers exit.
+    /// backpressure — they enqueue with `try_send` and fail fast when the queue is
+    /// full. Per-peer FIFO order is preserved because exactly one task drains each
+    /// peer's queue. The connection to write to is carried with each message
+    /// (resolved by the caller), so the drainer holds no back-reference to the
+    /// manager and creates no reference cycle — when the manager drops, the
+    /// senders drop, the receivers close, and the drainers exit.
     fn outbound_sender(&self, recipient: PartyId) -> OutboundSender {
         let node_id = self.node_id;
         self.outbound
             .entry(recipient)
             .or_insert_with(|| {
-                let (tx, mut rx) = mpsc::unbounded_channel::<OutboundMessage>();
+                let (tx, mut rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_QUEUE_CAPACITY);
                 tokio::spawn(async move {
                     while let Some((connection, msg)) = rx.recv().await {
                         if let Err(e) = connection.send(&msg).await {
@@ -1191,6 +1261,65 @@ impl QuicNetworkManager {
         self.local_cert_der = Some(cert_der);
         self.local_key_der = Some(key_der);
         self.local_public_key = Some(public_key);
+        Ok(())
+    }
+
+    /// Extract the exact DER-encoded SubjectPublicKeyInfo from a certificate.
+    pub fn public_key_from_certificate_der(cert_der: &[u8]) -> Result<NodePublicKey, String> {
+        Self::extract_public_key_from_cert(cert_der)
+    }
+
+    /// Install the immutable full-certificate roster used to admit MPC peers.
+    pub fn install_expected_server_public_keys<I>(&mut self, public_keys: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = NodePublicKey>,
+    {
+        let mut keys = Vec::new();
+        let mut compact_ids = std::collections::HashMap::new();
+        for key in public_keys {
+            let compact_id = key.derive_id();
+            if let Some(existing) = compact_ids.insert(compact_id, key.clone()) {
+                if existing != key {
+                    return Err(format!(
+                        "distinct server certificates collide at compact party ID {compact_id}"
+                    ));
+                }
+                continue;
+            }
+            keys.push(key);
+        }
+        if keys.is_empty() {
+            return Err("server certificate roster cannot be empty".to_string());
+        }
+        let local = self.local_public_key.as_ref().ok_or_else(|| {
+            "local certificate must be installed before the server certificate roster".to_string()
+        })?;
+        if !keys.contains(local) {
+            return Err(
+                "local certificate is absent from the server certificate roster".to_string(),
+            );
+        }
+        for peer in self.peer_public_keys.iter() {
+            if !keys.contains(peer.value()) {
+                return Err(format!(
+                    "already connected server peer {} is absent from the certificate roster",
+                    peer.key()
+                ));
+            }
+        }
+        let current = self
+            .allowed_peer_public_keys
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<std::collections::HashSet<_>>();
+        let requested = keys
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        if !current.is_empty() && current != requested {
+            return Err("server certificate roster is already frozen".to_string());
+        }
+        self.set_allowed_certificate_public_keys(keys);
         Ok(())
     }
 
@@ -1273,6 +1402,8 @@ impl QuicNetworkManager {
             client_connected_tx,
             peer_connected_tx,
             outbound: Arc::new(DashMap::new()),
+            send_hook: Arc::new(std::sync::RwLock::new(None)),
+            execution_scanner_receive_owner_claimed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1360,6 +1491,20 @@ impl QuicNetworkManager {
             .map(|entry| Arc::clone(entry.value()))
     }
 
+    /// Claim this manager clone-set for one execution connection scanner.
+    pub fn try_acquire_execution_scanner_receive_owner(
+        &self,
+    ) -> Option<ExecutionScannerReceiveOwnerLease> {
+        self.execution_scanner_receive_owner_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(ExecutionScannerReceiveOwnerLease {
+            _inner: Arc::new(ExecutionScannerReceiveOwnerLeaseInner {
+                claimed: Arc::clone(&self.execution_scanner_receive_owner_claimed),
+            }),
+        })
+    }
+
     /// Gets all server connections (peer-to-peer MPC party connections)
     pub fn get_all_server_connections(&self) -> Vec<(PartyId, Arc<dyn PeerConnection>)> {
         self.server_connections
@@ -1375,7 +1520,13 @@ impl QuicNetworkManager {
             return self
                 .client_connections
                 .iter()
-                .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+                .flat_map(|entry| {
+                    entry
+                        .value()
+                        .iter()
+                        .map(|connection| (*entry.key(), Arc::clone(connection)))
+                        .collect::<Vec<_>>()
+                })
                 .collect();
         }
 
@@ -1384,10 +1535,15 @@ impl QuicNetworkManager {
             .enumerate()
             .filter_map(|(logical_id, key)| {
                 let transport_id = key.derive_id();
-                self.client_connections
-                    .get(&transport_id)
-                    .map(|entry| (logical_id, Arc::clone(entry.value())))
+                self.client_connections.get(&transport_id).map(|entry| {
+                    entry
+                        .value()
+                        .iter()
+                        .map(|connection| (logical_id, Arc::clone(connection)))
+                        .collect::<Vec<_>>()
+                })
             })
+            .flatten()
             .collect()
     }
 
@@ -1395,7 +1551,7 @@ impl QuicNetworkManager {
     pub fn get_client_connection(&self, client_id: ClientId) -> Option<Arc<dyn PeerConnection>> {
         self.resolve_client_transport_id(client_id)
             .and_then(|transport_id| self.client_connections.get(&transport_id))
-            .map(|entry| Arc::clone(entry.value()))
+            .and_then(|entry| entry.value().first().cloned())
     }
 
     /// Removes dead connections from both server and client connection maps
@@ -1417,22 +1573,31 @@ impl QuicNetworkManager {
             self.server_connections.remove(&party_id);
         }
 
-        let client_entries: Vec<(ClientId, Arc<dyn PeerConnection>)> = self
-            .client_connections
-            .iter()
-            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
-            .collect();
-
-        let mut clients_to_remove = Vec::new();
-        for (client_id, conn) in client_entries {
-            if !conn.is_connected().await {
-                clients_to_remove.push(client_id);
+        let client_ids: Vec<ClientId> = self.client_connections.iter().map(|e| *e.key()).collect();
+        for client_id in client_ids {
+            let connections = self
+                .client_connections
+                .get(&client_id)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default();
+            let mut dead = Vec::new();
+            for connection in connections {
+                if !connection.is_connected().await {
+                    dead.push(connection);
+                }
             }
-        }
-
-        for client_id in clients_to_remove {
-            self.client_connections.remove(&client_id);
-            self.client_ids.remove(&client_id);
+            if let Some(mut entry) = self.client_connections.get_mut(&client_id) {
+                entry
+                    .value_mut()
+                    .retain(|connection| !dead.iter().any(|old| Arc::ptr_eq(old, connection)));
+            }
+            if self
+                .client_connections
+                .remove_if(&client_id, |_, connections| connections.is_empty())
+                .is_some()
+            {
+                self.client_ids.remove(&client_id);
+            }
         }
     }
 
@@ -1781,14 +1946,15 @@ impl QuicNetworkManager {
         // Assign party IDs to client connections
         for entry in self.client_connections.iter() {
             let derived_id = *entry.key();
-            let conn = entry.value();
 
             // Look up public key by derived_id
             if let Some(pk_entry) = self.peer_public_keys.get(&derived_id) {
                 let peer_pk = pk_entry.value();
                 if let Some(pos) = sorted_keys.iter().position(|k| k == peer_pk) {
-                    conn.set_remote_party_id(pos);
-                    assigned += 1;
+                    for connection in entry.value() {
+                        connection.set_remote_party_id(pos);
+                        assigned += 1;
+                    }
                 }
             }
         }
@@ -1988,6 +2154,25 @@ impl QuicNetworkManager {
         &mut self,
         address: SocketAddr,
     ) -> Result<Arc<dyn PeerConnection>, String> {
+        self.connect_as_server_inner(address, None).await
+    }
+
+    /// Connect to a server and require its TLS certificate to contain the exact
+    /// expected SubjectPublicKeyInfo before admitting the connection.
+    pub async fn connect_as_server_with_expected_public_key(
+        &mut self,
+        address: SocketAddr,
+        expected_public_key: &NodePublicKey,
+    ) -> Result<Arc<dyn PeerConnection>, String> {
+        self.connect_as_server_inner(address, Some(expected_public_key))
+            .await
+    }
+
+    async fn connect_as_server_inner(
+        &mut self,
+        address: SocketAddr,
+        expected_public_key: Option<&NodePublicKey>,
+    ) -> Result<Arc<dyn PeerConnection>, String> {
         self.ensure_client_endpoint(ClientType::Server).await?;
         self.ensure_loopback_installed().await;
 
@@ -2014,6 +2199,26 @@ impl QuicNetworkManager {
                 }
             };
 
+        if let Some(expected) = expected_public_key {
+            match peer_public_key.as_ref() {
+                Some(presented) if presented == expected => {}
+                Some(presented) => {
+                    connection.close(0u32.into(), b"server certificate mismatch");
+                    return Err(format!(
+                        "server certificate mismatch at {address}: expected compact ID {}, presented compact ID {}",
+                        expected.derive_id(),
+                        presented.derive_id()
+                    ));
+                }
+                None => {
+                    connection.close(0u32.into(), b"missing server certificate identity");
+                    return Err(format!(
+                        "server at {address} did not present an extractable certificate identity"
+                    ));
+                }
+            }
+        }
+
         // Open persistent stream and send sync byte to establish it
         let (mut send, recv) = connection
             .open_bi()
@@ -2037,6 +2242,14 @@ impl QuicNetworkManager {
 
         // Store peer's public key if available
         if let Some(ref pk) = peer_public_key {
+            if let Some(existing) = self.peer_public_keys.get(&peer_id) {
+                if existing.value() != pk {
+                    connection.close(0u32.into(), b"server certificate identity collision");
+                    return Err(format!(
+                        "server certificate identity collision for compact party ID {peer_id}"
+                    ));
+                }
+            }
             self.peer_public_keys.insert(peer_id, pk.clone());
             trace!("Stored public key for peer {}", peer_id);
         }
@@ -2965,11 +3178,13 @@ impl QuicNetworkManager {
         };
         let response_bytes = response.serialize();
         for entry in self.client_connections.iter() {
-            let conn = entry.value().clone();
-            let bytes = response_bytes.clone();
-            tokio::spawn(async move {
-                let _ = conn.send(&bytes).await;
-            });
+            for connection in entry.value() {
+                let connection = Arc::clone(connection);
+                let bytes = response_bytes.clone();
+                tokio::spawn(async move {
+                    let _ = connection.send(&bytes).await;
+                });
+            }
         }
 
         // 6. Return verified ordering
@@ -3145,7 +3360,10 @@ impl NetworkManager for QuicNetworkManager {
                     );
 
                     // Store as client connection
-                    self.client_connections.insert(peer_id, Arc::clone(&conn));
+                    self.client_connections
+                        .entry(peer_id)
+                        .or_default()
+                        .push(Arc::clone(&conn));
                     self.client_ids.insert(peer_id);
 
                     // Store client's public key for consensus
@@ -3306,8 +3524,9 @@ impl Network for QuicNetworkManager {
         // driven from a single message-processing loop cannot wedge the receive
         // path. The dedicated drainer performs the write in FIFO order.
         self.outbound_sender(recipient)
-            .send((connection, message.to_vec()))
+            .try_send((connection, message.to_vec()))
             .map_err(|_| NetworkError::SendError)?;
+        self.record_outbound_send(message, 1);
         debug!("Queued message to recipient {}", recipient);
         Ok(message.len())
     }
@@ -3316,6 +3535,7 @@ impl Network for QuicNetworkManager {
         self.await_consensus_gate().await?;
 
         let mut total_bytes = 0usize;
+        let mut recipients = 0usize;
         let party_count = self.party_count();
 
         // Broadcast to all parties using party_id (0..N-1).
@@ -3331,11 +3551,12 @@ impl Network for QuicNetworkManager {
                 }
                 match self
                     .outbound_sender(party_id)
-                    .send((connection, message.to_vec()))
+                    .try_send((connection, message.to_vec()))
                 {
                     Ok(()) => {
                         debug!("Queued broadcast message to party_id {}", party_id);
                         total_bytes += message.len();
+                        recipients += 1;
                     }
                     Err(_) => {
                         debug!("Failed to queue broadcast to party_id {}", party_id);
@@ -3360,15 +3581,17 @@ impl Network for QuicNetworkManager {
                     debug!("Skipping broadcast to self: loopback connection closed");
                 } else if self
                     .outbound_sender(self.node_id)
-                    .send((connection, message.to_vec()))
+                    .try_send((connection, message.to_vec()))
                     .is_ok()
                 {
                     debug!("Queued broadcast message to self (loopback fallback)");
                     total_bytes += message.len();
+                    recipients += 1;
                 }
             }
         }
 
+        self.record_outbound_send(message, recipients);
         Ok(total_bytes)
     }
 
@@ -3403,13 +3626,20 @@ impl Network for QuicNetworkManager {
             let Some(conn_ref) = self.client_connections.get(&transport_id) else {
                 return Err(NetworkError::ClientNotFound(client));
             };
-            let connection = conn_ref.value();
+            let connections = conn_ref.value().clone();
+            drop(conn_ref);
 
-            // Send directly without pre-checking is_connected() to avoid
-            // check-then-act race (STO-478).
-            match connection.send(message).await {
-                Ok(_) => Ok(message.len()),
-                Err(_) => Err(NetworkError::SendError),
+            // A logical client certificate may be reused by concurrent
+            // physical executions. The execution envelope ensures only the
+            // intended connection accepts the payload.
+            let mut delivered = false;
+            for connection in connections {
+                delivered |= connection.send(message).await.is_ok();
+            }
+            if delivered {
+                Ok(message.len())
+            } else {
+                Err(NetworkError::SendError)
             }
         } else {
             Err(NetworkError::ClientNotFound(client))
@@ -3641,6 +3871,85 @@ mod tests {
             &'a self,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
             Box::pin(async move { Ok((*self.response).clone()) })
+        }
+
+        fn remote_address(&self) -> SocketAddr {
+            self.remote_addr
+        }
+
+        fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn state<'a>(&'a self) -> Pin<Box<dyn Future<Output = ConnectionState> + Send + 'a>> {
+            Box::pin(async move { ConnectionState::Connected })
+        }
+
+        fn is_connected<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move { true })
+        }
+
+        fn get_connection_role(&self) -> ClientType {
+            ClientType::Server
+        }
+
+        fn remote_party_id(&self) -> Option<PartyId> {
+            self.remote_party_id.lock().ok().and_then(|id| *id)
+        }
+
+        fn set_remote_party_id(&self, party_id: PartyId) {
+            if let Ok(mut id) = self.remote_party_id.lock() {
+                *id = Some(party_id);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct StalledPeerConnection {
+        send_started: Arc<tokio::sync::Semaphore>,
+        release_send: Arc<tokio::sync::Semaphore>,
+        block_sends: Arc<AtomicBool>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
+        remote_addr: SocketAddr,
+        remote_party_id: Arc<std::sync::Mutex<Option<PartyId>>>,
+    }
+
+    impl StalledPeerConnection {
+        fn new() -> Self {
+            Self {
+                send_started: Arc::new(tokio::sync::Semaphore::new(0)),
+                release_send: Arc::new(tokio::sync::Semaphore::new(0)),
+                block_sends: Arc::new(AtomicBool::new(true)),
+                sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                remote_addr: "127.0.0.1:0".parse().unwrap(),
+                remote_party_id: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+    }
+
+    impl PeerConnection for StalledPeerConnection {
+        fn send<'a>(
+            &'a self,
+            _data: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.send_started.add_permits(1);
+                if self.block_sends.load(Ordering::Acquire) {
+                    self.release_send
+                        .acquire()
+                        .await
+                        .map_err(|_| "release semaphore closed".to_string())?
+                        .forget();
+                }
+                self.sent.fetch_add(1, Ordering::Release);
+                Ok(())
+            })
+        }
+
+        fn receive<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+            Box::pin(async move { std::future::pending().await })
         }
 
         fn remote_address(&self) -> SocketAddr {
@@ -4100,6 +4409,31 @@ mod tests {
     }
 
     #[test]
+    fn test_send_hook_records_message_and_recipient_count() {
+        let manager = QuicNetworkManager::new();
+        let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recipients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        manager.set_send_hook(Arc::new({
+            let bytes = Arc::clone(&bytes);
+            let recipients = Arc::clone(&recipients);
+            move |message, recipient_count| {
+                bytes.fetch_add(
+                    message.len() * recipient_count,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                recipients.fetch_add(recipient_count, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+
+        manager.record_outbound_send(b"hello", 3);
+        manager.record_outbound_send(b"ignored", 0);
+
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 15);
+        assert_eq!(recipients.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[test]
     fn test_manager_with_node_id() {
         let custom_id = 12345;
         let manager = QuicNetworkManager::with_node_id(custom_id);
@@ -4252,6 +4586,43 @@ mod tests {
             client_derived_id
         );
         assert!(server.client_ids.contains(&client_derived_id));
+    }
+
+    #[tokio::test]
+    async fn test_same_client_certificate_keeps_both_physical_connections() {
+        ensure_crypto_provider();
+        let mut server = QuicNetworkManager::with_node_id(1);
+        server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let address = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = identity.cert.der().to_vec();
+        let key = identity.signing_key.serialize_der();
+        let mut client_a = QuicNetworkManager::with_node_id(100);
+        client_a
+            .set_local_certificate_der(cert.clone(), key.clone())
+            .unwrap();
+        let mut client_b = QuicNetworkManager::with_node_id(101);
+        client_b.set_local_certificate_der(cert, key).unwrap();
+
+        let connect_a = tokio::spawn(async move {
+            client_a.connect_as_client(address).await.unwrap();
+            client_a
+        });
+        server.accept().await.unwrap();
+        let client_a = connect_a.await.unwrap();
+
+        let connect_b = tokio::spawn(async move {
+            client_b.connect_as_client(address).await.unwrap();
+            client_b
+        });
+        server.accept().await.unwrap();
+        let client_b = connect_b.await.unwrap();
+
+        let client_id = client_a.local_derived_id();
+        assert_eq!(client_id, client_b.local_derived_id());
+        assert_eq!(server.client_connections.get(&client_id).unwrap().len(), 2);
+        assert_eq!(server.get_all_client_connections().len(), 2);
     }
 
     #[tokio::test]
@@ -4949,12 +5320,13 @@ mod tests {
         // MAX_MESSAGE_SIZE must comfortably exceed the largest framed payload we
         // emit (a fully-unrolled MPC circuit is ~40 MB), while staying well
         // under u32::MAX so the 4-byte length prefix never truncates.
+        let max_message_size = std::hint::black_box(MAX_MESSAGE_SIZE);
         assert!(
-            MAX_MESSAGE_SIZE >= 256 * 1024 * 1024,
-            "MAX_MESSAGE_SIZE must admit large program uploads (>=256 MiB), got {MAX_MESSAGE_SIZE}"
+            max_message_size >= 256 * 1024 * 1024,
+            "MAX_MESSAGE_SIZE must admit large program uploads (>=256 MiB), got {max_message_size}"
         );
         assert!(
-            MAX_MESSAGE_SIZE < u32::MAX as usize,
+            max_message_size < u32::MAX as usize,
             "MAX_MESSAGE_SIZE must fit in the u32 length prefix"
         );
         // The real DoS bound is the incremental receive, not this ceiling:
@@ -5176,6 +5548,73 @@ mod tests {
     // ========================================================================
     // Race Condition Reproduction Tests (STO-479, STO-478, STO-481)
     // ========================================================================
+
+    /// STO-768 regression: a peer that stops consuming QUIC writes must not be
+    /// able to make the per-peer outbound queue retain messages without bound.
+    /// Queue saturation must fail fast, and delivery must resume after the peer
+    /// becomes writable again.
+    #[tokio::test]
+    async fn test_sto_768_stalled_peer_has_bounded_outbound_queue() {
+        const EXPECTED_QUEUE_CAPACITY: usize = OUTBOUND_QUEUE_CAPACITY;
+
+        let mut manager = QuicNetworkManager::with_node_id(7);
+        let local_key = NodePublicKey(vec![0]);
+        let peer_key = NodePublicKey(vec![1]);
+        let peer_id = peer_key.derive_id();
+        manager.local_public_key = Some(local_key);
+        manager.peer_public_keys.insert(peer_id, peer_key);
+
+        let peer = Arc::new(StalledPeerConnection::new());
+        manager
+            .server_connections
+            .insert(peer_id, Arc::clone(&peer) as Arc<dyn PeerConnection>);
+
+        assert_eq!(manager.send(1, b"first").await, Ok(5));
+        tokio::time::timeout(Duration::from_secs(1), peer.send_started.acquire())
+            .await
+            .expect("outbound drainer did not start")
+            .expect("send-start semaphore closed")
+            .forget();
+
+        for _ in 0..EXPECTED_QUEUE_CAPACITY {
+            assert_eq!(manager.send(1, b"queued").await, Ok(6));
+        }
+
+        let overflow = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.send(1, b"must-not-be-retained"),
+        )
+        .await
+        .expect("queue saturation blocked the caller instead of failing fast");
+        assert_eq!(overflow, Err(NetworkError::SendError));
+
+        let broadcast_overflow = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.broadcast(b"broadcast-must-not-be-retained"),
+        )
+        .await
+        .expect("broadcast queue saturation blocked the caller instead of failing fast");
+        assert_eq!(broadcast_overflow, Ok(0));
+
+        peer.block_sends.store(false, Ordering::Release);
+        peer.release_send.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.sent.load(Ordering::Acquire) < EXPECTED_QUEUE_CAPACITY + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued messages did not drain after the peer resumed");
+
+        assert_eq!(manager.send(1, b"healthy").await, Ok(7));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.sent.load(Ordering::Acquire) < EXPECTED_QUEUE_CAPACITY + 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("healthy delivery did not resume after backpressure cleared");
+    }
 
     /// STO-479 stress test: Race send() and close() concurrently on a QUIC
     /// connection to verify state doesn't get corrupted.
@@ -6038,5 +6477,52 @@ mod tests {
             result,
             Err(ConsensusError::ClientListDigestMismatch { party_id: 1 })
         );
+    }
+
+    #[test]
+    fn test_execution_scanner_receive_owner_is_clone_shared() {
+        let manager = QuicNetworkManager::new();
+        let clone = manager.clone();
+        let owner = manager
+            .try_acquire_execution_scanner_receive_owner()
+            .expect("first scanner claim succeeds");
+        let child = owner.clone();
+
+        assert!(clone
+            .try_acquire_execution_scanner_receive_owner()
+            .is_none());
+        drop(owner);
+        assert!(clone
+            .try_acquire_execution_scanner_receive_owner()
+            .is_none());
+        drop(child);
+        assert!(clone
+            .try_acquire_execution_scanner_receive_owner()
+            .is_some());
+    }
+
+    #[test]
+    fn test_server_certificate_roster_is_idempotent_and_frozen() {
+        let local = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let local_der = local.cert.der().to_vec();
+        let local_key = local.signing_key.serialize_der();
+        let local_public_key =
+            QuicNetworkManager::public_key_from_certificate_der(&local_der).unwrap();
+        let other_public_key =
+            QuicNetworkManager::public_key_from_certificate_der(other.cert.der()).unwrap();
+        let mut manager = QuicNetworkManager::new();
+        manager
+            .set_local_certificate_der(local_der, local_key)
+            .unwrap();
+
+        let roster = vec![local_public_key.clone(), other_public_key.clone()];
+        manager
+            .install_expected_server_public_keys(roster.clone())
+            .unwrap();
+        manager.install_expected_server_public_keys(roster).unwrap();
+        assert!(manager
+            .install_expected_server_public_keys([local_public_key])
+            .is_err());
     }
 }

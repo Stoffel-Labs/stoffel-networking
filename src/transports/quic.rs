@@ -856,7 +856,9 @@ pub struct QuicNetworkConfig {
     pub idle_timeout_ms: u64,
     /// Maximum connection retry attempts
     pub max_retries: u32,
-    /// Enable TLS encryption (should be true for production)
+    /// Require peer certificate authentication against the configured public
+    /// key allowlist. QUIC remains encrypted when this is false, but peer
+    /// identity is not authenticated; false is development-only.
     pub use_tls: bool,
 
     // NAT Traversal Configuration
@@ -1079,7 +1081,7 @@ pub struct QuicNetworkManager {
     server_connections: Arc<DashMap<PartyId, Arc<dyn PeerConnection>>>,
     /// Client-role connections (external clients connected to this server)
     client_connections: Arc<DashMap<ClientId, Vec<Arc<dyn PeerConnection>>>>,
-    /// Replaced Mutex<HashSet> with DashSet for client IDs
+    /// Replaced `Mutex<HashSet>` with DashSet for client IDs
     client_ids: Arc<DashSet<ClientId>>,
     /// Persistent certificate for this node (generated once)
     /// Stored as DER-encoded certificate and private key
@@ -1089,9 +1091,10 @@ pub struct QuicNetworkManager {
     local_public_key: Option<NodePublicKey>,
     /// Connected peers' public keys (for sender_id computation)
     peer_public_keys: Arc<DashMap<PartyId, NodePublicKey>>,
-    /// Optional allowlist of peer certificate public keys.
-    /// Empty means certificate public key allowlisting is disabled.
-    allowed_peer_public_keys: Arc<DashSet<NodePublicKey>>,
+    /// Certificate public keys authorized for the privileged MPC server role.
+    allowed_server_public_keys: Arc<DashSet<NodePublicKey>>,
+    /// Certificate public keys authorized for the external client role.
+    allowed_client_public_keys: Arc<DashSet<NodePublicKey>>,
     /// STUN client for NAT traversal
     stun_client: Option<Arc<StunClient>>,
     /// Cached local ICE candidates
@@ -1167,7 +1170,8 @@ impl QuicNetworkManager {
             local_key_der: None,
             local_public_key: None,
             peer_public_keys: Arc::new(DashMap::new()),
-            allowed_peer_public_keys: Arc::new(DashSet::new()),
+            allowed_server_public_keys: Arc::new(DashSet::new()),
+            allowed_client_public_keys: Arc::new(DashSet::new()),
             stun_client: None,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -1308,7 +1312,7 @@ impl QuicNetworkManager {
             }
         }
         let current = self
-            .allowed_peer_public_keys
+            .allowed_server_public_keys
             .iter()
             .map(|entry| entry.key().clone())
             .collect::<std::collections::HashSet<_>>();
@@ -1390,7 +1394,8 @@ impl QuicNetworkManager {
             local_key_der: None,
             local_public_key: None,
             peer_public_keys: Arc::new(DashMap::new()),
-            allowed_peer_public_keys: Arc::new(DashSet::new()),
+            allowed_server_public_keys: Arc::new(DashSet::new()),
+            allowed_client_public_keys: Arc::new(DashSet::new()),
             stun_client,
             local_candidates: Arc::new(Mutex::new(None)),
             pending_ice_agents: Arc::new(DashMap::new()),
@@ -1437,30 +1442,80 @@ impl QuicNetworkManager {
         }
     }
 
-    /// Replaces the certificate public key allowlist.
+    /// Replaces the MPC server certificate public key allowlist.
     ///
     /// Keys must be DER-encoded SubjectPublicKeyInfo bytes, matching
-    /// [`NodePublicKey`]. When the allowlist is empty, this check is disabled.
+    /// [`NodePublicKey`]. This backwards-compatible method authorizes only the
+    /// privileged server role; use
+    /// [`Self::set_allowed_client_certificate_public_keys`]
+    /// for external clients.
     pub fn set_allowed_certificate_public_keys(&mut self, keys: Vec<NodePublicKey>) {
-        self.allowed_peer_public_keys.clear();
+        self.set_allowed_server_certificate_public_keys(keys);
+    }
+
+    /// Replaces the MPC server certificate public key allowlist.
+    pub fn set_allowed_server_certificate_public_keys(&mut self, keys: Vec<NodePublicKey>) {
+        self.allowed_server_public_keys.clear();
         for key in keys {
-            self.allowed_peer_public_keys.insert(key);
+            self.allowed_server_public_keys.insert(key);
         }
     }
 
-    /// Adds a DER-encoded SubjectPublicKeyInfo key to the certificate public key allowlist.
+    /// Replaces the external client certificate public key allowlist.
+    pub fn set_allowed_client_certificate_public_keys(&mut self, keys: Vec<NodePublicKey>) {
+        self.allowed_client_public_keys.clear();
+        for key in keys {
+            self.allowed_client_public_keys.insert(key);
+        }
+    }
+
+    /// Adds a key to the MPC server certificate allowlist.
+    ///
+    /// This backwards-compatible method does not authorize the client role.
     pub fn add_allowed_certificate_public_key(&mut self, key: NodePublicKey) {
-        self.allowed_peer_public_keys.insert(key);
+        self.add_allowed_server_certificate_public_key(key);
     }
 
-    /// Clears the certificate public key allowlist, disabling this check.
+    /// Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
+    pub fn add_allowed_server_certificate_public_key(&mut self, key: NodePublicKey) {
+        self.allowed_server_public_keys.insert(key);
+    }
+
+    /// Adds a DER-encoded SubjectPublicKeyInfo key to the external client allowlist.
+    pub fn add_allowed_client_certificate_public_key(&mut self, key: NodePublicKey) {
+        self.allowed_client_public_keys.insert(key);
+    }
+
+    /// Clears the MPC server certificate public key allowlist.
+    ///
+    /// This backwards-compatible method does not modify the client allowlist.
     pub fn clear_allowed_certificate_public_keys(&mut self) {
-        self.allowed_peer_public_keys.clear();
+        self.clear_allowed_server_certificate_public_keys();
     }
 
-    /// Returns true when certificate public key allowlisting is enabled.
+    /// Clears the MPC server certificate public key allowlist.
+    pub fn clear_allowed_server_certificate_public_keys(&mut self) {
+        self.allowed_server_public_keys.clear();
+    }
+
+    /// Clears the external client certificate public key allowlist.
+    pub fn clear_allowed_client_certificate_public_keys(&mut self) {
+        self.allowed_client_public_keys.clear();
+    }
+
+    /// Returns true when at least one MPC server certificate key is trusted.
     pub fn has_certificate_public_key_allowlist(&self) -> bool {
-        !self.allowed_peer_public_keys.is_empty()
+        self.has_server_certificate_public_key_allowlist()
+    }
+
+    /// Returns true when at least one MPC server certificate key is trusted.
+    pub fn has_server_certificate_public_key_allowlist(&self) -> bool {
+        !self.allowed_server_public_keys.is_empty()
+    }
+
+    /// Returns true when at least one external client certificate key is trusted.
+    pub fn has_client_certificate_public_key_allowlist(&self) -> bool {
+        !self.allowed_client_public_keys.is_empty()
     }
 
     pub fn add_node(&mut self, node: QuicNode) {
@@ -1621,11 +1676,50 @@ impl QuicNetworkManager {
     ///
     /// If cert_der and key_der are provided, the client will present a certificate
     /// during TLS handshake (mutual TLS).
+    #[cfg(test)]
     fn create_insecure_client_config(
         role: ClientType,
         cert_der: Option<&[u8]>,
         key_der: Option<&[u8]>,
         idle_timeout_ms: u64,
+    ) -> Result<ClientConfig, String> {
+        Self::create_client_config_with_verifier(
+            role,
+            cert_der,
+            key_der,
+            idle_timeout_ms,
+            Arc::new(ServerCertificateVerifier::unauthenticated()),
+        )
+    }
+
+    fn create_authenticated_client_config(
+        role: ClientType,
+        cert_der: Option<&[u8]>,
+        key_der: Option<&[u8]>,
+        idle_timeout_ms: u64,
+        allowed_server_public_keys: Arc<DashSet<NodePublicKey>>,
+        authenticate_peer: bool,
+        expected_public_key: Option<NodePublicKey>,
+    ) -> Result<ClientConfig, String> {
+        Self::create_client_config_with_verifier(
+            role,
+            cert_der,
+            key_der,
+            idle_timeout_ms,
+            Arc::new(ServerCertificateVerifier::new(
+                allowed_server_public_keys,
+                authenticate_peer,
+                expected_public_key,
+            )),
+        )
+    }
+
+    fn create_client_config_with_verifier(
+        role: ClientType,
+        cert_der: Option<&[u8]>,
+        key_der: Option<&[u8]>,
+        idle_timeout_ms: u64,
+        certificate_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     ) -> Result<ClientConfig, String> {
         let mut crypto = match (cert_der, key_der) {
             (Some(cert), Some(key)) => {
@@ -1635,7 +1729,7 @@ impl QuicNetworkManager {
 
                 rustls::ClientConfig::builder()
                     .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
+                    .with_custom_certificate_verifier(Arc::clone(&certificate_verifier))
                     .with_client_auth_cert(cert_chain, private_key)
                     .map_err(|e| format!("Failed to configure client certificate: {}", e))?
             }
@@ -1643,7 +1737,7 @@ impl QuicNetworkManager {
                 // No client certificate
                 rustls::ClientConfig::builder()
                     .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
+                    .with_custom_certificate_verifier(certificate_verifier)
                     .with_no_client_auth()
             }
         };
@@ -1719,11 +1813,14 @@ impl QuicNetworkManager {
         self.ensure_local_certificate()?;
 
         if self.endpoint.is_none() {
-            let client_config = Self::create_insecure_client_config(
+            let client_config = Self::create_authenticated_client_config(
                 role,
                 self.local_cert_der.as_deref(),
                 self.local_key_der.as_deref(),
                 self.network_config.idle_timeout_ms,
+                Arc::clone(&self.allowed_server_public_keys),
+                self.network_config.use_tls,
+                None,
             )?;
             let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
                 .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
@@ -1731,6 +1828,27 @@ impl QuicNetworkManager {
             self.endpoint = Some(endpoint);
         }
         Ok(())
+    }
+
+    /// Builds the client configuration for one outbound connection.
+    ///
+    /// Endpoint defaults are only initialization fallbacks: a manager can both
+    /// listen and dial in different roles, so the advertised ALPN must be bound
+    /// to the individual connection attempt.
+    fn create_outbound_client_config(
+        &self,
+        role: ClientType,
+        expected_public_key: Option<NodePublicKey>,
+    ) -> Result<ClientConfig, String> {
+        Self::create_authenticated_client_config(
+            role,
+            self.local_cert_der.as_deref(),
+            self.local_key_der.as_deref(),
+            self.network_config.idle_timeout_ms,
+            Arc::clone(&self.allowed_server_public_keys),
+            self.network_config.use_tls,
+            expected_public_key,
+        )
     }
 
     // ============================================================================
@@ -1791,10 +1909,26 @@ impl QuicNetworkManager {
     fn verify_peer_public_key_allowed(
         &self,
         peer_public_key: Option<&NodePublicKey>,
+        role: ClientType,
         context: &str,
     ) -> Result<(), String> {
-        if self.allowed_peer_public_keys.is_empty() {
+        // `use_tls = false` is the explicit development-only escape hatch for
+        // dynamic peer discovery. QUIC still encrypts the connection, but the
+        // peer certificate is not authenticated in that mode.
+        if !self.network_config.use_tls {
             return Ok(());
+        }
+
+        let (allowed_public_keys, role_name) = match role {
+            ClientType::Server => (&self.allowed_server_public_keys, "server"),
+            ClientType::Client => (&self.allowed_client_public_keys, "client"),
+        };
+
+        if allowed_public_keys.is_empty() {
+            return Err(format!(
+                "{} rejected: no trusted {} certificate public keys are configured",
+                context, role_name
+            ));
         }
 
         let peer_public_key = peer_public_key.ok_or_else(|| {
@@ -1804,9 +1938,34 @@ impl QuicNetworkManager {
             )
         })?;
 
-        if !self.allowed_peer_public_keys.contains(peer_public_key) {
+        if !allowed_public_keys.contains(peer_public_key) {
             return Err(format!(
-                "{} rejected: peer certificate public key is not in allowlist",
+                "{} rejected: peer certificate public key is not authorized for the {} role",
+                context, role_name
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Verifies that a peer presented the exact certificate public key requested
+    /// by the caller. Membership in the global allowlist alone is insufficient:
+    /// without this comparison, one trusted peer could impersonate another.
+    fn verify_expected_peer_public_key(
+        peer_public_key: Option<&NodePublicKey>,
+        expected_public_key: &NodePublicKey,
+        context: &str,
+    ) -> Result<(), String> {
+        let peer_public_key = peer_public_key.ok_or_else(|| {
+            format!(
+                "{} rejected: no peer certificate public key available for identity binding",
+                context
+            )
+        })?;
+
+        if peer_public_key != expected_public_key {
+            return Err(format!(
+                "{} rejected: identity mismatch; peer certificate public key does not match the expected key",
                 context
             ));
         }
@@ -1817,11 +1976,60 @@ impl QuicNetworkManager {
     fn extract_and_verify_peer_public_key(
         &self,
         connection: &Connection,
+        role: ClientType,
         context: &str,
     ) -> Result<Option<NodePublicKey>, String> {
         let peer_public_key = Self::extract_peer_public_key(connection).ok();
-        self.verify_peer_public_key_allowed(peer_public_key.as_ref(), context)?;
+        self.verify_peer_public_key_allowed(peer_public_key.as_ref(), role, context)?;
         Ok(peer_public_key)
+    }
+
+    /// Requires a specific ALPN role for an outbound connection.
+    ///
+    /// Missing, unknown, or mismatched ALPN is an authentication failure. In
+    /// particular, it must never fall back to the privileged server role.
+    fn verify_negotiated_role(
+        connection: &Connection,
+        expected_role: ClientType,
+        context: &str,
+    ) -> Result<ClientType, String> {
+        let negotiated_role = extract_alpn_role(connection)
+            .map_err(|err| format!("{} rejected: {}", context, err))?;
+
+        if negotiated_role != expected_role {
+            return Err(format!(
+                "{} rejected: expected {:?} ALPN role, negotiated {:?}",
+                context, expected_role, negotiated_role
+            ));
+        }
+
+        Ok(negotiated_role)
+    }
+
+    /// Resolves a transport peer ID to exactly one trusted certificate key.
+    ///
+    /// Transport peer IDs are derived from certificate public keys. Requiring a
+    /// unique match also handles the (unlikely) case of a derived-ID collision
+    /// without silently choosing the wrong identity.
+    fn trusted_public_key_for_peer_id(&self, peer_id: PartyId) -> Result<NodePublicKey, String> {
+        let matching_keys: Vec<NodePublicKey> = self
+            .allowed_server_public_keys
+            .iter()
+            .filter(|key| key.derive_id() == peer_id)
+            .map(|key| key.clone())
+            .collect();
+
+        match matching_keys.as_slice() {
+            [key] => Ok(key.clone()),
+            [] => Err(format!(
+                "No trusted certificate public key is configured for peer {}",
+                peer_id
+            )),
+            _ => Err(format!(
+                "Multiple trusted certificate public keys derive to peer ID {}",
+                peer_id
+            )),
+        }
     }
 
     /// Verifies that the peer certificate-derived identity matches the expected party.
@@ -2040,7 +2248,7 @@ impl QuicNetworkManager {
 
     /// Connects as a CLIENT to a server (role identified via ALPN).
     /// The server's ID is derived from its public key.
-    /// Returns Arc<dyn PeerConnection> for actor model compatibility.
+    /// Returns `Arc<dyn PeerConnection>` for actor model compatibility.
     pub async fn connect_as_client(
         &mut self,
         address: SocketAddr,
@@ -2048,28 +2256,40 @@ impl QuicNetworkManager {
         self.ensure_client_endpoint(ClientType::Client).await?;
         self.ensure_loopback_installed().await;
 
+        let client_config = self.create_outbound_client_config(ClientType::Client, None)?;
         let endpoint = self.endpoint.as_ref().unwrap();
         let connection = endpoint
-            .connect(address, "localhost")
+            .connect_with(client_config, address, "localhost")
             .map_err(|e| format!("Failed to initiate connection: {}", e))?
             .await
             .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-        // Verify ALPN negotiation resulted in client-protocol
-        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
-            warn!("ALPN extraction failed: {}, defaulting to Server", e);
-            ClientType::Server
-        });
+        // Bind the outbound role to the negotiated protocol. This also protects
+        // managers whose endpoint was previously initialized for another role.
+        let connection_role = match Self::verify_negotiated_role(
+            &connection,
+            ClientType::Client,
+            "client connection",
+        ) {
+            Ok(role) => role,
+            Err(err) => {
+                connection.close(0u32.into(), b"ALPN role mismatch");
+                return Err(err);
+            }
+        };
 
         // Extract and authorize peer's public key from TLS certificate.
-        let peer_public_key =
-            match self.extract_and_verify_peer_public_key(&connection, "client connection") {
-                Ok(peer_public_key) => peer_public_key,
-                Err(err) => {
-                    connection.close(0u32.into(), b"certificate public key not allowed");
-                    return Err(err);
-                }
-            };
+        let peer_public_key = match self.extract_and_verify_peer_public_key(
+            &connection,
+            ClientType::Server,
+            "client connection",
+        ) {
+            Ok(peer_public_key) => peer_public_key,
+            Err(err) => {
+                connection.close(0u32.into(), b"certificate public key not allowed");
+                return Err(err);
+            }
+        };
 
         // Open persistent stream and send sync byte to establish it
         let (mut send, recv) = connection
@@ -2149,7 +2369,7 @@ impl QuicNetworkManager {
 
     /// Connects as a SERVER to another server (role identified via ALPN).
     /// The peer's ID is derived from its public key.
-    /// Returns Arc<dyn PeerConnection> for actor model compatibility.
+    /// Returns `Arc<dyn PeerConnection>` for actor model compatibility.
     pub async fn connect_as_server(
         &mut self,
         address: SocketAddr,
@@ -2157,14 +2377,33 @@ impl QuicNetworkManager {
         self.connect_as_server_inner(address, None).await
     }
 
-    /// Connect to a server and require its TLS certificate to contain the exact
-    /// expected SubjectPublicKeyInfo before admitting the connection.
+    /// Connects as a server-role peer and binds the connection to an exact
+    /// certificate public key.
+    ///
+    /// The expected key must also be present in the certificate public key
+    /// allowlist when authenticated TLS mode is enabled.
     pub async fn connect_as_server_with_expected_public_key(
         &mut self,
         address: SocketAddr,
         expected_public_key: &NodePublicKey,
     ) -> Result<Arc<dyn PeerConnection>, String> {
         self.connect_as_server_inner(address, Some(expected_public_key))
+            .await
+    }
+
+    /// Connects to a transport peer ID and binds the connection to the unique
+    /// trusted certificate key from which that ID is derived.
+    pub async fn connect_as_server_with_expected_peer_id(
+        &mut self,
+        address: SocketAddr,
+        expected_peer_id: PartyId,
+    ) -> Result<Arc<dyn PeerConnection>, String> {
+        if !self.network_config.use_tls {
+            return self.connect_as_server(address).await;
+        }
+
+        let expected_public_key = self.trusted_public_key_for_peer_id(expected_peer_id)?;
+        self.connect_as_server_with_expected_public_key(address, &expected_public_key)
             .await
     }
 
@@ -2176,28 +2415,40 @@ impl QuicNetworkManager {
         self.ensure_client_endpoint(ClientType::Server).await?;
         self.ensure_loopback_installed().await;
 
+        let client_config =
+            self.create_outbound_client_config(ClientType::Server, expected_public_key.cloned())?;
         let endpoint = self.endpoint.as_ref().unwrap();
-        let connection = endpoint
-            .connect(address, "localhost")
+        let connecting = endpoint.connect_with(client_config, address, "localhost");
+        let connection = connecting
             .map_err(|e| format!("Failed to initiate connection: {}", e))?
             .await
             .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-        // Verify ALPN negotiation - we expect the peer to see server-protocol
-        let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
-            warn!("ALPN extraction failed: {}, defaulting to Server", e);
-            ClientType::Server
-        });
+        // Verify ALPN negotiation - both sides must see server-protocol.
+        let connection_role = match Self::verify_negotiated_role(
+            &connection,
+            ClientType::Server,
+            "server connection",
+        ) {
+            Ok(role) => role,
+            Err(err) => {
+                connection.close(0u32.into(), b"ALPN role mismatch");
+                return Err(err);
+            }
+        };
 
         // Extract and authorize peer's public key from TLS certificate.
-        let peer_public_key =
-            match self.extract_and_verify_peer_public_key(&connection, "server connection") {
-                Ok(peer_public_key) => peer_public_key,
-                Err(err) => {
-                    connection.close(0u32.into(), b"certificate public key not allowed");
-                    return Err(err);
-                }
-            };
+        let peer_public_key = match self.extract_and_verify_peer_public_key(
+            &connection,
+            ClientType::Server,
+            "server connection",
+        ) {
+            Ok(peer_public_key) => peer_public_key,
+            Err(err) => {
+                connection.close(0u32.into(), b"certificate public key not allowed");
+                return Err(err);
+            }
+        };
 
         if let Some(expected) = expected_public_key {
             match peer_public_key.as_ref() {
@@ -2589,9 +2840,10 @@ impl QuicNetworkManager {
     async fn connect_to_nominated_peer(
         endpoint: &Endpoint,
         nominated_pair: &CandidatePair,
+        client_config: ClientConfig,
     ) -> Result<Connection, String> {
         endpoint
-            .connect(nominated_pair.remote.address, "localhost")
+            .connect_with(client_config, nominated_pair.remote.address, "localhost")
             .map_err(|e| format!("Failed to initiate connection: {}", e))?
             .await
             .map_err(|e| format!("Failed to establish connection: {}", e))
@@ -2619,11 +2871,14 @@ impl QuicNetworkManager {
         Ok(connection)
     }
 
-    fn negotiated_p2p_role(connection: &Connection) -> ClientType {
-        extract_alpn_role(connection).unwrap_or_else(|e| {
-            warn!("ALPN extraction failed: {}, defaulting to Server", e);
-            ClientType::Server
-        })
+    fn negotiated_p2p_role(connection: &Connection) -> Result<ClientType, String> {
+        match Self::verify_negotiated_role(connection, ClientType::Server, "p2p connection") {
+            Ok(role) => Ok(role),
+            Err(err) => {
+                connection.close(0u32.into(), b"ALPN role mismatch");
+                Err(err)
+            }
+        }
     }
 
     fn verify_and_store_p2p_identity(
@@ -2631,14 +2886,30 @@ impl QuicNetworkManager {
         connection: &Connection,
         party_id: PartyId,
     ) -> Result<Option<NodePublicKey>, String> {
-        let peer_public_key =
-            match self.extract_and_verify_peer_public_key(connection, "p2p connection") {
-                Ok(peer_public_key) => peer_public_key,
-                Err(err) => {
-                    connection.close(0u32.into(), b"certificate public key not allowed");
-                    return Err(err);
-                }
-            };
+        let peer_public_key = match self.extract_and_verify_peer_public_key(
+            connection,
+            ClientType::Server,
+            "p2p connection",
+        ) {
+            Ok(peer_public_key) => peer_public_key,
+            Err(err) => {
+                connection.close(0u32.into(), b"certificate public key not allowed");
+                return Err(err);
+            }
+        };
+
+        if self.network_config.use_tls {
+            let expected_public_key = self.trusted_public_key_for_peer_id(party_id)?;
+            if let Err(err) = Self::verify_expected_peer_public_key(
+                peer_public_key.as_ref(),
+                &expected_public_key,
+                "p2p connection",
+            ) {
+                connection.close(0u32.into(), b"p2p identity mismatch");
+                return Err(err);
+            }
+        }
+
         if let Err(err) = Self::verify_expected_p2p_identity(peer_public_key.as_ref(), party_id) {
             connection.close(0u32.into(), b"p2p identity mismatch");
             return Err(err);
@@ -2752,12 +3023,14 @@ impl QuicNetworkManager {
         // Store agent for potential later use
         self.pending_ice_agents.insert(target_party_id, ice_agent);
 
+        let client_config = self.create_outbound_client_config(ClientType::Server, None)?;
         let endpoint = self
             .endpoint
             .as_ref()
             .ok_or_else(|| "QUIC endpoint was not initialized".to_string())?;
-        let connection = Self::connect_to_nominated_peer(endpoint, &nominated_pair).await?;
-        let connection_role = Self::negotiated_p2p_role(&connection);
+        let connection =
+            Self::connect_to_nominated_peer(endpoint, &nominated_pair, client_config).await?;
+        let connection_role = Self::negotiated_p2p_role(&connection)?;
         let peer_public_key = match self.verify_and_store_p2p_identity(&connection, target_party_id)
         {
             Ok(peer_public_key) => peer_public_key,
@@ -2824,7 +3097,7 @@ impl QuicNetworkManager {
             .as_ref()
             .ok_or_else(|| "QUIC endpoint was not initialized".to_string())?;
         let connection = Self::accept_nominated_p2p_connection(endpoint, &nominated_pair).await?;
-        let connection_role = Self::negotiated_p2p_role(&connection);
+        let connection_role = Self::negotiated_p2p_role(&connection)?;
         let peer_public_key = self.verify_and_store_p2p_identity(&connection, from_party_id)?;
         let (send, recv) =
             Self::accept_p2p_stream(&connection, self.network_config.timeout_ms).await?;
@@ -2851,12 +3124,21 @@ impl QuicNetworkManager {
         direct_address: Option<SocketAddr>,
         signaling_connection: Option<Arc<dyn PeerConnection>>,
     ) -> Result<Arc<dyn PeerConnection>, String> {
+        if self.network_config.use_tls {
+            // Resolve before attempting any route so missing or ambiguous trust
+            // configuration cannot degrade into address-based authentication.
+            self.trusted_public_key_for_peer_id(target_party_id)?;
+        }
+
         // Strategy 1: Direct connection
         if let Some(addr) = direct_address {
             debug!("Attempting direct connection to {}", addr);
 
-            let result =
-                tokio::time::timeout(Duration::from_secs(3), self.connect_as_server(addr)).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                self.connect_as_server_with_expected_peer_id(addr, target_party_id),
+            )
+            .await;
 
             match result {
                 Ok(Ok(conn)) => {
@@ -3278,24 +3560,28 @@ impl NetworkManager for QuicNetworkManager {
 
             let remote_addr = connection.remote_address();
 
-            // Extract role from ALPN protocol negotiation
-            let connection_role = extract_alpn_role(&connection).unwrap_or_else(|e| {
-                warn!(
-                    "ALPN extraction failed during accept: {}, defaulting to Server",
-                    e
-                );
-                ClientType::Server
-            });
+            // Extract role from ALPN protocol negotiation. Missing or unknown
+            // ALPN is rejected and can never acquire the privileged server role.
+            let connection_role = match extract_alpn_role(&connection) {
+                Ok(role) => role,
+                Err(err) => {
+                    connection.close(0u32.into(), b"invalid ALPN role");
+                    return Err(format!("incoming connection rejected: {}", err));
+                }
+            };
 
             // Extract and authorize peer's public key from TLS certificate (mTLS).
-            let peer_public_key =
-                match self.extract_and_verify_peer_public_key(&connection, "incoming connection") {
-                    Ok(peer_public_key) => peer_public_key,
-                    Err(err) => {
-                        connection.close(0u32.into(), b"certificate public key not allowed");
-                        return Err(err);
-                    }
-                };
+            let peer_public_key = match self.extract_and_verify_peer_public_key(
+                &connection,
+                connection_role,
+                "incoming connection",
+            ) {
+                Ok(peer_public_key) => peer_public_key,
+                Err(err) => {
+                    connection.close(0u32.into(), b"certificate public key not allowed");
+                    return Err(err);
+                }
+            };
 
             // Accept persistent stream and receive sync byte (with timeout to
             // prevent indefinite hang if peer connects but never opens a stream)
@@ -3380,24 +3666,10 @@ impl NetworkManager for QuicNetworkManager {
                         remote_addr, peer_id
                     );
 
-                    // Validate peer is known when TLS is enforced and no
-                    // certificate public key allowlist is configured. When an
-                    // allowlist is configured, the key allowlist is the
-                    // authorization source.
+                    // Certificate-key authorization completed before the
+                    // stream was accepted. Add a routing entry only after that
+                    // check succeeds.
                     if !self.nodes.iter().any(|n| n.id() == peer_id) {
-                        if self.network_config.use_tls
-                            && !self.has_certificate_public_key_allowlist()
-                        {
-                            warn!(
-                                "Rejected unknown server peer {} from {} (use_tls=true)",
-                                peer_id, remote_addr
-                            );
-                            connection.close(0u32.into(), b"unknown peer");
-                            return Err(format!(
-                                "Unauthorized peer ID {} not in allowlist",
-                                peer_id
-                            ));
-                        }
                         self.nodes
                             .push(QuicNode::from_party_id(peer_id, remote_addr));
                     }
@@ -3472,11 +3744,14 @@ impl NetworkManager for QuicNetworkManager {
                 .map_err(|e| format!("Failed to create server endpoint: {}", e))?;
 
             // Default client config for outgoing connections uses Server role with mTLS
-            let client_config = Self::create_insecure_client_config(
+            let client_config = Self::create_authenticated_client_config(
                 ClientType::Server,
                 Some(cert_der),
                 Some(key_der),
                 self.network_config.idle_timeout_ms,
+                Arc::clone(&self.allowed_server_public_keys),
+                self.network_config.use_tls,
+                None,
             )?;
             endpoint.set_default_client_config(client_config);
 
@@ -3760,26 +4035,75 @@ impl rustls::server::danger::ClientCertVerifier for SkipClientVerification {
     }
 }
 
-/// Server certificate verifier that accepts all server certificates without verification.
-/// DEVELOPMENT ONLY - do not use in production.
+/// Server-certificate verifier for self-signed, public-key-pinned peers.
+///
+/// Standard WebPKI hostname validation is intentionally inapplicable because
+/// Stoffel peers use self-signed certificates. In authenticated mode, this
+/// verifier instead requires the certificate SPKI to be in the configured trust
+/// roster and, for target-aware connections, to match the exact expected key.
 #[derive(Debug)]
-struct SkipServerVerification;
+struct ServerCertificateVerifier {
+    allowed_server_public_keys: Arc<DashSet<NodePublicKey>>,
+    authenticate_peer: bool,
+    expected_public_key: Option<NodePublicKey>,
+}
 
-impl SkipServerVerification {
-    fn new() -> Self {
-        Self
+impl ServerCertificateVerifier {
+    fn new(
+        allowed_server_public_keys: Arc<DashSet<NodePublicKey>>,
+        authenticate_peer: bool,
+        expected_public_key: Option<NodePublicKey>,
+    ) -> Self {
+        Self {
+            allowed_server_public_keys,
+            authenticate_peer,
+            expected_public_key,
+        }
+    }
+
+    #[cfg(test)]
+    fn unauthenticated() -> Self {
+        Self::new(Arc::new(DashSet::new()), false, None)
     }
 }
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+impl rustls::client::danger::ServerCertVerifier for ServerCertificateVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if !self.authenticate_peer && self.expected_public_key.is_none() {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+
+        let peer_public_key = QuicNetworkManager::extract_public_key_from_cert(end_entity.as_ref())
+            .map_err(rustls::Error::General)?;
+
+        if self.authenticate_peer {
+            if self.allowed_server_public_keys.is_empty() {
+                return Err(rustls::Error::General(
+                    "no trusted peer certificate public keys are configured".to_string(),
+                ));
+            }
+            if !self.allowed_server_public_keys.contains(&peer_public_key) {
+                return Err(rustls::Error::General(
+                    "peer certificate public key is not in allowlist".to_string(),
+                ));
+            }
+        }
+
+        if let Some(expected_public_key) = self.expected_public_key.as_ref() {
+            if &peer_public_key != expected_public_key {
+                return Err(rustls::Error::General(
+                    "peer certificate identity mismatch".to_string(),
+                ));
+            }
+        }
+
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -4544,9 +4868,12 @@ mod tests {
     #[tokio::test]
     async fn test_client_to_server_connection() {
         ensure_crypto_provider();
-        // Create server and client managers
+        // Explicitly use development mode for dynamic peer discovery. The
+        // authenticated default requires both certificate keys to be provisioned.
         let mut server = QuicNetworkManager::with_node_id(1);
+        server.network_config.use_tls = false;
         let mut client = QuicNetworkManager::with_node_id(100);
+        client.network_config.use_tls = false;
 
         // Start listening on server
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -4594,16 +4921,21 @@ mod tests {
         let mut server = QuicNetworkManager::with_node_id(1);
         server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let address = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+        let server_key = server.get_public_key().unwrap().clone();
 
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = identity.cert.der().to_vec();
         let key = identity.signing_key.serialize_der();
+        let client_key = QuicNetworkManager::public_key_from_certificate_der(&cert).unwrap();
+        server.add_allowed_client_certificate_public_key(client_key);
         let mut client_a = QuicNetworkManager::with_node_id(100);
         client_a
             .set_local_certificate_der(cert.clone(), key.clone())
             .unwrap();
+        client_a.add_allowed_server_certificate_public_key(server_key.clone());
         let mut client_b = QuicNetworkManager::with_node_id(101);
         client_b.set_local_certificate_der(cert, key).unwrap();
+        client_b.add_allowed_server_certificate_public_key(server_key);
 
         let connect_a = tokio::spawn(async move {
             client_a.connect_as_client(address).await.unwrap();
@@ -4629,7 +4961,9 @@ mod tests {
     async fn test_connection_role_from_alpn() {
         ensure_crypto_provider();
         let mut server = QuicNetworkManager::with_node_id(1);
+        server.network_config.use_tls = false;
         let mut client = QuicNetworkManager::with_node_id(100);
+        client.network_config.use_tls = false;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -4706,6 +5040,9 @@ mod tests {
         // Connect as a server peer that is not in the listener's allowlist.
         let connect_task = tokio::spawn(async move {
             let mut unknown_peer = QuicNetworkManager::with_node_id(2);
+            // Keep the initiator permissive so the listener's allowlist is the
+            // side under test.
+            unknown_peer.network_config.use_tls = false;
             unknown_peer.connect_as_server(server_addr).await
         });
 
@@ -4720,8 +5057,8 @@ mod tests {
         );
         let err = accept_result.unwrap_err();
         assert!(
-            err.contains("Unauthorized peer ID"),
-            "Expected unauthorized peer error, got: {}",
+            err.contains("no trusted server certificate public keys"),
+            "Expected fail-closed trust configuration error, got: {}",
             err
         );
 
@@ -4744,6 +5081,13 @@ mod tests {
 
         let mut server = QuicNetworkManager::with_node_id(1);
         let mut client = QuicNetworkManager::with_node_id(2);
+        server
+            .ensure_local_certificate()
+            .expect("server certificate generation should succeed");
+        let server_key = server
+            .get_public_key()
+            .expect("server should have a public key")
+            .clone();
         client
             .ensure_local_certificate()
             .expect("client certificate generation should succeed");
@@ -4753,6 +5097,7 @@ mod tests {
             .clone();
 
         server.add_allowed_certificate_public_key(client_key.clone());
+        client.add_allowed_certificate_public_key(server_key);
         server
             .listen("127.0.0.1:0".parse().unwrap())
             .await
@@ -4808,6 +5153,7 @@ mod tests {
 
         let connect_task = tokio::spawn(async move {
             let mut unlisted_peer = QuicNetworkManager::with_node_id(2);
+            unlisted_peer.network_config.use_tls = false;
             unlisted_peer.connect_as_server(server_addr).await
         });
 
@@ -4819,7 +5165,7 @@ mod tests {
         assert!(accept_result.is_err(), "unlisted peer should be rejected");
         let err = accept_result.unwrap_err();
         assert!(
-            err.contains("not in allowlist"),
+            err.contains("not authorized for the server role"),
             "Expected allowlist rejection, got: {}",
             err
         );
@@ -4865,11 +5211,167 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_authenticated_tls_with_empty_allowlist_fails_closed() {
+        let mut manager = QuicNetworkManager::new();
+        let peer_key = NodePublicKey(vec![0x01, 0x02, 0x03]);
+
+        let err = manager
+            .verify_peer_public_key_allowed(Some(&peer_key), ClientType::Server, "test connection")
+            .expect_err("authenticated TLS must reject peers when no trusted keys are configured");
+        assert!(
+            err.contains("no trusted server certificate public keys"),
+            "unexpected fail-closed error: {}",
+            err
+        );
+
+        manager.network_config.use_tls = false;
+        assert!(
+            manager
+                .verify_peer_public_key_allowed(
+                    Some(&peer_key),
+                    ClientType::Server,
+                    "test connection",
+                )
+                .is_ok(),
+            "explicit development mode should permit dynamic peer discovery"
+        );
+    }
+
+    #[test]
+    fn test_certificate_public_key_authorization_is_role_specific() {
+        let mut manager = QuicNetworkManager::new();
+        let client_key = NodePublicKey(vec![0x01, 0x02, 0x03]);
+        let server_key = NodePublicKey(vec![0x04, 0x05, 0x06]);
+
+        manager.add_allowed_client_certificate_public_key(client_key.clone());
+        manager.add_allowed_server_certificate_public_key(server_key);
+
+        assert!(manager
+            .verify_peer_public_key_allowed(
+                Some(&client_key),
+                ClientType::Client,
+                "client connection",
+            )
+            .is_ok());
+        let err = manager
+            .verify_peer_public_key_allowed(
+                Some(&client_key),
+                ClientType::Server,
+                "server connection",
+            )
+            .expect_err("a client-authorized key must not acquire the server role");
+        assert!(
+            err.contains("not authorized for the server role"),
+            "unexpected cross-role rejection: {}",
+            err
+        );
+        assert!(manager.has_server_certificate_public_key_allowlist());
+        assert!(manager.has_client_certificate_public_key_allowlist());
+    }
+
+    #[tokio::test]
+    async fn test_default_outbound_tls_rejects_empty_allowlist() {
+        ensure_crypto_provider();
+
+        let mut server = QuicNetworkManager::with_node_id(1);
+        server.network_config.use_tls = false;
+        server
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("server listen should succeed");
+        let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
+        let accept_task = tokio::spawn(async move { server.accept().await });
+
+        let mut client = QuicNetworkManager::with_node_id(2);
+        assert!(client.network_config.use_tls);
+        let err = client
+            .connect_as_server(server_addr)
+            .await
+            .expect_err("the authenticated default must reject an empty trust roster");
+        assert!(
+            err.contains("no trusted peer certificate public keys"),
+            "unexpected TLS trust error: {}",
+            err
+        );
+        assert!(
+            client.peer_public_keys.is_empty(),
+            "a peer rejected during TLS must not enter identity state"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), accept_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_fallback_rejects_allowlisted_peer_with_wrong_identity() {
+        ensure_crypto_provider();
+
+        // The intended and attacking peers are both globally trusted. The
+        // direct address is maliciously substituted to point at the attacker.
+        let mut intended_peer = QuicNetworkManager::with_node_id(1);
+        intended_peer
+            .ensure_local_certificate()
+            .expect("intended peer certificate generation should succeed");
+        let intended_key = intended_peer
+            .get_public_key()
+            .expect("intended peer should expose its key")
+            .clone();
+
+        let mut attacker = QuicNetworkManager::with_node_id(2);
+        attacker
+            .ensure_local_certificate()
+            .expect("attacker certificate generation should succeed");
+        let attacker_key = attacker
+            .get_public_key()
+            .expect("attacker should expose its key")
+            .clone();
+
+        let mut connector = QuicNetworkManager::with_node_id(3);
+        connector
+            .ensure_local_certificate()
+            .expect("connector certificate generation should succeed");
+        let connector_key = connector
+            .get_public_key()
+            .expect("connector should expose its key")
+            .clone();
+
+        connector
+            .set_allowed_certificate_public_keys(vec![intended_key.clone(), attacker_key.clone()]);
+        attacker.add_allowed_certificate_public_key(connector_key);
+        attacker
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("attacker listen should succeed");
+        let attacker_addr = attacker.endpoint.as_ref().unwrap().local_addr().unwrap();
+
+        let accept_task = tokio::spawn(async move { attacker.accept().await });
+        let result = connector
+            .connect_with_fallback(intended_key.derive_id(), Some(attacker_addr), None)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an allowlisted peer must not impersonate the requested peer"
+        );
+        assert!(
+            !connector
+                .peer_public_keys
+                .contains_key(&attacker_key.derive_id()),
+            "the impersonating peer key must not be stored"
+        );
+
+        // The connector closes as soon as the identity mismatch is detected.
+        // Bound the peer-side cleanup so this regression test cannot hang.
+        let _ = tokio::time::timeout(Duration::from_secs(1), accept_task).await;
+    }
+
     #[tokio::test]
     async fn test_send_receive_after_connection() {
         ensure_crypto_provider();
         let mut server = QuicNetworkManager::with_node_id(1);
+        server.network_config.use_tls = false;
         let mut client = QuicNetworkManager::with_node_id(100);
+        client.network_config.use_tls = false;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -5627,6 +6129,7 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server = QuicNetworkManager::with_node_id(1);
+        server.network_config.use_tls = false;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -5636,6 +6139,7 @@ mod tests {
 
         for _ in 0..iterations {
             let mut fresh_client = QuicNetworkManager::with_node_id(200);
+            fresh_client.network_config.use_tls = false;
             let conn_task = tokio::spawn(async move {
                 let conn = fresh_client
                     .connect_as_client(bound_addr)
@@ -5873,10 +6377,12 @@ mod tests {
         let result = rt.block_on(async {
             let mut server = QuicNetworkManager::with_node_id(1);
             server.network_config.timeout_ms = 500;
+            server.network_config.use_tls = false;
             server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
             let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
 
             let mut bad_peer = QuicNetworkManager::with_node_id(2);
+            bad_peer.network_config.use_tls = false;
             bad_peer
                 .listen("127.0.0.1:0".parse().unwrap())
                 .await
@@ -6177,7 +6683,9 @@ mod tests {
     async fn test_connect_p2p_rejects_identity_mismatch() {
         ensure_crypto_provider();
 
-        let mut victim = QuicNetworkManager::with_node_id(1000);
+        // A maximal legacy ID makes this test endpoint the controlling ICE
+        // agent regardless of the certificate-derived target ID.
+        let mut victim = QuicNetworkManager::with_node_id(usize::MAX);
         victim.network_config.enable_nat_traversal = true;
         victim
             .listen("127.0.0.1:0".parse().unwrap())
@@ -6190,6 +6698,24 @@ mod tests {
             .listen("127.0.0.1:0".parse().unwrap())
             .await
             .expect("attacker listen failed");
+
+        let attacker_key = attacker
+            .get_public_key()
+            .expect("attacker should expose its key")
+            .clone();
+        let mut intended_peer = QuicNetworkManager::with_node_id(3000);
+        intended_peer
+            .ensure_local_certificate()
+            .expect("intended peer certificate generation should succeed");
+        let intended_key = intended_peer
+            .get_public_key()
+            .expect("intended peer should expose its key")
+            .clone();
+
+        // Both identities are globally trusted. The exact target binding must
+        // still prevent the attacker from occupying the intended peer's slot.
+        victim
+            .set_allowed_certificate_public_keys(vec![attacker_key.clone(), intended_key.clone()]);
 
         // Drive incoming accepts on attacker so QUIC handshakes in ICE checks and
         // final P2P connect can complete deterministically during the test.
@@ -6226,8 +6752,8 @@ mod tests {
             }
         });
 
-        let attacker_derived_id = attacker.local_derived_id();
-        let target_party_id = if attacker_derived_id == 1 { 2 } else { 1 };
+        let attacker_derived_id = attacker_key.derive_id();
+        let target_party_id = intended_key.derive_id();
         assert_ne!(
             attacker_derived_id, target_party_id,
             "test precondition failed: attacker ID unexpectedly matched target ID"

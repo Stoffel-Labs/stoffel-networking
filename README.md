@@ -97,7 +97,7 @@ When `expected_parties` or `expected_clients` is configured, send paths are tran
 | `timeout_ms` | `30000` | Connection and stream setup timeout in milliseconds |
 | `idle_timeout_ms` | `300000` | QUIC idle timeout in milliseconds |
 | `max_retries` | `3` | Maximum connection retry attempts |
-| `use_tls` | `true` | Enable TLS and peer certificate handling |
+| `use_tls` | `true` | Authenticate peer certificates against role-specific public-key allowlists. `false` permits unauthenticated development peers; QUIC remains encrypted |
 | `enable_nat_traversal` | `false` | Enable ICE/STUN NAT traversal helpers |
 | `stun_servers` | `[]` | STUN server socket addresses for reflexive address discovery |
 | `enable_hole_punching` | `true` | Enable coordinated UDP hole punching when NAT traversal is used |
@@ -124,7 +124,15 @@ let manager = QuicNetworkManager::with_config(config);
 
 By default, a manager generates ephemeral self-signed certificate material on first use. Runtimes that need stable authenticated transport identities can install certificate/key DER before `listen` or `connect` with `set_local_certificate_der`.
 
-Certificate public-key allowlisting is available through `set_allowed_certificate_public_keys`, `add_allowed_certificate_public_key`, and `clear_allowed_certificate_public_keys`.
+With authenticated TLS, configure MPC peers through the server certificate
+allowlist APIs and external clients through the client certificate allowlist
+APIs. Each negotiated ALPN role is checked against its own allowlist, and an
+empty allowlist rejects every peer claiming that role. The older
+`set_allowed_certificate_public_keys`, `add_allowed_certificate_public_key`, and
+`clear_allowed_certificate_public_keys` methods remain server-only aliases.
+Trust must be configured on both endpoints. Target-aware server connection
+methods also pin the exact requested key, preventing another server-authorized
+peer from impersonating it.
 
 ## Architecture
 

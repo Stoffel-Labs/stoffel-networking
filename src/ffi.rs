@@ -544,7 +544,8 @@ pub extern "C" fn stoffelnet_manager_destroy(manager: StoffelNetworkManagerHandl
 ///
 /// * `manager` - Handle to the network manager
 /// * `address` - The network address of the node (null-terminated string)
-/// * `party_id` - The party ID of the node
+/// * `party_id` - The party ID of the node. In authenticated TLS mode this must
+///   be the transport ID derived from the peer's allowlisted certificate key.
 ///
 /// # Returns
 ///
@@ -597,10 +598,11 @@ pub extern "C" fn stoffelnet_manager_add_node(
     STOFFELNET_OK
 }
 
-/// Adds a DER-encoded SubjectPublicKeyInfo key to the certificate public key allowlist.
+/// Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
 ///
-/// When at least one key is configured, connections whose peer certificate public key
-/// is not in the allowlist are rejected.
+/// This backwards-compatible endpoint grants only the privileged server role.
+/// Use [`stoffelnet_manager_add_allowed_client_certificate_public_key`] for
+/// external clients.
 ///
 /// # Safety
 ///
@@ -608,6 +610,24 @@ pub extern "C" fn stoffelnet_manager_add_node(
 /// - key must point to at least key_len bytes
 #[unsafe(no_mangle)]
 pub extern "C" fn stoffelnet_manager_add_allowed_certificate_public_key(
+    manager: StoffelNetworkManagerHandle,
+    key: *const u8,
+    key_len: usize,
+) -> c_int {
+    stoffelnet_manager_add_allowed_server_certificate_public_key(manager, key, key_len)
+}
+
+/// Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
+///
+/// In authenticated TLS mode, a peer negotiating `server-protocol` is accepted
+/// only if its certificate public key is in this allowlist.
+///
+/// # Safety
+///
+/// - The manager handle must be valid
+/// - key must point to at least key_len bytes
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_add_allowed_server_certificate_public_key(
     manager: StoffelNetworkManagerHandle,
     key: *const u8,
     key_len: usize,
@@ -627,19 +647,72 @@ pub extern "C" fn stoffelnet_manager_add_allowed_certificate_public_key(
 
     handle.runtime.block_on(async {
         let mut manager = handle.manager.lock().await;
-        manager.add_allowed_certificate_public_key(NodePublicKey(key_bytes));
+        manager.add_allowed_server_certificate_public_key(NodePublicKey(key_bytes));
     });
 
     STOFFELNET_OK
 }
 
-/// Clears the certificate public key allowlist, disabling this check.
+/// Adds a DER-encoded SubjectPublicKeyInfo key to the external client allowlist.
+///
+/// In authenticated TLS mode, a peer negotiating `client-protocol` is accepted
+/// only if its certificate public key is in this allowlist.
+///
+/// # Safety
+///
+/// - The manager handle must be valid
+/// - key must point to at least key_len bytes
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_add_allowed_client_certificate_public_key(
+    manager: StoffelNetworkManagerHandle,
+    key: *const u8,
+    key_len: usize,
+) -> c_int {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    if key.is_null() || key_len == 0 {
+        set_last_error("Null or empty certificate public key");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len).to_vec() };
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+
+    handle.runtime.block_on(async {
+        let mut manager = handle.manager.lock().await;
+        manager.add_allowed_client_certificate_public_key(NodePublicKey(key_bytes));
+    });
+
+    STOFFELNET_OK
+}
+
+/// Clears the MPC server certificate public key allowlist.
+///
+/// This backwards-compatible endpoint does not modify the client allowlist.
 ///
 /// # Safety
 ///
 /// The manager handle must be valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn stoffelnet_manager_clear_allowed_certificate_public_keys(
+    manager: StoffelNetworkManagerHandle,
+) -> c_int {
+    stoffelnet_manager_clear_allowed_server_certificate_public_keys(manager)
+}
+
+/// Clears the MPC server certificate public key allowlist.
+///
+/// In authenticated TLS mode, an empty server allowlist rejects every peer
+/// negotiating `server-protocol`.
+///
+/// # Safety
+///
+/// The manager handle must be valid.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_clear_allowed_server_certificate_public_keys(
     manager: StoffelNetworkManagerHandle,
 ) -> c_int {
     if manager.is_null() {
@@ -650,7 +723,33 @@ pub extern "C" fn stoffelnet_manager_clear_allowed_certificate_public_keys(
     let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
     handle.runtime.block_on(async {
         let mut manager = handle.manager.lock().await;
-        manager.clear_allowed_certificate_public_keys();
+        manager.clear_allowed_server_certificate_public_keys();
+    });
+
+    STOFFELNET_OK
+}
+
+/// Clears the external client certificate public key allowlist.
+///
+/// In authenticated TLS mode, an empty client allowlist rejects every peer
+/// negotiating `client-protocol`.
+///
+/// # Safety
+///
+/// The manager handle must be valid.
+#[unsafe(no_mangle)]
+pub extern "C" fn stoffelnet_manager_clear_allowed_client_certificate_public_keys(
+    manager: StoffelNetworkManagerHandle,
+) -> c_int {
+    if manager.is_null() {
+        set_last_error("Null manager handle");
+        return STOFFELNET_ERR_NULL_POINTER;
+    }
+
+    let handle = unsafe { &*(manager as *const NetworkManagerHandle) };
+    handle.runtime.block_on(async {
+        let mut manager = handle.manager.lock().await;
+        manager.clear_allowed_client_certificate_public_keys();
     });
 
     STOFFELNET_OK
@@ -661,7 +760,8 @@ pub extern "C" fn stoffelnet_manager_clear_allowed_certificate_public_keys(
 /// # Arguments
 ///
 /// * `manager` - Handle to the network manager
-/// * `party_id` - The party ID to connect to
+/// * `party_id` - The transport ID derived from the target's allowlisted
+///   certificate public key when authenticated TLS is enabled
 ///
 /// # Returns
 ///
@@ -693,7 +793,11 @@ pub extern "C" fn stoffelnet_manager_connect_to_party(
             .map(|n| n.address());
 
         match node_addr {
-            Some(addr) => manager.connect_as_server(addr).await,
+            Some(addr) => {
+                manager
+                    .connect_as_server_with_expected_peer_id(addr, party_id as PartyId)
+                    .await
+            }
             None => Err(format!("Party {} not found", party_id)),
         }
     });
@@ -712,7 +816,8 @@ pub extern "C" fn stoffelnet_manager_connect_to_party(
 /// # Arguments
 ///
 /// * `manager` - Handle to the network manager
-/// * `party_id` - The party ID to connect to
+/// * `party_id` - The transport ID derived from the target's allowlisted
+///   certificate public key when authenticated TLS is enabled
 /// * `callback` - Callback function to invoke when connection completes
 /// * `user_data` - User data to pass to the callback
 ///
@@ -755,7 +860,11 @@ pub extern "C" fn stoffelnet_manager_connect_to_party_async(
                 .map(|n| n.address());
 
             match node_addr {
-                Some(addr) => manager.connect_as_server(addr).await,
+                Some(addr) => {
+                    manager
+                        .connect_as_server_with_expected_peer_id(addr, party_id as PartyId)
+                        .await
+                }
                 None => Err(format!("Party {} not found", party_id)),
             }
         };

@@ -843,9 +843,28 @@ impl Node for QuicNode {
 // NETWORK CONFIG AND MESSAGE
 // ============================================================================
 
+/// Controls whether QUIC peer certificates are authenticated.
+///
+/// QUIC transport encryption is always enabled. The insecure mode exists only
+/// for local development and tests where peer keys cannot be provisioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PeerAuthenticationMode {
+    /// Require certificates to be authorized for their negotiated role.
+    #[default]
+    Required,
+    /// Disable peer identity authentication. Never use this in production.
+    DangerouslyDisabledForDevelopment,
+}
+
+impl PeerAuthenticationMode {
+    fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
 /// Configuration for the QUIC network manager.
 ///
-/// Controls connection timeouts, TLS settings, and NAT traversal options.
+/// Controls connection timeouts, peer authentication, and NAT traversal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuicNetworkConfig {
     /// Connection timeout in milliseconds
@@ -856,10 +875,9 @@ pub struct QuicNetworkConfig {
     pub idle_timeout_ms: u64,
     /// Maximum connection retry attempts
     pub max_retries: u32,
-    /// Require peer certificate authentication against the configured public
-    /// key allowlist. QUIC remains encrypted when this is false, but peer
-    /// identity is not authenticated; false is development-only.
-    pub use_tls: bool,
+    /// Controls peer certificate authentication. QUIC encryption remains
+    /// enabled in every mode.
+    pub peer_authentication: PeerAuthenticationMode,
 
     // NAT Traversal Configuration
     /// Enable NAT traversal features
@@ -888,7 +906,7 @@ impl Default for QuicNetworkConfig {
             timeout_ms: 30000,
             idle_timeout_ms: 300_000,
             max_retries: 3,
-            use_tls: true,
+            peer_authentication: PeerAuthenticationMode::Required,
             enable_nat_traversal: false,
             // Default to empty - STUN servers require DNS resolution which isn't supported
             // by SocketAddr. Users should configure STUN servers with resolved IP addresses.
@@ -1323,7 +1341,7 @@ impl QuicNetworkManager {
         if !current.is_empty() && current != requested {
             return Err("server certificate roster is already frozen".to_string());
         }
-        self.set_allowed_certificate_public_keys(keys);
+        self.set_allowed_server_certificate_public_keys(keys);
         Ok(())
     }
 
@@ -1442,13 +1460,16 @@ impl QuicNetworkManager {
         }
     }
 
-    /// Replaces the MPC server certificate public key allowlist.
+    /// Deprecated alias for [`Self::set_allowed_server_certificate_public_keys`].
     ///
     /// Keys must be DER-encoded SubjectPublicKeyInfo bytes, matching
     /// [`NodePublicKey`]. This backwards-compatible method authorizes only the
     /// privileged server role; use
     /// [`Self::set_allowed_client_certificate_public_keys`]
     /// for external clients.
+    #[deprecated(
+        note = "use set_allowed_server_certificate_public_keys or set_allowed_client_certificate_public_keys"
+    )]
     pub fn set_allowed_certificate_public_keys(&mut self, keys: Vec<NodePublicKey>) {
         self.set_allowed_server_certificate_public_keys(keys);
     }
@@ -1469,9 +1490,12 @@ impl QuicNetworkManager {
         }
     }
 
-    /// Adds a key to the MPC server certificate allowlist.
+    /// Deprecated alias for [`Self::add_allowed_server_certificate_public_key`].
     ///
     /// This backwards-compatible method does not authorize the client role.
+    #[deprecated(
+        note = "use add_allowed_server_certificate_public_key or add_allowed_client_certificate_public_key"
+    )]
     pub fn add_allowed_certificate_public_key(&mut self, key: NodePublicKey) {
         self.add_allowed_server_certificate_public_key(key);
     }
@@ -1486,9 +1510,12 @@ impl QuicNetworkManager {
         self.allowed_client_public_keys.insert(key);
     }
 
-    /// Clears the MPC server certificate public key allowlist.
+    /// Deprecated alias for [`Self::clear_allowed_server_certificate_public_keys`].
     ///
     /// This backwards-compatible method does not modify the client allowlist.
+    #[deprecated(
+        note = "use clear_allowed_server_certificate_public_keys or clear_allowed_client_certificate_public_keys"
+    )]
     pub fn clear_allowed_certificate_public_keys(&mut self) {
         self.clear_allowed_server_certificate_public_keys();
     }
@@ -1503,7 +1530,10 @@ impl QuicNetworkManager {
         self.allowed_client_public_keys.clear();
     }
 
-    /// Returns true when at least one MPC server certificate key is trusted.
+    /// Deprecated alias for [`Self::has_server_certificate_public_key_allowlist`].
+    #[deprecated(
+        note = "use has_server_certificate_public_key_allowlist or has_client_certificate_public_key_allowlist"
+    )]
     pub fn has_certificate_public_key_allowlist(&self) -> bool {
         self.has_server_certificate_public_key_allowlist()
     }
@@ -1770,19 +1800,19 @@ impl QuicNetworkManager {
     /// Creates self-signed server config using provided DER-encoded certificate and key.
     /// Accepts both ALPN_SERVER_PROTOCOL and ALPN_CLIENT_PROTOCOL for incoming connections.
     ///
-    /// When `use_tls` is `true`, client certificates are mandatory — peers that
-    /// connect without presenting a certificate are rejected at the TLS layer.
+    /// When peer authentication is required, client certificates are mandatory
+    /// and peers without one are rejected at the TLS layer.
     fn create_self_signed_server_config(
         cert_der_bytes: &[u8],
         key_der_bytes: &[u8],
         idle_timeout_ms: u64,
-        use_tls: bool,
+        require_peer_authentication: bool,
     ) -> Result<ServerConfig, String> {
         let cert_der = CertificateDer::from(cert_der_bytes.to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der_bytes.to_vec()));
 
         let mut server_crypto = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(SkipClientVerification::new(use_tls))
+            .with_client_cert_verifier(SkipClientVerification::new(require_peer_authentication))
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| format!("Failed to create server crypto config: {}", e))?;
 
@@ -1819,7 +1849,7 @@ impl QuicNetworkManager {
                 self.local_key_der.as_deref(),
                 self.network_config.idle_timeout_ms,
                 Arc::clone(&self.allowed_server_public_keys),
-                self.network_config.use_tls,
+                self.network_config.peer_authentication.is_required(),
                 None,
             )?;
             let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
@@ -1846,7 +1876,7 @@ impl QuicNetworkManager {
             self.local_key_der.as_deref(),
             self.network_config.idle_timeout_ms,
             Arc::clone(&self.allowed_server_public_keys),
-            self.network_config.use_tls,
+            self.network_config.peer_authentication.is_required(),
             expected_public_key,
         )
     }
@@ -1912,10 +1942,10 @@ impl QuicNetworkManager {
         role: ClientType,
         context: &str,
     ) -> Result<(), String> {
-        // `use_tls = false` is the explicit development-only escape hatch for
-        // dynamic peer discovery. QUIC still encrypts the connection, but the
-        // peer certificate is not authenticated in that mode.
-        if !self.network_config.use_tls {
+        // The explicitly dangerous development mode is the only escape hatch
+        // for dynamic peer discovery. QUIC still encrypts the connection, but
+        // the peer certificate is not authenticated in that mode.
+        if !self.network_config.peer_authentication.is_required() {
             return Ok(());
         }
 
@@ -1948,10 +1978,13 @@ impl QuicNetworkManager {
         Ok(())
     }
 
-    /// Verifies that a peer presented the exact certificate public key requested
-    /// by the caller. Membership in the global allowlist alone is insufficient:
-    /// without this comparison, one trusted peer could impersonate another.
-    fn verify_expected_peer_public_key(
+    /// Verifies that a server-role peer presented the exact certificate key
+    /// requested by the caller after role-specific authorization succeeds.
+    ///
+    /// Incoming clients have no caller-selected target identity, so they are
+    /// authorized by the client-role allowlist rather than a separate exact-key
+    /// helper.
+    fn verify_expected_server_public_key(
         peer_public_key: Option<&NodePublicKey>,
         expected_public_key: &NodePublicKey,
         context: &str,
@@ -2398,7 +2431,7 @@ impl QuicNetworkManager {
         address: SocketAddr,
         expected_peer_id: PartyId,
     ) -> Result<Arc<dyn PeerConnection>, String> {
-        if !self.network_config.use_tls {
+        if !self.network_config.peer_authentication.is_required() {
             return self.connect_as_server(address).await;
         }
 
@@ -2450,23 +2483,14 @@ impl QuicNetworkManager {
             }
         };
 
-        if let Some(expected) = expected_public_key {
-            match peer_public_key.as_ref() {
-                Some(presented) if presented == expected => {}
-                Some(presented) => {
-                    connection.close(0u32.into(), b"server certificate mismatch");
-                    return Err(format!(
-                        "server certificate mismatch at {address}: expected compact ID {}, presented compact ID {}",
-                        expected.derive_id(),
-                        presented.derive_id()
-                    ));
-                }
-                None => {
-                    connection.close(0u32.into(), b"missing server certificate identity");
-                    return Err(format!(
-                        "server at {address} did not present an extractable certificate identity"
-                    ));
-                }
+        if let Some(expected_public_key) = expected_public_key {
+            if let Err(err) = Self::verify_expected_server_public_key(
+                peer_public_key.as_ref(),
+                expected_public_key,
+                "server connection",
+            ) {
+                connection.close(0u32.into(), b"server certificate mismatch");
+                return Err(format!("{} at {}", err, address));
             }
         }
 
@@ -2898,9 +2922,9 @@ impl QuicNetworkManager {
             }
         };
 
-        if self.network_config.use_tls {
+        if self.network_config.peer_authentication.is_required() {
             let expected_public_key = self.trusted_public_key_for_peer_id(party_id)?;
-            if let Err(err) = Self::verify_expected_peer_public_key(
+            if let Err(err) = Self::verify_expected_server_public_key(
                 peer_public_key.as_ref(),
                 &expected_public_key,
                 "p2p connection",
@@ -3124,7 +3148,7 @@ impl QuicNetworkManager {
         direct_address: Option<SocketAddr>,
         signaling_connection: Option<Arc<dyn PeerConnection>>,
     ) -> Result<Arc<dyn PeerConnection>, String> {
-        if self.network_config.use_tls {
+        if self.network_config.peer_authentication.is_required() {
             // Resolve before attempting any route so missing or ambiguous trust
             // configuration cannot degrade into address-based authentication.
             self.trusted_public_key_for_peer_id(target_party_id)?;
@@ -3738,7 +3762,7 @@ impl NetworkManager for QuicNetworkManager {
                 cert_der,
                 key_der,
                 self.network_config.idle_timeout_ms,
-                self.network_config.use_tls,
+                self.network_config.peer_authentication.is_required(),
             )?;
             let mut endpoint = Endpoint::server(server_config, bind_address)
                 .map_err(|e| format!("Failed to create server endpoint: {}", e))?;
@@ -3750,7 +3774,7 @@ impl NetworkManager for QuicNetworkManager {
                 Some(key_der),
                 self.network_config.idle_timeout_ms,
                 Arc::clone(&self.allowed_server_public_keys),
-                self.network_config.use_tls,
+                self.network_config.peer_authentication.is_required(),
                 None,
             )?;
             endpoint.set_default_client_config(client_config);
@@ -3960,13 +3984,13 @@ impl Network for QuicNetworkManager {
 
 /// Client certificate verifier.
 ///
-/// When `require_client_cert` is `true` (production / `use_tls = true`), the
+/// When `require_client_cert` is `true` (the production default), the
 /// verifier mandates that every connecting peer presents a TLS certificate.
 /// The certificate content is still accepted without chain verification because
 /// identity is derived from the public key (mTLS key-pinning), but the peer
 /// **must** present one.
 ///
-/// When `require_client_cert` is `false` (development / `use_tls = false`),
+/// When `require_client_cert` is `false` (explicit insecure development mode),
 /// client certificates are entirely optional.
 #[derive(Debug)]
 struct SkipClientVerification {
@@ -4815,11 +4839,13 @@ mod tests {
     #[tokio::test]
     async fn test_server_to_server_connection() {
         ensure_crypto_provider();
-        // Create two managers (use_tls=false for dynamic peer discovery in tests)
+        // Explicitly disable peer authentication for dynamic test discovery.
         let mut server1 = QuicNetworkManager::with_node_id(1);
-        server1.network_config.use_tls = false;
+        server1.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         let mut server2 = QuicNetworkManager::with_node_id(2);
-        server2.network_config.use_tls = false;
+        server2.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         // Start listening on server1
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -4871,9 +4897,11 @@ mod tests {
         // Explicitly use development mode for dynamic peer discovery. The
         // authenticated default requires both certificate keys to be provisioned.
         let mut server = QuicNetworkManager::with_node_id(1);
-        server.network_config.use_tls = false;
+        server.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         let mut client = QuicNetworkManager::with_node_id(100);
-        client.network_config.use_tls = false;
+        client.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         // Start listening on server
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -4961,9 +4989,11 @@ mod tests {
     async fn test_connection_role_from_alpn() {
         ensure_crypto_provider();
         let mut server = QuicNetworkManager::with_node_id(1);
-        server.network_config.use_tls = false;
+        server.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         let mut client = QuicNetworkManager::with_node_id(100);
-        client.network_config.use_tls = false;
+        client.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -4983,9 +5013,11 @@ mod tests {
     async fn test_public_keys_exchanged_on_server_connection() {
         ensure_crypto_provider();
         let mut server1 = QuicNetworkManager::with_node_id(1);
-        server1.network_config.use_tls = false;
+        server1.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         let mut server2 = QuicNetworkManager::with_node_id(2);
-        server2.network_config.use_tls = false;
+        server2.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         // Both servers need to have their certificates generated
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -5028,9 +5060,9 @@ mod tests {
     async fn test_reject_unknown_server_peer_does_not_store_public_key() {
         ensure_crypto_provider();
 
-        // use_tls defaults to true: unknown server peers must be rejected.
+        // Peer authentication is required by default, so unknown peers fail.
         let mut server = QuicNetworkManager::with_node_id(1);
-        assert!(server.network_config.use_tls);
+        assert!(server.network_config.peer_authentication.is_required());
         server
             .listen("127.0.0.1:0".parse().unwrap())
             .await
@@ -5042,7 +5074,8 @@ mod tests {
             let mut unknown_peer = QuicNetworkManager::with_node_id(2);
             // Keep the initiator permissive so the listener's allowlist is the
             // side under test.
-            unknown_peer.network_config.use_tls = false;
+            unknown_peer.network_config.peer_authentication =
+                PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
             unknown_peer.connect_as_server(server_addr).await
         });
 
@@ -5096,8 +5129,8 @@ mod tests {
             .expect("client should have a public key")
             .clone();
 
-        server.add_allowed_certificate_public_key(client_key.clone());
-        client.add_allowed_certificate_public_key(server_key);
+        server.add_allowed_server_certificate_public_key(client_key.clone());
+        client.add_allowed_server_certificate_public_key(server_key);
         server
             .listen("127.0.0.1:0".parse().unwrap())
             .await
@@ -5144,7 +5177,7 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server = QuicNetworkManager::with_node_id(1);
-        server.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+        server.add_allowed_server_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
         server
             .listen("127.0.0.1:0".parse().unwrap())
             .await
@@ -5153,7 +5186,8 @@ mod tests {
 
         let connect_task = tokio::spawn(async move {
             let mut unlisted_peer = QuicNetworkManager::with_node_id(2);
-            unlisted_peer.network_config.use_tls = false;
+            unlisted_peer.network_config.peer_authentication =
+                PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
             unlisted_peer.connect_as_server(server_addr).await
         });
 
@@ -5187,7 +5221,7 @@ mod tests {
         let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
 
         let mut client = QuicNetworkManager::with_node_id(2);
-        client.add_allowed_certificate_public_key(NodePublicKey(vec![0x11, 0x22, 0x33]));
+        client.add_allowed_server_certificate_public_key(NodePublicKey(vec![0x11, 0x22, 0x33]));
 
         let accept_task = tokio::spawn(async move { server.accept().await });
         let connect_result = client.connect_as_client(server_addr).await;
@@ -5225,7 +5259,8 @@ mod tests {
             err
         );
 
-        manager.network_config.use_tls = false;
+        manager.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         assert!(
             manager
                 .verify_peer_public_key_allowed(
@@ -5275,7 +5310,8 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server = QuicNetworkManager::with_node_id(1);
-        server.network_config.use_tls = false;
+        server.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         server
             .listen("127.0.0.1:0".parse().unwrap())
             .await
@@ -5284,7 +5320,7 @@ mod tests {
         let accept_task = tokio::spawn(async move { server.accept().await });
 
         let mut client = QuicNetworkManager::with_node_id(2);
-        assert!(client.network_config.use_tls);
+        assert!(client.network_config.peer_authentication.is_required());
         let err = client
             .connect_as_server(server_addr)
             .await
@@ -5335,9 +5371,11 @@ mod tests {
             .expect("connector should expose its key")
             .clone();
 
-        connector
-            .set_allowed_certificate_public_keys(vec![intended_key.clone(), attacker_key.clone()]);
-        attacker.add_allowed_certificate_public_key(connector_key);
+        connector.set_allowed_server_certificate_public_keys(vec![
+            intended_key.clone(),
+            attacker_key.clone(),
+        ]);
+        attacker.add_allowed_server_certificate_public_key(connector_key);
         attacker
             .listen("127.0.0.1:0".parse().unwrap())
             .await
@@ -5369,9 +5407,11 @@ mod tests {
     async fn test_send_receive_after_connection() {
         ensure_crypto_provider();
         let mut server = QuicNetworkManager::with_node_id(1);
-        server.network_config.use_tls = false;
+        server.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         let mut client = QuicNetworkManager::with_node_id(100);
-        client.network_config.use_tls = false;
+        client.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -5576,11 +5616,13 @@ mod tests {
     async fn test_sender_ids_are_sequential_0_to_n() {
         ensure_crypto_provider();
 
-        // Create two servers (use_tls=false for dynamic peer discovery in tests)
+        // Explicitly disable peer authentication for dynamic test discovery.
         let mut server1 = QuicNetworkManager::with_node_id(1);
-        server1.network_config.use_tls = false;
+        server1.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         let mut server2 = QuicNetworkManager::with_node_id(2);
-        server2.network_config.use_tls = false;
+        server2.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         // Start listening (generates certificates)
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -5869,44 +5911,44 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_client_auth_mandatory_when_use_tls_enabled() {
+    fn test_client_auth_mandatory_when_peer_authentication_is_required() {
         ensure_crypto_provider();
         let verifier = SkipClientVerification::new(true);
         assert!(
             verifier.client_auth_mandatory(),
-            "client_auth_mandatory must be true when use_tls is enabled"
+            "client authentication must be mandatory in required mode"
         );
     }
 
     #[test]
-    fn test_client_auth_optional_when_use_tls_disabled() {
+    fn test_client_auth_optional_in_insecure_development_mode() {
         ensure_crypto_provider();
         let verifier = SkipClientVerification::new(false);
         assert!(
             !verifier.client_auth_mandatory(),
-            "client_auth_mandatory must be false when use_tls is disabled (dev mode)"
+            "client authentication may be optional only in insecure development mode"
         );
     }
 
     #[test]
-    fn test_server_config_with_use_tls_true_requires_client_cert() {
+    fn test_server_config_with_required_authentication_requires_client_cert() {
         ensure_crypto_provider();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert gen");
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.signing_key.serialize_der();
 
-        // Must succeed — config creation with use_tls=true
+        // Required peer authentication must produce a valid server config.
         let config = QuicNetworkManager::create_self_signed_server_config(
             &cert_der, &key_der, 300_000, true,
         );
         assert!(
             config.is_ok(),
-            "Server config with use_tls=true must succeed"
+            "server config with required peer authentication must succeed"
         );
     }
 
     #[test]
-    fn test_server_config_with_use_tls_false_allows_no_client_cert() {
+    fn test_server_config_with_insecure_development_authentication_is_valid() {
         ensure_crypto_provider();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert gen");
         let cert_der = cert.cert.der().to_vec();
@@ -5917,7 +5959,7 @@ mod tests {
         );
         assert!(
             config.is_ok(),
-            "Server config with use_tls=false must succeed"
+            "server config with insecure development authentication must succeed"
         );
     }
 
@@ -6129,7 +6171,8 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server = QuicNetworkManager::with_node_id(1);
-        server.network_config.use_tls = false;
+        server.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -6139,7 +6182,8 @@ mod tests {
 
         for _ in 0..iterations {
             let mut fresh_client = QuicNetworkManager::with_node_id(200);
-            fresh_client.network_config.use_tls = false;
+            fresh_client.network_config.peer_authentication =
+                PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
             let conn_task = tokio::spawn(async move {
                 let conn = fresh_client
                     .connect_as_client(bound_addr)
@@ -6196,9 +6240,11 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server = QuicNetworkManager::with_node_id(1);
-        server.network_config.use_tls = false;
+        server.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         let mut client = QuicNetworkManager::with_node_id(100);
-        client.network_config.use_tls = false;
+        client.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         server.listen(addr).await.expect("Failed to start server");
@@ -6253,9 +6299,11 @@ mod tests {
         ensure_crypto_provider();
 
         let mut server1 = QuicNetworkManager::with_node_id(1);
-        server1.network_config.use_tls = false;
+        server1.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
         let mut server2 = QuicNetworkManager::with_node_id(2);
-        server2.network_config.use_tls = false;
+        server2.network_config.peer_authentication =
+            PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
 
         // Both listen
         let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -6377,12 +6425,14 @@ mod tests {
         let result = rt.block_on(async {
             let mut server = QuicNetworkManager::with_node_id(1);
             server.network_config.timeout_ms = 500;
-            server.network_config.use_tls = false;
+            server.network_config.peer_authentication =
+                PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
             server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
             let server_addr = server.endpoint.as_ref().unwrap().local_addr().unwrap();
 
             let mut bad_peer = QuicNetworkManager::with_node_id(2);
-            bad_peer.network_config.use_tls = false;
+            bad_peer.network_config.peer_authentication =
+                PeerAuthenticationMode::DangerouslyDisabledForDevelopment;
             bad_peer
                 .listen("127.0.0.1:0".parse().unwrap())
                 .await
@@ -6714,8 +6764,10 @@ mod tests {
 
         // Both identities are globally trusted. The exact target binding must
         // still prevent the attacker from occupying the intended peer's slot.
-        victim
-            .set_allowed_certificate_public_keys(vec![attacker_key.clone(), intended_key.clone()]);
+        victim.set_allowed_server_certificate_public_keys(vec![
+            attacker_key.clone(),
+            intended_key.clone(),
+        ]);
 
         // Drive incoming accepts on attacker so QUIC handshakes in ICE checks and
         // final P2P connect can complete deterministically during the test.

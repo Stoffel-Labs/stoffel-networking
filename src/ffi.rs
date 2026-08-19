@@ -609,6 +609,9 @@ pub extern "C" fn stoffelnet_manager_add_node(
 /// - The manager handle must be valid
 /// - key must point to at least key_len bytes
 #[unsafe(no_mangle)]
+#[deprecated(
+    note = "use stoffelnet_manager_add_allowed_server_certificate_public_key or stoffelnet_manager_add_allowed_client_certificate_public_key"
+)]
 pub extern "C" fn stoffelnet_manager_add_allowed_certificate_public_key(
     manager: StoffelNetworkManagerHandle,
     key: *const u8,
@@ -697,6 +700,9 @@ pub extern "C" fn stoffelnet_manager_add_allowed_client_certificate_public_key(
 ///
 /// The manager handle must be valid.
 #[unsafe(no_mangle)]
+#[deprecated(
+    note = "use stoffelnet_manager_clear_allowed_server_certificate_public_keys or stoffelnet_manager_clear_allowed_client_certificate_public_keys"
+)]
 pub extern "C" fn stoffelnet_manager_clear_allowed_certificate_public_keys(
     manager: StoffelNetworkManagerHandle,
 ) -> c_int {

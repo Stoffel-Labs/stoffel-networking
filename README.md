@@ -97,7 +97,7 @@ When `expected_parties` or `expected_clients` is configured, send paths are tran
 | `timeout_ms` | `30000` | Connection and stream setup timeout in milliseconds |
 | `idle_timeout_ms` | `300000` | QUIC idle timeout in milliseconds |
 | `max_retries` | `3` | Maximum connection retry attempts |
-| `use_tls` | `true` | Authenticate peer certificates against role-specific public-key allowlists. `false` permits unauthenticated development peers; QUIC remains encrypted |
+| `peer_authentication` | `PeerAuthenticationMode::Required` | Require role-specific certificate authorization. `DangerouslyDisabledForDevelopment` is an explicit local-development escape hatch; QUIC remains encrypted |
 | `enable_nat_traversal` | `false` | Enable ICE/STUN NAT traversal helpers |
 | `stun_servers` | `[]` | STUN server socket addresses for reflexive address discovery |
 | `enable_hole_punching` | `true` | Enable coordinated UDP hole punching when NAT traversal is used |
@@ -106,6 +106,17 @@ When `expected_parties` or `expected_clients` is configured, send paths are tran
 | `expected_parties` | `None` | Optional number of MPC parties required before send/broadcast proceeds |
 | `expected_clients` | `None` | Optional number of clients required before send-to-client proceeds |
 | `consensus_timeout_ms` | `60000` | Readiness/ordering consensus timeout in milliseconds |
+
+Unauthenticated peer discovery requires an intentionally conspicuous opt-in:
+
+```rust
+use stoffelnet::transports::quic::{PeerAuthenticationMode, QuicNetworkConfig};
+
+let development_config = QuicNetworkConfig {
+    peer_authentication: PeerAuthenticationMode::DangerouslyDisabledForDevelopment,
+    ..Default::default()
+};
+```
 
 ### NAT traversal
 
@@ -129,7 +140,8 @@ allowlist APIs and external clients through the client certificate allowlist
 APIs. Each negotiated ALPN role is checked against its own allowlist, and an
 empty allowlist rejects every peer claiming that role. The older
 `set_allowed_certificate_public_keys`, `add_allowed_certificate_public_key`, and
-`clear_allowed_certificate_public_keys` methods remain server-only aliases.
+`clear_allowed_certificate_public_keys` methods remain deprecated server-only
+aliases for source and ABI compatibility.
 Trust must be configured on both endpoints. Target-aware server connection
 methods also pin the exact requested key, preventing another server-authorized
 peer from impersonating it.

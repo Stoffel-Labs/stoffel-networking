@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::Once;
 use stoffelnet::network_utils::{ClientType, Message, NetworkError, Node, NodePublicKey};
 use stoffelnet::transports::quic::{
-    ConnectionState, LoopbackPeerConnection, NetworkManager, PeerConnection, QuicMessage,
-    QuicNetworkConfig, QuicNetworkManager, QuicNode,
+    ConnectionState, LoopbackPeerConnection, NetworkManager, PeerAuthenticationMode,
+    PeerConnection, QuicMessage, QuicNetworkConfig, QuicNetworkManager, QuicNode,
 };
 
 static CRYPTO_INIT: Once = Once::new();
@@ -226,8 +226,8 @@ async fn test_certificate_public_key_allowlist_accepts_expected_server_peer() {
         .expect("listener should expose a certificate public key")
         .clone();
 
-    listener.set_allowed_certificate_public_keys(vec![connector_key.clone()]);
-    connector.set_allowed_certificate_public_keys(vec![listener_key]);
+    listener.set_allowed_server_certificate_public_keys(vec![connector_key.clone()]);
+    connector.set_allowed_server_certificate_public_keys(vec![listener_key]);
 
     let connect_task = tokio::spawn(async move {
         let result = connector.connect_as_server(listener_addr).await;
@@ -371,7 +371,7 @@ async fn test_certificate_public_key_allowlist_rejects_unexpected_server_peer() 
     init_crypto();
 
     let mut listener = QuicNetworkManager::with_node_id(1);
-    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    listener.add_allowed_server_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
     let listener_addr = unused_localhost_addr();
     listener
         .listen(listener_addr)
@@ -380,7 +380,7 @@ async fn test_certificate_public_key_allowlist_rejects_unexpected_server_peer() 
 
     let connect_task = tokio::spawn(async move {
         let mut unexpected_peer = QuicNetworkManager::with_config(QuicNetworkConfig {
-            use_tls: false,
+            peer_authentication: PeerAuthenticationMode::DangerouslyDisabledForDevelopment,
             ..QuicNetworkConfig::default()
         });
         unexpected_peer.connect_as_server(listener_addr).await
@@ -410,18 +410,18 @@ async fn test_certificate_public_key_allowlist_clear_only_permits_development_mo
     init_crypto();
 
     let mut listener = QuicNetworkManager::with_node_id(1);
-    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
-    assert!(listener.has_certificate_public_key_allowlist());
-    listener.clear_allowed_certificate_public_keys();
-    assert!(!listener.has_certificate_public_key_allowlist());
+    listener.add_allowed_server_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    assert!(listener.has_server_certificate_public_key_allowlist());
+    listener.clear_allowed_server_certificate_public_keys();
+    assert!(!listener.has_server_certificate_public_key_allowlist());
 
     let config = QuicNetworkConfig {
-        use_tls: false,
+        peer_authentication: PeerAuthenticationMode::DangerouslyDisabledForDevelopment,
         ..Default::default()
     };
     let mut listener = QuicNetworkManager::with_config(config.clone());
-    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
-    listener.clear_allowed_certificate_public_keys();
+    listener.add_allowed_server_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    listener.clear_allowed_server_certificate_public_keys();
     let listener_addr = unused_localhost_addr();
     listener
         .listen(listener_addr)
@@ -501,7 +501,11 @@ fn test_default_config_values() {
         "default idle_timeout_ms should be 300000"
     );
     assert_eq!(config.max_retries, 3, "default max_retries should be 3");
-    assert!(config.use_tls, "default use_tls should be true");
+    assert_eq!(
+        config.peer_authentication,
+        PeerAuthenticationMode::Required,
+        "peer authentication should be required by default"
+    );
     assert!(
         !config.enable_nat_traversal,
         "default enable_nat_traversal should be false"
@@ -531,7 +535,7 @@ fn test_config_with_nat_traversal() {
     // Verify all other fields remain at defaults
     assert_eq!(config.timeout_ms, 30000);
     assert_eq!(config.max_retries, 3);
-    assert!(config.use_tls);
+    assert_eq!(config.peer_authentication, PeerAuthenticationMode::Required);
     assert!(config.stun_servers.is_empty());
     assert!(config.enable_hole_punching);
     assert_eq!(config.hole_punch_timeout_ms, 10000);

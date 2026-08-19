@@ -25,14 +25,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(__GNUC__) || defined(__clang__)
-#define STOFFELNET_DEPRECATED(message) __attribute__((deprecated(message)))
-#elif defined(_MSC_VER)
-#define STOFFELNET_DEPRECATED(message) __declspec(deprecated(message))
-#else
-#define STOFFELNET_DEPRECATED(message)
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -232,23 +224,6 @@ int32_t stoffelnet_manager_add_node(
 
 /**
  * Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
- * This backwards-compatible function grants only the privileged server role.
- * @deprecated Use stoffelnet_manager_add_allowed_server_certificate_public_key
- * or stoffelnet_manager_add_allowed_client_certificate_public_key.
- * @param manager Handle to the network manager
- * @param key Pointer to DER-encoded SubjectPublicKeyInfo bytes
- * @param key_len Length of key in bytes
- * @return STOFFELNET_OK on success, or an error code
- */
-STOFFELNET_DEPRECATED("use a role-specific certificate public key function")
-int32_t stoffelnet_manager_add_allowed_certificate_public_key(
-    StoffelNetworkManagerHandle manager,
-    const uint8_t* key,
-    size_t key_len
-);
-
-/**
- * Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
  * A peer negotiating server-protocol must present a key from this list.
  * @param manager Handle to the network manager
  * @param key Pointer to DER-encoded SubjectPublicKeyInfo bytes
@@ -273,18 +248,6 @@ int32_t stoffelnet_manager_add_allowed_client_certificate_public_key(
     StoffelNetworkManagerHandle manager,
     const uint8_t* key,
     size_t key_len
-);
-
-/**
- * Clears the MPC server certificate public key allowlist. This backwards-compatible
- * function does not modify the external client allowlist.
- * @deprecated Use a role-specific clear function.
- * @param manager Handle to the network manager
- * @return STOFFELNET_OK on success, or an error code
- */
-STOFFELNET_DEPRECATED("use a role-specific certificate public key function")
-int32_t stoffelnet_manager_clear_allowed_certificate_public_keys(
-    StoffelNetworkManagerHandle manager
 );
 
 /**

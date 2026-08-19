@@ -138,10 +138,9 @@ By default, a manager generates ephemeral self-signed certificate material on fi
 With authenticated TLS, configure MPC peers through the server certificate
 allowlist APIs and external clients through the client certificate allowlist
 APIs. Each negotiated ALPN role is checked against its own allowlist, and an
-empty allowlist rejects every peer claiming that role. The older
-`set_allowed_certificate_public_keys`, `add_allowed_certificate_public_key`, and
-`clear_allowed_certificate_public_keys` methods remain deprecated server-only
-aliases for source and ABI compatibility.
+empty allowlist rejects every peer claiming that role. Callers must choose the
+role-specific server or client API; the ambiguous generic trust APIs have been
+removed.
 Trust must be configured on both endpoints. Target-aware server connection
 methods also pin the exact requested key, preventing another server-authorized
 peer from impersonating it.

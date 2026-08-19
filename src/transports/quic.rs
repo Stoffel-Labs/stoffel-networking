@@ -1460,20 +1460,6 @@ impl QuicNetworkManager {
         }
     }
 
-    /// Deprecated alias for [`Self::set_allowed_server_certificate_public_keys`].
-    ///
-    /// Keys must be DER-encoded SubjectPublicKeyInfo bytes, matching
-    /// [`NodePublicKey`]. This backwards-compatible method authorizes only the
-    /// privileged server role; use
-    /// [`Self::set_allowed_client_certificate_public_keys`]
-    /// for external clients.
-    #[deprecated(
-        note = "use set_allowed_server_certificate_public_keys or set_allowed_client_certificate_public_keys"
-    )]
-    pub fn set_allowed_certificate_public_keys(&mut self, keys: Vec<NodePublicKey>) {
-        self.set_allowed_server_certificate_public_keys(keys);
-    }
-
     /// Replaces the MPC server certificate public key allowlist.
     pub fn set_allowed_server_certificate_public_keys(&mut self, keys: Vec<NodePublicKey>) {
         self.allowed_server_public_keys.clear();
@@ -1490,16 +1476,6 @@ impl QuicNetworkManager {
         }
     }
 
-    /// Deprecated alias for [`Self::add_allowed_server_certificate_public_key`].
-    ///
-    /// This backwards-compatible method does not authorize the client role.
-    #[deprecated(
-        note = "use add_allowed_server_certificate_public_key or add_allowed_client_certificate_public_key"
-    )]
-    pub fn add_allowed_certificate_public_key(&mut self, key: NodePublicKey) {
-        self.add_allowed_server_certificate_public_key(key);
-    }
-
     /// Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
     pub fn add_allowed_server_certificate_public_key(&mut self, key: NodePublicKey) {
         self.allowed_server_public_keys.insert(key);
@@ -1510,16 +1486,6 @@ impl QuicNetworkManager {
         self.allowed_client_public_keys.insert(key);
     }
 
-    /// Deprecated alias for [`Self::clear_allowed_server_certificate_public_keys`].
-    ///
-    /// This backwards-compatible method does not modify the client allowlist.
-    #[deprecated(
-        note = "use clear_allowed_server_certificate_public_keys or clear_allowed_client_certificate_public_keys"
-    )]
-    pub fn clear_allowed_certificate_public_keys(&mut self) {
-        self.clear_allowed_server_certificate_public_keys();
-    }
-
     /// Clears the MPC server certificate public key allowlist.
     pub fn clear_allowed_server_certificate_public_keys(&mut self) {
         self.allowed_server_public_keys.clear();
@@ -1528,14 +1494,6 @@ impl QuicNetworkManager {
     /// Clears the external client certificate public key allowlist.
     pub fn clear_allowed_client_certificate_public_keys(&mut self) {
         self.allowed_client_public_keys.clear();
-    }
-
-    /// Deprecated alias for [`Self::has_server_certificate_public_key_allowlist`].
-    #[deprecated(
-        note = "use has_server_certificate_public_key_allowlist or has_client_certificate_public_key_allowlist"
-    )]
-    pub fn has_certificate_public_key_allowlist(&self) -> bool {
-        self.has_server_certificate_public_key_allowlist()
     }
 
     /// Returns true when at least one MPC server certificate key is trusted.

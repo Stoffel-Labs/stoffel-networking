@@ -600,28 +600,6 @@ pub extern "C" fn stoffelnet_manager_add_node(
 
 /// Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
 ///
-/// This backwards-compatible endpoint grants only the privileged server role.
-/// Use [`stoffelnet_manager_add_allowed_client_certificate_public_key`] for
-/// external clients.
-///
-/// # Safety
-///
-/// - The manager handle must be valid
-/// - key must point to at least key_len bytes
-#[unsafe(no_mangle)]
-#[deprecated(
-    note = "use stoffelnet_manager_add_allowed_server_certificate_public_key or stoffelnet_manager_add_allowed_client_certificate_public_key"
-)]
-pub extern "C" fn stoffelnet_manager_add_allowed_certificate_public_key(
-    manager: StoffelNetworkManagerHandle,
-    key: *const u8,
-    key_len: usize,
-) -> c_int {
-    stoffelnet_manager_add_allowed_server_certificate_public_key(manager, key, key_len)
-}
-
-/// Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
-///
 /// In authenticated TLS mode, a peer negotiating `server-protocol` is accepted
 /// only if its certificate public key is in this allowlist.
 ///
@@ -690,23 +668,6 @@ pub extern "C" fn stoffelnet_manager_add_allowed_client_certificate_public_key(
     });
 
     STOFFELNET_OK
-}
-
-/// Clears the MPC server certificate public key allowlist.
-///
-/// This backwards-compatible endpoint does not modify the client allowlist.
-///
-/// # Safety
-///
-/// The manager handle must be valid.
-#[unsafe(no_mangle)]
-#[deprecated(
-    note = "use stoffelnet_manager_clear_allowed_server_certificate_public_keys or stoffelnet_manager_clear_allowed_client_certificate_public_keys"
-)]
-pub extern "C" fn stoffelnet_manager_clear_allowed_certificate_public_keys(
-    manager: StoffelNetworkManagerHandle,
-) -> c_int {
-    stoffelnet_manager_clear_allowed_server_certificate_public_keys(manager)
 }
 
 /// Clears the MPC server certificate public key allowlist.

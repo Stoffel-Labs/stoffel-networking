@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-24
+
+### Added
+
+- Collision-resistant certificate identities and immutable server certificate rosters for authenticated peer admission.
+- Exact server public-key verification when establishing authenticated server connections.
+- Bounded per-peer outbound queues, an outbound send statistics hook, and exclusive receive ownership for concurrent execution scanners.
+
+### Changed
+
+- Logical clients may retain multiple concurrent physical connections authenticated by the same certificate; client sends fan out across those connections.
+- Legacy compact transport IDs now use domain-separated BLAKE3 derivation and remain non-authoritative for authorization decisions.
+- Release automation now validates the crate from version-matched `vX.Y.Z` tags, publishes to crates.io, signs the packaged crate with Cosign, and attaches the crate, SHA-256 checksum, and signature bundle to the GitHub release.
+
+### Fixed
+
+- Outbound party sends and broadcasts fail fast on queue saturation instead of blocking receive paths or retaining messages without a bound.
+
 ## [0.1.0] - 2026-06-19
 
 ### Added

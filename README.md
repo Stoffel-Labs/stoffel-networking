@@ -17,11 +17,9 @@
 
 ## Installation
 
-For the 0.1.0 release:
-
 ```toml
 [dependencies]
-stoffelnet = "0.1.0"
+stoffelnet = "0.1.1"
 ```
 
 To depend on this repository directly:

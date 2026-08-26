@@ -280,7 +280,7 @@ void stoffelnet_free_bytes(uint8_t* data, size_t len);
 |-----------|---------|------------|
 | `timeout_ms` | 30000 | > 0 |
 | `max_retries` | 3 | >= 0 |
-| `use_tls` | true | - |
+| `peer_authentication` | `PeerAuthenticationMode::Required` | Use insecure mode only for local development |
 | `enable_nat_traversal` | false | - |
 | `stun_servers` | [] | list of SocketAddr |
 

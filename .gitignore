@@ -1,3 +1,6 @@
 /target
 Cargo.lock
 /certs
+
+/tests/nat_simulation/logs/
+!/tests/nat_simulation/Cargo.lock

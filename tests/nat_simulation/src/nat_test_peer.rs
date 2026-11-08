@@ -328,7 +328,7 @@ async fn main() -> Result<(), BoxError> {
 
     // Report result to signaling server
     let (success, message) = match &result {
-        Ok(remote_addr) => (true, format!("Connected to {}", remote_addr)),
+        Ok(connection) => (true, format!("Connected to {}", connection.remote_address())),
         Err(e) => (false, e.to_string()),
     };
 
@@ -346,7 +346,10 @@ async fn main() -> Result<(), BoxError> {
     }
 
     // Wait for test completion
-    wait_for_test_complete(reader.clone()).await?;
+    let all_peers_passed = wait_for_test_complete(reader.clone()).await?;
+    if !success || !all_peers_passed {
+        return Err("NAT integration test failed".into());
+    }
 
     Ok(())
 }
@@ -587,7 +590,7 @@ async fn attempt_quic_connection_with_endpoint(
     _local_peer_id: usize,
     remote_addr: SocketAddr,
     role: IceRole,
-) -> Result<SocketAddr, BoxError> {
+) -> Result<quinn::Connection, BoxError> {
     use tokio::sync::oneshot;
 
     // Increase timeout to allow handshake to complete through NAT
@@ -596,7 +599,7 @@ async fn attempt_quic_connection_with_endpoint(
     let attempt_timeout = Duration::from_secs(10);  // Increased from 3s to allow full handshake
 
     // Channel to signal success from either direction
-    let (success_tx, success_rx) = oneshot::channel::<SocketAddr>();
+    let (success_tx, success_rx) = oneshot::channel::<quinn::Connection>();
     let success_tx = Arc::new(std::sync::Mutex::new(Some(success_tx)));
 
     // Clone endpoint for both tasks
@@ -613,12 +616,21 @@ async fn attempt_quic_connection_with_endpoint(
                     match incoming.await {
                         Ok(conn) => {
                             let addr = conn.remote_address();
-                            info!("Accepted QUIC connection from {}", addr);
+                            let (mut send, mut recv) = conn.accept_bi().await?;
+                            let payload = recv.read_to_end(1024).await?;
+                            if payload != b"cone-nat-round-trip" {
+                                return Err("Unexpected QUIC probe payload".into());
+                            }
+                            send.write_all(&payload).await?;
+                            send.finish()?;
+                            // Keep the connection alive until the echoed bytes are acknowledged.
+                            send.stopped().await?;
+                            info!("Accepted QUIC connection and echoed probe from {}", addr);
                             // Try to send success signal
                             if let Some(tx) = success_tx.lock().unwrap().take() {
-                                let _ = tx.send(addr);
+                                let _ = tx.send(conn.clone());
                             }
-                            return Ok::<_, BoxError>(addr);
+                            return Ok::<_, BoxError>(conn);
                         }
                         Err(e) => {
                             debug!("Failed to accept incoming connection: {}", e);
@@ -647,19 +659,26 @@ async fn attempt_quic_connection_with_endpoint(
                 Ok(c) => c,
                 Err(e) => {
                     error!("QUIC connect call failed: {}", e);
-                    return Err::<SocketAddr, BoxError>(e.into());
+                    return Err::<quinn::Connection, BoxError>(e.into());
                 }
             };
 
             match tokio::time::timeout(attempt_timeout, connecting).await {
                 Ok(Ok(conn)) => {
                     let addr = conn.remote_address();
-                    info!("Successfully connected to {}", addr);
+                    let (mut send, mut recv) = conn.open_bi().await?;
+                    send.write_all(b"cone-nat-round-trip").await?;
+                    send.finish()?;
+                    let echoed = recv.read_to_end(1024).await?;
+                    if echoed != b"cone-nat-round-trip" {
+                        return Err("Unexpected QUIC probe response".into());
+                    }
+                    info!("Successfully connected and verified QUIC round trip to {}", addr);
                     // Try to send success signal
                     if let Some(tx) = success_tx_connect.lock().unwrap().take() {
-                        let _ = tx.send(addr);
+                        let _ = tx.send(conn.clone());
                     }
-                    Ok(addr)
+                    Ok(conn)
                 }
                 Ok(Err(e)) => {
                     debug!("QUIC handshake failed: {}", e);
@@ -686,9 +705,9 @@ async fn attempt_quic_connection_with_endpoint(
     }
 
     match result {
-        Ok(Ok(addr)) => {
-            info!("QUIC connection established to {}", addr);
-            Ok(addr)
+        Ok(Ok(conn)) => {
+            info!("QUIC connection established to {}", conn.remote_address());
+            Ok(conn)
         }
         Ok(Err(_)) => {
             // Channel closed without success

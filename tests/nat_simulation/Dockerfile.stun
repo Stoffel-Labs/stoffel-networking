@@ -1,33 +1,18 @@
-# STUN Server for NAT Simulation Tests
-# Provides UDP-based reflexive address discovery for peers behind NAT
-
-FROM rust:1.83-slim-bookworm AS builder
-
+# Build the isolated, lockfile-pinned NAT integration harness.
+FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /build
-
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    cmake \
+RUN apt-get update && apt-get install -y pkg-config libssl-dev cmake \
     && rm -rf /var/lib/apt/lists/*
-
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./Cargo.toml
 COPY src ./src
-COPY tests/nat_simulation/src/stun_server.rs ./tests/nat_simulation/src/stun_server.rs
-
-RUN cargo build --release --bin nat_stun_server
+COPY tests/nat_simulation/Cargo.toml tests/nat_simulation/Cargo.lock ./tests/nat_simulation/
+COPY tests/nat_simulation/src ./tests/nat_simulation/src
+ENV CARGO_TARGET_DIR=/build/target
+RUN cargo build --release --locked --manifest-path tests/nat_simulation/Cargo.toml --bins
 
 FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
+RUN apt-get update && apt-get install -y ca-certificates iproute2 iputils-ping \
     && rm -rf /var/lib/apt/lists/*
-
 COPY --from=builder /build/target/release/nat_stun_server /app/nat_stun_server
-
 WORKDIR /app
-
-# STUN uses UDP port 3478 by default
-EXPOSE 3478/udp
-
 CMD ["/app/nat_stun_server"]

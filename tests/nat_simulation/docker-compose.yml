@@ -2,12 +2,12 @@
 #
 # Network topology:
 #
-#   peer_a (10.101.0.10:5001) <---> nat_a (public: 10.100.0.2) <--->
+#   peer_a (10.101.0.10:5000) <---> nat_a (public: 10.100.0.2) <--->
 #                                                                    |
 #                                 signaling (10.100.0.10)  <---------+-- "public" network
 #                                 stun (10.100.0.11)       <---------+
 #                                                                    |
-#   peer_b (10.102.0.10:5002) <---> nat_b (public: 10.100.0.3) <--->
+#   peer_b (10.102.0.10:5000) <---> nat_b (public: 10.100.0.3) <--->
 #
 # - peer_a and peer_b are on separate private networks (simulating home LANs)
 # - nat_a and nat_b provide NAT translation (simulating home routers)
@@ -27,6 +27,8 @@ networks:
   # "Public" internet - where NAT routers have public IPs
   public:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
     ipam:
       config:
         - subnet: 10.100.0.0/24
@@ -138,10 +140,10 @@ services:
         # on macOS can reassign IPs between interfaces after container startup
 
         # === NAT RULES ===
-        # NOTE: We allow all forwarding because Docker Desktop on macOS has internal
-        # routing that can bypass container NAT. The SNAT/DNAT rules still apply
-        # to traffic that goes through this container.
-        iptables -A FORWARD -j ACCEPT
+        # Count both forwarding directions so the test can prove that packets
+        # traverse this router, including conntrack's reverse-SNAT path.
+        iptables -A FORWARD -s 10.101.0.10 -j ACCEPT
+        iptables -A FORWARD -d 10.101.0.10 -j ACCEPT
         # Outbound: SNAT all UDP from peer's port 5000 to our public IP
         # This applies when peer sends to ANY destination (public network or other NAT)
         iptables -t nat -A POSTROUTING -s 10.101.0.10 -p udp --sport 5000 -j SNAT --to-source 10.100.0.2:5000
@@ -219,10 +221,10 @@ services:
         # on macOS can reassign IPs between interfaces after container startup
 
         # === NAT RULES ===
-        # NOTE: We allow all forwarding because Docker Desktop on macOS has internal
-        # routing that can bypass container NAT. The SNAT/DNAT rules still apply
-        # to traffic that goes through this container.
-        iptables -A FORWARD -j ACCEPT
+        # Count both forwarding directions so the test can prove that packets
+        # traverse this router, including conntrack's reverse-SNAT path.
+        iptables -A FORWARD -s 10.102.0.10 -j ACCEPT
+        iptables -A FORWARD -d 10.102.0.10 -j ACCEPT
         # Outbound: SNAT all UDP from peer's port 5000 to our public IP
         # This applies when peer sends to ANY destination (public network or other NAT)
         iptables -t nat -A POSTROUTING -s 10.102.0.10 -p udp --sport 5000 -j SNAT --to-source 10.100.0.3:5000
@@ -245,7 +247,6 @@ services:
       start_period: 30s
 
   # Peer A - behind NAT A
-  # Uses port 5001 to avoid conntrack tuple collision with peer_b's port 5002
   peer_a:
     build:
       context: ../..
@@ -281,7 +282,6 @@ services:
       "
 
   # Peer B - behind NAT B
-  # Uses port 5002 to avoid conntrack tuple collision with peer_a's port 5001
   # Starts slightly after peer_a to avoid race conditions in candidate exchange
   peer_b:
     build:

@@ -8,7 +8,7 @@
 # 4. Collects results and logs
 # 5. Cleans up
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -76,6 +76,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if $KEEP_RUNNING; then
+    trap - EXIT
+fi
+
 log_info "NAT Hole Punching Integration Test"
 log_info "==================================="
 log_info "Project directory: $PROJECT_DIR"
@@ -94,7 +98,7 @@ if ! docker info &> /dev/null; then
     exit 1
 fi
 
-if ! command -v docker compose &> /dev/null; then
+if ! docker compose version &> /dev/null; then
     log_error "Docker Compose is not installed"
     exit 1
 fi
@@ -104,18 +108,6 @@ log_info "Prerequisites OK"
 # Clean up any existing test containers
 log_info "Cleaning up existing containers..."
 cleanup
-
-# Build the project first (native build for faster iteration)
-log_info "Building Rust binaries..."
-cd "$PROJECT_DIR"
-
-if $VERBOSE; then
-    cargo build --release --bin nat_signaling_server --bin nat_test_peer
-else
-    cargo build --release --bin nat_signaling_server --bin nat_test_peer 2>&1 | tail -5
-fi
-
-log_info "Build complete"
 
 # Build Docker images
 log_info "Building Docker images..."
@@ -141,7 +133,8 @@ docker compose -f "$COMPOSE_FILE" up -d nat_a
 # Wait for NAT A to become healthy (apk install takes time)
 log_info "Waiting for NAT A to become healthy..."
 for i in {1..30}; do
-    if docker compose -f "$COMPOSE_FILE" ps nat_a --format "{{.Status}}" 2>/dev/null | grep -q "healthy"; then
+    health=$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose -f "$COMPOSE_FILE" ps -q nat_a)" 2>/dev/null || true)
+    if [[ "$health" == "healthy" ]]; then
         log_info "NAT A is healthy"
         break
     fi
@@ -154,31 +147,24 @@ docker compose -f "$COMPOSE_FILE" up -d nat_b
 # Wait for NAT B to become healthy
 log_info "Waiting for NAT B to become healthy..."
 for i in {1..30}; do
-    if docker compose -f "$COMPOSE_FILE" ps nat_b --format "{{.Status}}" 2>/dev/null | grep -q "healthy"; then
+    health=$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose -f "$COMPOSE_FILE" ps -q nat_b)" 2>/dev/null || true)
+    if [[ "$health" == "healthy" ]]; then
         log_info "NAT B is healthy"
         break
     fi
     sleep 2
 done
 
-# Verify NAT containers are running
-if ! docker compose -f "$COMPOSE_FILE" ps | grep -q "nat_a.*Up"; then
-    log_error "NAT A container failed to start"
-    docker compose -f "$COMPOSE_FILE" logs nat_a
-    exit 1
-fi
-
-if ! docker compose -f "$COMPOSE_FILE" ps | grep -q "nat_b.*Up"; then
-    log_error "NAT B container failed to start"
-    docker compose -f "$COMPOSE_FILE" logs nat_b
-    exit 1
-fi
-
-if ! docker compose -f "$COMPOSE_FILE" ps | grep -q "signaling.*Up"; then
-    log_error "Signaling server failed to start"
-    docker compose -f "$COMPOSE_FILE" logs signaling
-    exit 1
-fi
+# Inspect machine-readable state; grep -q pipelines can SIGPIPE under pipefail.
+for service in nat_a nat_b signaling; do
+    container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service")
+    running=$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || true)
+    if [[ "$running" != "true" ]]; then
+        log_error "$service container failed to start"
+        docker compose -f "$COMPOSE_FILE" logs "$service"
+        exit 1
+    fi
+done
 
 log_info "Infrastructure ready"
 
@@ -207,18 +193,22 @@ while true; do
 
     if [[ "$PEER_A_STATUS" == *"Exited"* ]] && [[ "$PEER_B_STATUS" == *"Exited"* ]]; then
         # Check exit codes
-        PEER_A_EXIT=$(docker compose -f "$COMPOSE_FILE" ps -a peer_a --format "{{.State}}" 2>/dev/null || echo "unknown")
-        PEER_B_EXIT=$(docker compose -f "$COMPOSE_FILE" ps -a peer_b --format "{{.State}}" 2>/dev/null || echo "unknown")
+        PEER_A_EXIT=$(docker inspect --format '{{.State.ExitCode}}' "$(docker compose -f "$COMPOSE_FILE" ps -a -q peer_a)")
+        PEER_B_EXIT=$(docker inspect --format '{{.State.ExitCode}}' "$(docker compose -f "$COMPOSE_FILE" ps -a -q peer_b)")
 
         log_info "Both peers have completed"
         log_info "Peer A status: $PEER_A_STATUS"
         log_info "Peer B status: $PEER_B_STATUS"
 
         # Check logs for success indicators
-        if docker compose -f "$COMPOSE_FILE" logs peer_a 2>&1 | grep -q "SUCCESS"; then
-            if docker compose -f "$COMPOSE_FILE" logs peer_b 2>&1 | grep -q "SUCCESS"; then
-                TEST_PASSED=true
-            fi
+        peer_a_logs=$(docker compose -f "$COMPOSE_FILE" logs peer_a 2>&1)
+        peer_b_logs=$(docker compose -f "$COMPOSE_FILE" logs peer_b 2>&1)
+        if [[ "$PEER_A_EXIT" == "0" && "$PEER_B_EXIT" == "0" ]] \
+            && grep -Fq "STUN discovered reflexive address: 10.100.0.2:5000 " <<<"$peer_a_logs" \
+            && grep -Fq "STUN discovered reflexive address: 10.100.0.3:5000 " <<<"$peer_b_logs" \
+            && grep -Fq "SUCCESS: Connected to 10.100.0.3:5000" <<<"$peer_a_logs" \
+            && grep -Fq "SUCCESS: Connected to 10.100.0.2:5000" <<<"$peer_b_logs"; then
+            TEST_PASSED=true
         fi
         break
     fi
@@ -243,7 +233,26 @@ docker compose -f "$COMPOSE_FILE" logs peer_b > "$LOGS_DIR/peer_b.log" 2>&1
 docker compose -f "$COMPOSE_FILE" logs nat_a > "$LOGS_DIR/nat_a.log" 2>&1
 docker compose -f "$COMPOSE_FILE" logs nat_b > "$LOGS_DIR/nat_b.log" 2>&1
 
+# A successful handshake must have traversed both configured NAT routers.
+# Save counters as evidence and reject accidental direct Docker bridge paths.
+for router in nat_a nat_b; do
+    docker compose -f "$COMPOSE_FILE" exec -T "$router" \
+        iptables -t nat -L -v -n -x > "$LOGS_DIR/$router-counters.log"
+    docker compose -f "$COMPOSE_FILE" exec -T "$router" \
+        iptables -L FORWARD -v -n -x >> "$LOGS_DIR/$router-counters.log"
+    if ! awk '$3 == "SNAT" && /to:10[.]100[.]0[.]/ && $1 > 0 { snat = 1 } $3 == "ACCEPT" && $8 ~ /^10[.]10[12][.]0[.]10$/ && $1 > 0 { outbound = 1 } $3 == "ACCEPT" && $9 ~ /^10[.]10[12][.]0[.]10$/ && $1 > 0 { inbound = 1 } END { exit !(snat && outbound && inbound) }' \
+        "$LOGS_DIR/$router-counters.log"; then
+        log_error "$router did not translate traffic in both directions"
+        TEST_PASSED=false
+    fi
+done
+
 log_info "Logs saved to $LOGS_DIR"
+
+# Keep the complete topology available for packet/counter inspection when requested.
+if $KEEP_RUNNING; then
+    trap - EXIT
+fi
 
 # Show test result
 echo ""

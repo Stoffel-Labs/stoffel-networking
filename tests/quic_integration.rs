@@ -1,10 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Once;
-use stoffelnet::network_utils::{Message, NetworkError, Node, NodePublicKey};
+use stoffelnet::network_utils::{ClientType, Message, NetworkError, Node, NodePublicKey};
 use stoffelnet::transports::quic::{
-    ConnectionState, LoopbackPeerConnection, NetworkManager, PeerConnection, QuicMessage,
-    QuicNetworkConfig, QuicNetworkManager, QuicNode,
+    ConnectionState, LoopbackPeerConnection, NetworkManager, PeerAuthenticationMode,
+    PeerConnection, QuicMessage, QuicNetworkConfig, QuicNetworkManager, QuicNode,
 };
 
 static CRYPTO_INIT: Once = Once::new();
@@ -221,8 +221,13 @@ async fn test_certificate_public_key_allowlist_accepts_expected_server_peer() {
         .get_public_key()
         .expect("connector should expose a certificate public key")
         .clone();
+    let listener_key = listener
+        .get_public_key()
+        .expect("listener should expose a certificate public key")
+        .clone();
 
-    listener.set_allowed_certificate_public_keys(vec![connector_key.clone()]);
+    listener.set_allowed_server_certificate_public_keys(vec![connector_key.clone()]);
+    connector.set_allowed_server_certificate_public_keys(vec![listener_key]);
 
     let connect_task = tokio::spawn(async move {
         let result = connector.connect_as_server(listener_addr).await;
@@ -255,11 +260,118 @@ async fn test_certificate_public_key_allowlist_accepts_expected_server_peer() {
 }
 
 #[tokio::test]
+async fn test_authenticated_client_role_uses_client_allowlist_after_endpoint_reuse() {
+    init_crypto();
+
+    let mut listener = QuicNetworkManager::with_node_id(1);
+    let mut connector = QuicNetworkManager::with_node_id(2);
+    let listener_addr = unused_localhost_addr();
+    let connector_addr = unused_localhost_addr();
+
+    listener
+        .listen(listener_addr)
+        .await
+        .expect("listener should start");
+    connector
+        .listen(connector_addr)
+        .await
+        .expect("connector should start with a server-role endpoint default");
+
+    let listener_key = listener
+        .get_public_key()
+        .expect("listener should expose a certificate public key")
+        .clone();
+    let connector_key = connector
+        .get_public_key()
+        .expect("connector should expose a certificate public key")
+        .clone();
+    let connector_id = connector_key.derive_id();
+
+    listener.add_allowed_client_certificate_public_key(connector_key.clone());
+    connector.add_allowed_server_certificate_public_key(listener_key);
+
+    let connect_task = tokio::spawn(async move {
+        let result = connector.connect_as_client(listener_addr).await;
+        (connector, result)
+    });
+
+    let accepted = listener
+        .accept()
+        .await
+        .expect("client-authorized certificate should be accepted as a client");
+    let (_connector, connected) = connect_task.await.expect("connect task should not panic");
+    let connected = connected.expect("client-role connection should succeed");
+
+    assert_eq!(accepted.get_connection_role(), ClientType::Client);
+    assert_eq!(connected.get_connection_role(), ClientType::Client);
+    assert_eq!(listener.get_all_client_connections().len(), 1);
+    assert_eq!(
+        listener.client_public_key_bytes_by_transport_id(connector_id),
+        Some(connector_key.0)
+    );
+    assert!(listener.peer_public_key_bytes(connector_id).is_none());
+}
+
+#[tokio::test]
+async fn test_client_authorized_certificate_cannot_spoof_server_alpn_role() {
+    init_crypto();
+
+    let mut listener = QuicNetworkManager::with_node_id(1);
+    let mut connector = QuicNetworkManager::with_node_id(2);
+    let listener_addr = unused_localhost_addr();
+    let connector_addr = unused_localhost_addr();
+
+    listener
+        .listen(listener_addr)
+        .await
+        .expect("listener should start");
+    connector
+        .listen(connector_addr)
+        .await
+        .expect("connector should start");
+
+    let listener_key = listener
+        .get_public_key()
+        .expect("listener should expose a certificate public key")
+        .clone();
+    let connector_key = connector
+        .get_public_key()
+        .expect("connector should expose a certificate public key")
+        .clone();
+    let connector_id = connector_key.derive_id();
+
+    // The connector is a legitimate external client, but it is deliberately
+    // absent from the privileged server trust set.
+    listener.add_allowed_client_certificate_public_key(connector_key);
+    listener.add_allowed_server_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    connector.add_allowed_server_certificate_public_key(listener_key);
+
+    let connect_task = tokio::spawn(async move {
+        let result = connector.connect_as_server(listener_addr).await;
+        (connector, result)
+    });
+
+    let err = listener
+        .accept()
+        .await
+        .expect_err("a client-authorized key must not negotiate the server role");
+    let (_connector, _connect_result) = connect_task.await.expect("connect task should not panic");
+
+    assert!(
+        err.contains("not authorized for the server role"),
+        "unexpected cross-role rejection: {}",
+        err
+    );
+    assert!(listener.get_all_client_connections().is_empty());
+    assert!(listener.peer_public_key_bytes(connector_id).is_none());
+}
+
+#[tokio::test]
 async fn test_certificate_public_key_allowlist_rejects_unexpected_server_peer() {
     init_crypto();
 
     let mut listener = QuicNetworkManager::with_node_id(1);
-    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    listener.add_allowed_server_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
     let listener_addr = unused_localhost_addr();
     listener
         .listen(listener_addr)
@@ -267,7 +379,10 @@ async fn test_certificate_public_key_allowlist_rejects_unexpected_server_peer() 
         .expect("listener should start");
 
     let connect_task = tokio::spawn(async move {
-        let mut unexpected_peer = QuicNetworkManager::with_node_id(2);
+        let mut unexpected_peer = QuicNetworkManager::with_config(QuicNetworkConfig {
+            peer_authentication: PeerAuthenticationMode::DangerouslyDisabledForDevelopment,
+            ..QuicNetworkConfig::default()
+        });
         unexpected_peer.connect_as_server(listener_addr).await
     });
 
@@ -279,7 +394,9 @@ async fn test_certificate_public_key_allowlist_rejects_unexpected_server_peer() 
         "listener should reject a certificate public key outside the allowlist"
     );
     assert!(
-        accept_result.unwrap_err().contains("not in allowlist"),
+        accept_result
+            .unwrap_err()
+            .contains("not authorized for the server role"),
         "rejection should report the allowlist failure"
     );
     assert!(
@@ -289,22 +406,22 @@ async fn test_certificate_public_key_allowlist_rejects_unexpected_server_peer() 
 }
 
 #[tokio::test]
-async fn test_certificate_public_key_allowlist_clear_disables_rejection() {
+async fn test_certificate_public_key_allowlist_clear_only_permits_development_mode() {
     init_crypto();
 
     let mut listener = QuicNetworkManager::with_node_id(1);
-    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
-    assert!(listener.has_certificate_public_key_allowlist());
-    listener.clear_allowed_certificate_public_keys();
-    assert!(!listener.has_certificate_public_key_allowlist());
+    listener.add_allowed_server_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    assert!(listener.has_server_certificate_public_key_allowlist());
+    listener.clear_allowed_server_certificate_public_keys();
+    assert!(!listener.has_server_certificate_public_key_allowlist());
 
     let config = QuicNetworkConfig {
-        use_tls: false,
+        peer_authentication: PeerAuthenticationMode::DangerouslyDisabledForDevelopment,
         ..Default::default()
     };
     let mut listener = QuicNetworkManager::with_config(config.clone());
-    listener.add_allowed_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
-    listener.clear_allowed_certificate_public_keys();
+    listener.add_allowed_server_certificate_public_key(NodePublicKey(vec![0xAA, 0xBB, 0xCC]));
+    listener.clear_allowed_server_certificate_public_keys();
     let listener_addr = unused_localhost_addr();
     listener
         .listen(listener_addr)
@@ -322,12 +439,12 @@ async fn test_certificate_public_key_allowlist_clear_disables_rejection() {
 
     assert!(
         accept_result.is_ok(),
-        "clearing the allowlist should disable certificate public key rejection: {:?}",
+        "development mode should permit dynamic peers after clearing the allowlist: {:?}",
         accept_result.err()
     );
     assert!(
         connect_result.is_ok(),
-        "connector should succeed once the allowlist is cleared: {:?}",
+        "development-mode connector should succeed with an empty allowlist: {:?}",
         connect_result.err()
     );
 }
@@ -384,7 +501,11 @@ fn test_default_config_values() {
         "default idle_timeout_ms should be 300000"
     );
     assert_eq!(config.max_retries, 3, "default max_retries should be 3");
-    assert!(config.use_tls, "default use_tls should be true");
+    assert_eq!(
+        config.peer_authentication,
+        PeerAuthenticationMode::Required,
+        "peer authentication should be required by default"
+    );
     assert!(
         !config.enable_nat_traversal,
         "default enable_nat_traversal should be false"
@@ -414,7 +535,7 @@ fn test_config_with_nat_traversal() {
     // Verify all other fields remain at defaults
     assert_eq!(config.timeout_ms, 30000);
     assert_eq!(config.max_retries, 3);
-    assert!(config.use_tls);
+    assert_eq!(config.peer_authentication, PeerAuthenticationMode::Required);
     assert!(config.stun_servers.is_empty());
     assert!(config.enable_hole_punching);
     assert_eq!(config.hole_punch_timeout_ms, 10000);

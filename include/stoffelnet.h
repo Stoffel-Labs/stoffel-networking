@@ -212,7 +212,8 @@ void stoffelnet_manager_destroy(StoffelNetworkManagerHandle manager);
  * Adds a node to the network manager
  * @param manager Handle to the network manager
  * @param address Network address of the node (null-terminated string)
- * @param party_id Party ID of the node
+ * @param party_id Party ID of the node. In authenticated TLS mode this must be
+ * the transport ID derived from the peer's allowlisted certificate public key.
  * @return STOFFELNET_OK on success, or an error code
  */
 int32_t stoffelnet_manager_add_node(
@@ -222,33 +223,56 @@ int32_t stoffelnet_manager_add_node(
 );
 
 /**
- * Adds a DER-encoded SubjectPublicKeyInfo key to the certificate public key allowlist.
- * When at least one key is configured, connections from peers whose certificate public
- * key is not in the allowlist are rejected.
+ * Adds a DER-encoded SubjectPublicKeyInfo key to the MPC server allowlist.
+ * A peer negotiating server-protocol must present a key from this list.
  * @param manager Handle to the network manager
  * @param key Pointer to DER-encoded SubjectPublicKeyInfo bytes
  * @param key_len Length of key in bytes
  * @return STOFFELNET_OK on success, or an error code
  */
-int32_t stoffelnet_manager_add_allowed_certificate_public_key(
+int32_t stoffelnet_manager_add_allowed_server_certificate_public_key(
     StoffelNetworkManagerHandle manager,
     const uint8_t* key,
     size_t key_len
 );
 
 /**
- * Clears the certificate public key allowlist, disabling this check.
+ * Adds a DER-encoded SubjectPublicKeyInfo key to the external client allowlist.
+ * A peer negotiating client-protocol must present a key from this list.
+ * @param manager Handle to the network manager
+ * @param key Pointer to DER-encoded SubjectPublicKeyInfo bytes
+ * @param key_len Length of key in bytes
+ * @return STOFFELNET_OK on success, or an error code
+ */
+int32_t stoffelnet_manager_add_allowed_client_certificate_public_key(
+    StoffelNetworkManagerHandle manager,
+    const uint8_t* key,
+    size_t key_len
+);
+
+/**
+ * Clears the MPC server certificate public key allowlist.
  * @param manager Handle to the network manager
  * @return STOFFELNET_OK on success, or an error code
  */
-int32_t stoffelnet_manager_clear_allowed_certificate_public_keys(
+int32_t stoffelnet_manager_clear_allowed_server_certificate_public_keys(
+    StoffelNetworkManagerHandle manager
+);
+
+/**
+ * Clears the external client certificate public key allowlist.
+ * @param manager Handle to the network manager
+ * @return STOFFELNET_OK on success, or an error code
+ */
+int32_t stoffelnet_manager_clear_allowed_client_certificate_public_keys(
     StoffelNetworkManagerHandle manager
 );
 
 /**
  * Connects to a party (blocking)
  * @param manager Handle to the network manager
- * @param party_id Party ID to connect to
+ * @param party_id Transport ID derived from the target's allowlisted certificate
+ * public key when authenticated TLS is enabled
  * @return STOFFELNET_OK on success, or an error code
  */
 int32_t stoffelnet_manager_connect_to_party(
@@ -259,7 +283,8 @@ int32_t stoffelnet_manager_connect_to_party(
 /**
  * Connects to a party asynchronously with a callback
  * @param manager Handle to the network manager
- * @param party_id Party ID to connect to
+ * @param party_id Transport ID derived from the target's allowlisted certificate
+ * public key when authenticated TLS is enabled
  * @param callback Callback function invoked when connection completes
  * @param user_data User data passed to the callback
  * @return Handle to the async operation, or NULL on error
